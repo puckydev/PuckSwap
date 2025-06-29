@@ -1,0 +1,378 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// =============================================================================
+// LIQUIDITY PROVISION VALIDATOR - MASTER SCHEMA COMPLIANT
+// =============================================================================
+// 
+// Features:
+// - Uses exact master schema PoolDatum structure
+// - Balanced liquidity provision (ADA + token deposits)
+// - Proportional LP token calculation (handled by separate minting policy)
+// - Pool datum updates with new reserves
+// - Unbalanced liquidity prevention
+// - Minimum ADA compliance validation
+// - Security validations against manipulation
+// =============================================================================
+
+// Exact PoolDatum Structure from deployed contract
+// Matches contracts/examples/redeemer_parser_integration.aiken
+pub type PoolDatum {
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_total_supply: Int,
+  fee_bps: Int,
+}
+
+// Enhanced liquidity provision redeemer with deadline protection
+pub type LiquidityProvisionRedeemer {
+  ada_amount: Int,              // ADA amount to deposit
+  token_amount: Int,            // Token amount to deposit
+  min_lp_tokens: Int,           // Minimum LP tokens to receive (slippage protection)
+  max_ratio_deviation_bps: Int, // Maximum allowed ratio deviation (basis points)
+  user_address: Address,        // User address for validation
+  deadline: Int,                // Slot deadline for MEV protection
+  is_initial_liquidity: Bool,   // Whether this is the first liquidity provision
+}
+
+// Enhanced liquidity calculation result
+pub type LiquidityResult {
+  lp_tokens_to_mint: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  new_lp_total_supply: Int,
+  ada_ratio: Int,
+  token_ratio: Int,
+  is_balanced: Bool,
+  effective_ratio: Int,
+}
+
+// =============================================================================
+// MAIN VALIDATOR
+// =============================================================================
+
+// Main liquidity provision validator
+validator liquidity_provision_validator(
+  datum: PoolDatum,
+  redeemer: LiquidityProvisionRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find pool input and output UTxOs
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate the liquidity provision operation
+      validate_liquidity_provision_operation(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// CORE LIQUIDITY PROVISION VALIDATION
+// =============================================================================
+
+// Validate liquidity provision operation with all security checks
+fn validate_liquidity_provision_operation(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum,
+  redeemer: LiquidityProvisionRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate redeemer parameters
+  expect validate_redeemer_parameters(redeemer)
+  
+  // Validate pool datum structure
+  expect validate_pool_datum(datum)
+  
+  // Get current pool reserves from UTxO values
+  let (current_ada_reserve, current_token_reserve) = 
+    extract_pool_reserves(pool_input.output.value, datum)
+  
+  // Validate reserves match datum
+  expect current_ada_reserve == datum.ada_reserve
+  expect current_token_reserve == datum.token_reserve
+  
+  // Calculate liquidity provision result
+  let liquidity_result = calculate_liquidity_provision(
+    current_ada_reserve,
+    current_token_reserve,
+    redeemer.ada_amount,
+    redeemer.token_amount,
+    redeemer.is_initial_liquidity
+  )
+  
+  // Validate minimum LP tokens requirement (slippage protection)
+  expect liquidity_result.lp_tokens_to_mint >= redeemer.min_lp_tokens
+  
+  // Validate liquidity ratio if not initial provision
+  if !redeemer.is_initial_liquidity {
+    expect validate_liquidity_ratio_balance(
+      liquidity_result.ada_ratio,
+      liquidity_result.token_ratio,
+      redeemer.max_ratio_deviation_bps
+    )
+  }
+  
+  // Get new pool datum from output
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_datum: PoolDatum = output_datum_data
+  
+  // Validate reserves are updated correctly in datum
+  expect new_datum.ada_reserve == liquidity_result.new_ada_reserve
+  expect new_datum.token_reserve == liquidity_result.new_token_reserve
+  
+  // Validate pool configuration remains unchanged
+  expect new_datum.fee_basis_points == datum.fee_basis_points
+  expect new_datum.lp_token_policy == datum.lp_token_policy
+  expect new_datum.lp_token_name == datum.lp_token_name
+  
+  // Validate pool reserves in output UTxO match calculated values
+  let (output_ada_reserve, output_token_reserve) = 
+    extract_pool_reserves(pool_output.value, datum)
+  
+  expect output_ada_reserve == liquidity_result.new_ada_reserve
+  expect output_token_reserve == liquidity_result.new_token_reserve
+  
+  // Validate minimum ADA requirements are met
+  expect validate_min_ada_requirement(pool_output)
+  
+  // Validate LP token minting (handled by separate policy)
+  expect validate_lp_token_minting_reference(liquidity_result.lp_tokens_to_mint, datum, ctx)
+  
+  // Validate user authorization
+  expect validate_user_authorization(redeemer.user_address, ctx)
+  
+  // Validate against dust attacks and manipulation
+  expect validate_security_constraints(redeemer, datum, liquidity_result)
+  
+  True
+}
+
+// =============================================================================
+// LIQUIDITY CALCULATION
+// =============================================================================
+
+// Calculate liquidity provision with proportional LP token calculation
+fn calculate_liquidity_provision(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  is_initial: Bool
+) -> LiquidityResult {
+  // Validate input parameters
+  expect ada_amount > 0
+  expect token_amount > 0
+
+  if is_initial {
+    // Initial liquidity provision - use geometric mean
+    let lp_tokens_to_mint = math.sqrt(ada_amount * token_amount)
+    
+    LiquidityResult {
+      lp_tokens_to_mint: lp_tokens_to_mint,
+      new_ada_reserve: ada_amount,
+      new_token_reserve: token_amount,
+      ada_ratio: 1000000,  // 100% (scaled by 1e6)
+      token_ratio: 1000000, // 100% (scaled by 1e6)
+      is_balanced: True,
+    }
+  } else {
+    // Subsequent liquidity provision - use proportional calculation
+    expect ada_reserve > 0
+    expect token_reserve > 0
+
+    // Calculate ratios (scaled by 1e6 for precision)
+    let ada_ratio = ada_amount * 1000000 / ada_reserve
+    let token_ratio = token_amount * 1000000 / token_reserve
+
+    // Use minimum ratio to prevent manipulation and ensure balanced liquidity
+    let effective_ratio = math.min(ada_ratio, token_ratio)
+    
+    // Calculate LP tokens based on existing total supply
+    // Note: This assumes total LP supply is tracked elsewhere or calculated from minting policy
+    let estimated_total_lp_supply = math.sqrt(ada_reserve * token_reserve)
+    let lp_tokens_to_mint = estimated_total_lp_supply * effective_ratio / 1000000
+
+    // Check if liquidity is balanced (ratios are close)
+    let ratio_diff = math.abs(ada_ratio - token_ratio)
+    let max_ratio = math.max(ada_ratio, token_ratio)
+    let is_balanced = if max_ratio > 0 {
+      ratio_diff * 10000 / max_ratio <= 500  // 5% tolerance
+    } else {
+      True
+    }
+
+    LiquidityResult {
+      lp_tokens_to_mint: lp_tokens_to_mint,
+      new_ada_reserve: ada_reserve + ada_amount,
+      new_token_reserve: token_reserve + token_amount,
+      ada_ratio: ada_ratio,
+      token_ratio: token_ratio,
+      is_balanced: is_balanced,
+    }
+  }
+}
+
+// Validate liquidity ratio balance to prevent unbalanced additions
+fn validate_liquidity_ratio_balance(
+  ada_ratio: Int,
+  token_ratio: Int,
+  max_deviation_bps: Int
+) -> Bool {
+  // Calculate ratio difference in basis points
+  let ratio_diff = math.abs(ada_ratio - token_ratio)
+  let max_ratio = math.max(ada_ratio, token_ratio)
+  let deviation_bps = if max_ratio > 0 {
+    ratio_diff * 10000 / max_ratio
+  } else {
+    0
+  }
+
+  // Ensure deviation is within acceptable bounds
+  deviation_bps <= max_deviation_bps
+}
+
+// =============================================================================
+// VALIDATION HELPER FUNCTIONS
+// =============================================================================
+
+// Validate redeemer parameters
+fn validate_redeemer_parameters(redeemer: LiquidityProvisionRedeemer) -> Bool {
+  // Validate amounts are positive
+  expect redeemer.ada_amount > 0
+  expect redeemer.token_amount > 0
+  expect redeemer.min_lp_tokens >= 0
+
+  // Validate ratio deviation parameters
+  expect redeemer.max_ratio_deviation_bps >= 0 && redeemer.max_ratio_deviation_bps <= 10000
+
+  // Validate against dust attacks
+  expect redeemer.ada_amount >= 1_000_000   // 1 ADA minimum
+  expect redeemer.token_amount >= 1_000_000 // 1 token minimum (adjust based on token decimals)
+
+  True
+}
+
+// Validate pool datum structure
+fn validate_pool_datum(datum: PoolDatum) -> Bool {
+  // Validate reserves are non-negative
+  expect datum.ada_reserve >= 0
+  expect datum.token_reserve >= 0
+
+  // Validate fee is reasonable
+  expect datum.fee_basis_points >= 0 && datum.fee_basis_points <= 10000
+
+  // Validate policy and asset name are not empty
+  expect bytearray.length(datum.lp_token_policy) > 0
+  expect bytearray.length(datum.lp_token_name) > 0
+
+  True
+}
+
+// Extract pool reserves from UTxO value
+fn extract_pool_reserves(pool_value: Value, datum: PoolDatum) -> (Int, Int) {
+  let ada_amount = quantity_of(pool_value, ada_policy_id, ada_asset_name)
+
+  // For token amount, we need to find the correct token in the pool
+  // This is a simplified approach - in practice, you'd iterate through the value
+  let token_amount = quantity_of(pool_value, datum.lp_token_policy, datum.lp_token_name)
+
+  // Validate reserves are non-negative
+  expect ada_amount >= 0
+  expect token_amount >= 0
+
+  (ada_amount, token_amount)
+}
+
+// Validate minimum ADA requirement
+fn validate_min_ada_requirement(pool_output: Output) -> Bool {
+  let ada_amount = quantity_of(pool_output.value, ada_policy_id, ada_asset_name)
+  // Ensure minimum 2 ADA remains in pool UTxO for protocol requirements
+  ada_amount >= 2_000_000
+}
+
+// Validate LP token minting reference (separate policy handles actual minting)
+fn validate_lp_token_minting_reference(
+  lp_tokens_to_mint: Int,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate LP tokens to mint is positive
+  expect lp_tokens_to_mint > 0
+
+  // Check that LP minting policy is referenced in transaction
+  let mint_value = ctx.transaction.mint
+  let lp_token_amount = quantity_of(mint_value, datum.lp_token_policy, datum.lp_token_name)
+
+  // The separate LP minting policy should handle the actual minting
+  // This validator just validates the calculation is correct
+  expect lp_token_amount == lp_tokens_to_mint
+
+  True
+}
+
+// Validate user authorization
+fn validate_user_authorization(user_address: Address, ctx: ScriptContext) -> Bool {
+  let user_signed = list.any(ctx.transaction.extra_signatories, fn(signature) {
+    when user_address.payment_credential is {
+      VerificationKeyCredential(pkh) -> signature == pkh
+      _ -> False
+    }
+  })
+
+  expect user_signed
+  True
+}
+
+// Validate security constraints against attacks and manipulation
+fn validate_security_constraints(
+  redeemer: LiquidityProvisionRedeemer,
+  datum: PoolDatum,
+  liquidity_result: LiquidityResult
+) -> Bool {
+  // Prevent excessive single liquidity provision (max 50% of pool)
+  if !redeemer.is_initial_liquidity {
+    let max_single_provision_percentage = 5000  // 50% in basis points
+    let max_ada_amount = datum.ada_reserve * max_single_provision_percentage / 10000
+    let max_token_amount = datum.token_reserve * max_single_provision_percentage / 10000
+
+    expect redeemer.ada_amount <= max_ada_amount
+    expect redeemer.token_amount <= max_token_amount
+  }
+
+  // Validate liquidity is balanced for non-initial provisions
+  if !redeemer.is_initial_liquidity {
+    expect liquidity_result.is_balanced
+  }
+
+  // Validate LP tokens calculation is reasonable
+  expect liquidity_result.lp_tokens_to_mint > 0
+
+  True
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Find input by output reference
+fn find_input(inputs: List<Input>, output_ref: OutputReference) -> Option<Input> {
+  list.find(inputs, fn(input) { input.output_reference == output_ref })
+}
+
+// Find output by address
+fn find_output(outputs: List<Output>, pool_address: Address) -> Option<Output> {
+  list.find(outputs, fn(output) { output.address == pool_address })
+}

@@ -1,0 +1,499 @@
+use aiken/transaction.{ScriptContext, Transaction, Input, Output, Finite, PosInfinity}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, to_dict}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import shared types
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use puckswap/lib/value_utils.{get_ada_quantity, get_asset_quantity}
+
+// =============================================================================
+// AMM SECURITY UTILITIES
+// =============================================================================
+// 
+// Comprehensive security validation utilities for AMM operations
+// - Anti-manipulation protection
+// - Dust attack prevention
+// - MEV protection
+// - Flash loan attack prevention
+// - Price impact validation
+// =============================================================================
+
+// Security configuration constants
+pub const MAX_PRICE_IMPACT_BPS: Int = 1000        // 10% maximum price impact
+pub const MIN_ADA_SWAP_AMOUNT: Int = 1_000_000     // 1 ADA minimum
+pub const MIN_TOKEN_SWAP_AMOUNT: Int = 1_000_000   // 1 token minimum
+pub const MAX_SWAP_PERCENTAGE: Int = 5000          // 50% of pool reserves
+pub const MAX_TRANSACTION_INPUTS: Int = 10         // Anti-flash loan
+pub const MAX_TRANSACTION_OUTPUTS: Int = 10        // Anti-flash loan
+pub const MAX_VALIDITY_RANGE_SLOTS: Int = 7200     // 2 hours
+pub const MAX_TRANSACTION_FEE: Int = 10_000_000    // 10 ADA
+
+// Security validation result
+pub type SecurityResult {
+  is_valid: Bool,
+  error_code: SecurityErrorCode,
+  error_message: ByteArray,
+}
+
+// Security error codes
+pub type SecurityErrorCode {
+  NoError
+  DustAttack
+  ManipulationAttempt
+  ExcessivePriceImpact
+  FlashLoanAttempt
+  UnauthorizedAccess
+  InvalidParameters
+  DeadlineExpired
+  InsufficientLiquidity
+}
+
+// =============================================================================
+// MAIN SECURITY VALIDATION
+// =============================================================================
+
+// Comprehensive security validation for AMM swaps
+pub fn validate_amm_security(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolCIP68Datum,
+  amount_in: Int,
+  swap_in_token: Bool,
+  user_address: Address,
+  deadline_slot: Int,
+  ctx: ScriptContext
+) -> SecurityResult {
+  // Validate against dust attacks
+  let dust_result = validate_dust_protection(amount_in, swap_in_token, datum.pool_state)
+  if !dust_result.is_valid {
+    return dust_result
+  }
+
+  // Validate against manipulation attacks
+  let manipulation_result = validate_manipulation_protection(
+    pool_input, pool_output, datum, amount_in, swap_in_token, ctx
+  )
+  if !manipulation_result.is_valid {
+    return manipulation_result
+  }
+
+  // Validate price impact
+  let price_impact_result = validate_price_impact(
+    datum.pool_state.ada_reserve,
+    datum.pool_state.token_reserve,
+    amount_in,
+    swap_in_token,
+    datum.pool_config.fee_bps
+  )
+  if !price_impact_result.is_valid {
+    return price_impact_result
+  }
+
+  // Validate against flash loan attacks
+  let flash_loan_result = validate_flash_loan_protection(ctx)
+  if !flash_loan_result.is_valid {
+    return flash_loan_result
+  }
+
+  // Validate user authorization
+  let auth_result = validate_user_authorization(user_address, ctx)
+  if !auth_result.is_valid {
+    return auth_result
+  }
+
+  // Validate deadline
+  let deadline_result = validate_deadline_security(deadline_slot, ctx)
+  if !deadline_result.is_valid {
+    return deadline_result
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// DUST ATTACK PROTECTION
+// =============================================================================
+
+// Validate against dust attacks
+pub fn validate_dust_protection(
+  amount_in: Int,
+  swap_in_token: Bool,
+  pool_state: PoolState
+) -> SecurityResult {
+  // Check minimum swap amounts
+  let min_amount = if swap_in_token { MIN_TOKEN_SWAP_AMOUNT } else { MIN_ADA_SWAP_AMOUNT }
+  
+  if amount_in < min_amount {
+    return SecurityResult {
+      is_valid: False,
+      error_code: DustAttack,
+      error_message: #"Swap amount below minimum threshold",
+    }
+  }
+
+  // Check maximum swap percentage
+  let pool_size = if swap_in_token { pool_state.token_reserve } else { pool_state.ada_reserve }
+  let max_swap_amount = pool_size * MAX_SWAP_PERCENTAGE / 10000
+
+  if amount_in > max_swap_amount {
+    return SecurityResult {
+      is_valid: False,
+      error_code: ExcessivePriceImpact,
+      error_message: #"Swap amount exceeds maximum percentage of pool",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// MANIPULATION PROTECTION
+// =============================================================================
+
+// Validate against manipulation attacks
+pub fn validate_manipulation_protection(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolCIP68Datum,
+  amount_in: Int,
+  swap_in_token: Bool,
+  ctx: ScriptContext
+) -> SecurityResult {
+  // Validate constant product is maintained
+  let original_product = datum.pool_state.ada_reserve * datum.pool_state.token_reserve
+  
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: PoolCIP68Datum = output_datum_data
+  
+  let new_product = new_pool_datum.pool_state.ada_reserve * new_pool_datum.pool_state.token_reserve
+
+  // Product should increase due to fees
+  if new_product < original_product {
+    return SecurityResult {
+      is_valid: False,
+      error_code: ManipulationAttempt,
+      error_message: #"Constant product formula violated",
+    }
+  }
+
+  // Validate reserves are reasonable
+  if new_pool_datum.pool_state.ada_reserve <= 0 || new_pool_datum.pool_state.token_reserve <= 0 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InsufficientLiquidity,
+      error_message: #"Pool reserves would become invalid",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// PRICE IMPACT VALIDATION
+// =============================================================================
+
+// Validate price impact is within acceptable bounds
+pub fn validate_price_impact(
+  ada_reserve: Int,
+  token_reserve: Int,
+  amount_in: Int,
+  swap_in_token: Bool,
+  fee_bps: Int
+) -> SecurityResult {
+  // Calculate price impact
+  let price_impact = calculate_price_impact(
+    ada_reserve, token_reserve, amount_in, swap_in_token, fee_bps
+  )
+
+  if price_impact > MAX_PRICE_IMPACT_BPS {
+    return SecurityResult {
+      is_valid: False,
+      error_code: ExcessivePriceImpact,
+      error_message: #"Price impact exceeds maximum allowed",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// Calculate price impact in basis points
+pub fn calculate_price_impact(
+  ada_reserve: Int,
+  token_reserve: Int,
+  amount_in: Int,
+  swap_in_token: Bool,
+  fee_bps: Int
+) -> Int {
+  // Calculate original price
+  let original_price = if swap_in_token {
+    ada_reserve * 1000000 / token_reserve
+  } else {
+    token_reserve * 1000000 / ada_reserve
+  }
+
+  // Calculate new reserves after swap
+  let fee_numerator = 997
+  let fee_denominator = 1000
+  let amount_in_with_fee = amount_in * fee_numerator
+
+  let (new_ada_reserve, new_token_reserve) = if swap_in_token {
+    let numerator = amount_in_with_fee * ada_reserve
+    let denominator = (token_reserve * fee_denominator) + amount_in_with_fee
+    let output_amount = numerator / denominator
+    (ada_reserve - output_amount, token_reserve + amount_in)
+  } else {
+    let numerator = amount_in_with_fee * token_reserve
+    let denominator = (ada_reserve * fee_denominator) + amount_in_with_fee
+    let output_amount = numerator / denominator
+    (ada_reserve + amount_in, token_reserve - output_amount)
+  }
+
+  // Calculate new price
+  let new_price = if swap_in_token {
+    new_ada_reserve * 1000000 / new_token_reserve
+  } else {
+    new_token_reserve * 1000000 / new_ada_reserve
+  }
+
+  // Calculate price impact in basis points
+  math.abs(new_price - original_price) * 10000 / original_price
+}
+
+// =============================================================================
+// FLASH LOAN PROTECTION
+// =============================================================================
+
+// Validate against flash loan attacks
+pub fn validate_flash_loan_protection(ctx: ScriptContext) -> SecurityResult {
+  let input_count = list.length(ctx.transaction.inputs)
+  let output_count = list.length(ctx.transaction.outputs)
+
+  if input_count > MAX_TRANSACTION_INPUTS {
+    return SecurityResult {
+      is_valid: False,
+      error_code: FlashLoanAttempt,
+      error_message: #"Too many transaction inputs",
+    }
+  }
+
+  if output_count > MAX_TRANSACTION_OUTPUTS {
+    return SecurityResult {
+      is_valid: False,
+      error_code: FlashLoanAttempt,
+      error_message: #"Too many transaction outputs",
+    }
+  }
+
+  // Validate transaction fee is reasonable
+  if ctx.transaction.fee > MAX_TRANSACTION_FEE {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InvalidParameters,
+      error_message: #"Transaction fee too high",
+    }
+  }
+
+  // Validate validity range is reasonable
+  let validity_range_size = calculate_validity_range_size(ctx.transaction.validity_range)
+  if validity_range_size > MAX_VALIDITY_RANGE_SLOTS {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InvalidParameters,
+      error_message: #"Validity range too large",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// Calculate validity range size in slots
+fn calculate_validity_range_size(validity_range) -> Int {
+  when (validity_range.lower_bound.bound_type, validity_range.upper_bound.bound_type) is {
+    (Finite(lower), Finite(upper)) -> upper - lower
+    _ -> 0
+  }
+}
+
+// =============================================================================
+// USER AUTHORIZATION
+// =============================================================================
+
+// Validate user authorization
+pub fn validate_user_authorization(user_address: Address, ctx: ScriptContext) -> SecurityResult {
+  let user_signed = list.any(ctx.transaction.extra_signatories, fn(signature) {
+    when user_address.payment_credential is {
+      VerificationKeyCredential(pkh) -> signature == pkh
+      _ -> False
+    }
+  })
+
+  if !user_signed {
+    return SecurityResult {
+      is_valid: False,
+      error_code: UnauthorizedAccess,
+      error_message: #"User signature required",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// DEADLINE VALIDATION
+// =============================================================================
+
+// Validate deadline security
+pub fn validate_deadline_security(deadline_slot: Int, ctx: ScriptContext) -> SecurityResult {
+  let is_valid = when ctx.transaction.validity_range.upper_bound.bound_type is {
+    Finite(upper_bound) -> upper_bound <= deadline_slot
+    PosInfinity -> True
+    _ -> False
+  }
+
+  if !is_valid {
+    return SecurityResult {
+      is_valid: False,
+      error_code: DeadlineExpired,
+      error_message: #"Transaction deadline expired",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Convert security error code to human-readable message
+pub fn security_error_to_message(error_code: SecurityErrorCode) -> ByteArray {
+  when error_code is {
+    NoError -> #"No error"
+    DustAttack -> #"Dust attack detected"
+    ManipulationAttempt -> #"Price manipulation attempt"
+    ExcessivePriceImpact -> #"Price impact too high"
+    FlashLoanAttempt -> #"Flash loan attack detected"
+    UnauthorizedAccess -> #"Unauthorized access attempt"
+    InvalidParameters -> #"Invalid parameters"
+    DeadlineExpired -> #"Transaction deadline expired"
+    InsufficientLiquidity -> #"Insufficient liquidity"
+  }
+}
+
+// Validate swap parameters are within safe bounds
+pub fn validate_safe_swap_parameters(
+  amount_in: Int,
+  min_out: Int,
+  max_slippage_bps: Int,
+  pool_ada_reserve: Int,
+  pool_token_reserve: Int
+) -> SecurityResult {
+  // Validate amounts are positive
+  if amount_in <= 0 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InvalidParameters,
+      error_message: #"Input amount must be positive",
+    }
+  }
+
+  if min_out < 0 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InvalidParameters,
+      error_message: #"Minimum output cannot be negative",
+    }
+  }
+
+  // Validate slippage is reasonable
+  if max_slippage_bps < 0 || max_slippage_bps > 10000 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InvalidParameters,
+      error_message: #"Invalid slippage parameter",
+    }
+  }
+
+  // Validate pool has sufficient liquidity
+  if pool_ada_reserve <= 0 || pool_token_reserve <= 0 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: InsufficientLiquidity,
+      error_message: #"Pool has insufficient liquidity",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}
+
+// Check if transaction exhibits suspicious patterns
+pub fn detect_suspicious_patterns(ctx: ScriptContext) -> SecurityResult {
+  let tx = ctx.transaction
+
+  // Check for unusual minting patterns
+  let mint_policies = list.length(to_dict(tx.mint))
+  if mint_policies > 3 {
+    return SecurityResult {
+      is_valid: False,
+      error_code: FlashLoanAttempt,
+      error_message: #"Suspicious minting pattern",
+    }
+  }
+
+  // Check for circular transactions (same address in inputs and outputs)
+  let input_addresses = list.map(tx.inputs, fn(input) { input.output.address })
+  let output_addresses = list.map(tx.outputs, fn(output) { output.address })
+
+  let has_circular_pattern = list.any(input_addresses, fn(addr) {
+    list.count(output_addresses, fn(out_addr) { out_addr == addr }) > 2
+  })
+
+  if has_circular_pattern {
+    return SecurityResult {
+      is_valid: False,
+      error_code: FlashLoanAttempt,
+      error_message: #"Circular transaction pattern detected",
+    }
+  }
+
+  SecurityResult {
+    is_valid: True,
+    error_code: NoError,
+    error_message: #"",
+  }
+}

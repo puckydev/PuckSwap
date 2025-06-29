@@ -1,0 +1,438 @@
+use aiken/transaction.{ScriptContext, Mint, Spend, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, flatten, to_dict}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/dict
+
+// Import shared types
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use puckswap/lib/value_utils.{get_ada_quantity, get_asset_quantity}
+
+// =============================================================================
+// LP MINTING SECURITY UTILITIES
+// =============================================================================
+// 
+// Comprehensive security utilities for LP token minting policy
+// - Provision event validation
+// - Arbitrary minting prevention
+// - Validator execution verification
+// - Transaction pattern analysis
+// - Security threat detection
+// =============================================================================
+
+// Security validation constants
+pub const MAX_MINTING_POLICIES_PER_TX: Int = 1      // Only one policy should mint per transaction
+pub const MAX_VALIDATOR_EXECUTIONS: Int = 3         // Maximum validator executions per transaction
+pub const MIN_SECURITY_NONCE_LENGTH: Int = 8        // Minimum security nonce length
+pub const MAX_TRANSACTION_COMPLEXITY: Int = 10      // Maximum inputs/outputs for security
+
+// Security threat levels
+pub type ThreatLevel {
+  None
+  Low
+  Medium
+  High
+  Critical
+}
+
+// Security validation result
+pub type SecurityValidationResult {
+  is_valid: Bool,
+  threat_level: ThreatLevel,
+  error_message: ByteArray,
+  detected_patterns: List<SecurityPattern>,
+}
+
+// Security patterns that indicate potential attacks
+pub type SecurityPattern {
+  ArbitraryMinting
+  ValidatorBypass
+  ReplayAttack
+  FlashLoanAttempt
+  SandwichAttack
+  FrontRunning
+  BackRunning
+}
+
+// =============================================================================
+// PROVISION EVENT VALIDATION
+// =============================================================================
+
+// Validate that a legitimate provision event is occurring
+pub fn validate_provision_event(
+  pool_input: Input,
+  pool_output: Output,
+  pool_input_datum: PoolCIP68Datum,
+  pool_output_datum: PoolCIP68Datum,
+  operation_type: String,  // "mint" or "burn"
+  ctx: ScriptContext
+) -> SecurityValidationResult {
+  // Validate pool state changes are consistent with operation
+  let state_validation = validate_pool_state_changes(
+    pool_input_datum, pool_output_datum, operation_type
+  )
+  
+  if !state_validation.is_valid {
+    return state_validation
+  }
+
+  // Validate transaction structure is appropriate for provision
+  let structure_validation = validate_provision_transaction_structure(ctx, operation_type)
+  
+  if !structure_validation.is_valid {
+    return structure_validation
+  }
+
+  // Validate no suspicious patterns
+  let pattern_validation = detect_suspicious_provision_patterns(ctx)
+  
+  if !pattern_validation.is_valid {
+    return pattern_validation
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Validate pool state changes are consistent with operation type
+fn validate_pool_state_changes(
+  input_datum: PoolCIP68Datum,
+  output_datum: PoolCIP68Datum,
+  operation_type: String
+) -> SecurityValidationResult {
+  let input_state = input_datum.pool_state
+  let output_state = output_datum.pool_state
+
+  if operation_type == "mint" {
+    // For minting (liquidity provision), reserves and LP supply should increase
+    if output_state.ada_reserve <= input_state.ada_reserve ||
+       output_state.token_reserve <= input_state.token_reserve ||
+       output_state.total_lp_supply <= input_state.total_lp_supply {
+      return SecurityValidationResult {
+        is_valid: False,
+        threat_level: High,
+        error_message: #"Invalid pool state changes for minting operation",
+        detected_patterns: [ArbitraryMinting],
+      }
+    }
+  } else if operation_type == "burn" {
+    // For burning (liquidity withdrawal), reserves and LP supply should decrease
+    if output_state.ada_reserve >= input_state.ada_reserve ||
+       output_state.token_reserve >= input_state.token_reserve ||
+       output_state.total_lp_supply >= input_state.total_lp_supply {
+      return SecurityValidationResult {
+        is_valid: False,
+        threat_level: High,
+        error_message: #"Invalid pool state changes for burning operation",
+        detected_patterns: [ArbitraryMinting],
+      }
+    }
+  } else {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Critical,
+      error_message: #"Unknown operation type",
+      detected_patterns: [ArbitraryMinting],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Validate transaction structure is appropriate for provision
+fn validate_provision_transaction_structure(
+  ctx: ScriptContext,
+  operation_type: String
+) -> SecurityValidationResult {
+  let tx = ctx.transaction
+
+  // Validate transaction complexity
+  let input_count = list.length(tx.inputs)
+  let output_count = list.length(tx.outputs)
+
+  if input_count > MAX_TRANSACTION_COMPLEXITY || output_count > MAX_TRANSACTION_COMPLEXITY {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Medium,
+      error_message: #"Transaction too complex for provision operation",
+      detected_patterns: [FlashLoanAttempt],
+    }
+  }
+
+  // Validate minting policies
+  let mint_dict = to_dict(tx.mint)
+  let minting_policies = list.length(mint_dict)
+
+  if minting_policies > MAX_MINTING_POLICIES_PER_TX {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: High,
+      error_message: #"Too many minting policies in transaction",
+      detected_patterns: [ArbitraryMinting],
+    }
+  }
+
+  // Validate validator executions
+  let validator_executions = count_validator_executions(tx.inputs)
+
+  if validator_executions > MAX_VALIDATOR_EXECUTIONS {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Medium,
+      error_message: #"Too many validator executions",
+      detected_patterns: [FlashLoanAttempt],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// =============================================================================
+// ARBITRARY MINTING PREVENTION
+// =============================================================================
+
+// Validate against arbitrary LP minting attempts
+pub fn validate_arbitrary_minting_prevention(
+  policy_id: PolicyId,
+  redeemer: LPMintingRedeemer,
+  ctx: ScriptContext
+) -> SecurityValidationResult {
+  // Validate only authorized validators can trigger minting
+  let validator_validation = validate_authorized_validator_execution(redeemer, ctx)
+  
+  if !validator_validation.is_valid {
+    return validator_validation
+  }
+
+  // Validate minting amounts are reasonable
+  let amount_validation = validate_reasonable_minting_amounts(policy_id, ctx)
+  
+  if !amount_validation.is_valid {
+    return amount_validation
+  }
+
+  // Validate no bypass attempts
+  let bypass_validation = validate_no_validator_bypass(redeemer, ctx)
+  
+  if !bypass_validation.is_valid {
+    return bypass_validation
+  }
+
+  // Validate transaction timing
+  let timing_validation = validate_transaction_timing(ctx)
+  
+  if !timing_validation.is_valid {
+    return timing_validation
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Validate authorized validator execution
+fn validate_authorized_validator_execution(
+  redeemer: LPMintingRedeemer,
+  ctx: ScriptContext
+) -> SecurityValidationResult {
+  // Validate validator hash is present in transaction
+  let validator_present = list.any(ctx.transaction.inputs, fn(input) {
+    when input.output.address.payment_credential is {
+      ScriptCredential(script_hash) -> script_hash == redeemer.validator_hash
+      _ -> False
+    }
+  })
+
+  if !validator_present {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Critical,
+      error_message: #"Authorized validator not executed",
+      detected_patterns: [ValidatorBypass, ArbitraryMinting],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Validate reasonable minting amounts
+fn validate_reasonable_minting_amounts(
+  policy_id: PolicyId,
+  ctx: ScriptContext
+) -> SecurityValidationResult {
+  let mint_dict = to_dict(ctx.transaction.mint)
+  
+  // Find minting amounts for this policy
+  let policy_minting = list.find(mint_dict, fn(policy_assets) {
+    let (minting_policy, _) = policy_assets
+    minting_policy == policy_id
+  })
+
+  when policy_minting is {
+    Some((_, assets)) -> {
+      // Validate minting amounts are reasonable
+      let total_minted = list.foldr(assets, 0, fn(asset, acc) {
+        let (_, amount) = asset
+        acc + math.abs(amount)
+      })
+
+      // Prevent excessive minting (more than 1B tokens)
+      if total_minted > 1_000_000_000_000_000 {
+        return SecurityValidationResult {
+          is_valid: False,
+          threat_level: Critical,
+          error_message: #"Excessive minting amount",
+          detected_patterns: [ArbitraryMinting],
+        }
+      }
+
+      SecurityValidationResult {
+        is_valid: True,
+        threat_level: None,
+        error_message: #"",
+        detected_patterns: [],
+      }
+    }
+    None -> SecurityValidationResult {
+      is_valid: False,
+      threat_level: High,
+      error_message: #"No minting found for policy",
+      detected_patterns: [ArbitraryMinting],
+    }
+  }
+}
+
+// Validate no validator bypass attempts
+fn validate_no_validator_bypass(
+  redeemer: LPMintingRedeemer,
+  ctx: ScriptContext
+) -> SecurityValidationResult {
+  // Validate security nonce is properly formed
+  if bytearray.length(redeemer.security_nonce) < MIN_SECURITY_NONCE_LENGTH {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Medium,
+      error_message: #"Invalid security nonce",
+      detected_patterns: [ReplayAttack],
+    }
+  }
+
+  // Validate user authorization is present
+  let user_signed = list.any(ctx.transaction.extra_signatories, fn(signature) {
+    when redeemer.user_address.payment_credential is {
+      VerificationKeyCredential(pkh) -> signature == pkh
+      _ -> False
+    }
+  })
+
+  if !user_signed {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: High,
+      error_message: #"User authorization missing",
+      detected_patterns: [ValidatorBypass],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Validate transaction timing
+fn validate_transaction_timing(ctx: ScriptContext) -> SecurityValidationResult {
+  // Validate validity range is reasonable
+  let validity_range_size = when (ctx.transaction.validity_range.lower_bound.bound_type, ctx.transaction.validity_range.upper_bound.bound_type) is {
+    (Finite(lower), Finite(upper)) -> upper - lower
+    _ -> 0
+  }
+
+  // Prevent transactions with excessive validity ranges (potential for MEV)
+  if validity_range_size > 7200 {  // 2 hours
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Medium,
+      error_message: #"Validity range too large",
+      detected_patterns: [FrontRunning, BackRunning],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Count validator executions in transaction
+fn count_validator_executions(inputs: List<Input>) -> Int {
+  list.foldr(inputs, 0, fn(input, acc) {
+    when input.output.address.payment_credential is {
+      ScriptCredential(_) -> acc + 1
+      _ -> acc
+    }
+  })
+}
+
+// Detect suspicious provision patterns
+fn detect_suspicious_provision_patterns(ctx: ScriptContext) -> SecurityValidationResult {
+  let tx = ctx.transaction
+
+  // Check for sandwich attack patterns
+  let has_multiple_swaps = count_swap_operations(tx.inputs) > 1
+  
+  if has_multiple_swaps {
+    return SecurityValidationResult {
+      is_valid: False,
+      threat_level: Medium,
+      error_message: #"Potential sandwich attack pattern",
+      detected_patterns: [SandwichAttack],
+    }
+  }
+
+  SecurityValidationResult {
+    is_valid: True,
+    threat_level: None,
+    error_message: #"",
+    detected_patterns: [],
+  }
+}
+
+// Count swap operations in transaction (simplified)
+fn count_swap_operations(inputs: List<Input>) -> Int {
+  // This is a simplified implementation
+  // In practice, would analyze transaction patterns more thoroughly
+  list.length(inputs)
+}

@@ -1,0 +1,24 @@
+# PuckSwap Wallet Seed Template
+# 
+# Instructions:
+# 1. Copy this file to wallet.seed (without .template extension)
+# 2. Replace the example seed phrase below with your actual 12-24 word seed phrase
+# 3. Ensure wallet.seed is in .gitignore (it already is)
+# 4. Delete wallet.seed after use for security
+#
+# SECURITY WARNING:
+# - Never commit actual seed phrases to version control
+# - Never share seed phrases with anyone
+# - Use testnet wallets only for development
+# - Delete seed files after minting tokens
+#
+# Example format (replace with your actual seed phrase):
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+
+# For Preprod testnet, you can generate a new wallet seed phrase using:
+# - Eternl wallet (create new wallet, export seed phrase)
+# - Daedalus testnet (create new wallet, backup seed phrase)  
+# - Any BIP39 compatible wallet generator
+#
+# Make sure your wallet has at least 5 ADA on Preprod testnet before running the script.
+# Get testnet ADA from: https://docs.cardano.org/cardano-testnet/tools/faucet/

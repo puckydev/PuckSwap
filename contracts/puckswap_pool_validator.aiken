@@ -1,0 +1,319 @@
+use aiken/transaction.{ScriptContext, Spend, Mint, find_input, find_output}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, from_lovelace, merge, negate, tokens, flatten
+}
+use aiken/list
+use aiken/math
+use aiken/cbor
+use aiken/bytearray
+use aiken/option
+
+// Minimum ADA required in UTxOs (Cardano protocol parameter)
+const min_ada: Int = 2_000_000
+
+// Maximum slippage allowed (10% = 1000 basis points)
+const max_slippage_bps: Int = 1000
+
+// CIP-68 compliant datum structure for AMM pool
+// Following CIP-67 schema standardization
+type PoolDatum {
+  // CIP-68 metadata fields
+  version: Int,
+  extra: Data,
+
+  // Core pool state (CIP-20 multi-asset support)
+  ada_reserve: Int,
+  token_reserve: Int,
+  token_policy: PolicyId,
+  token_name: AssetName,
+
+  // LP token information (CIP-25 compliance)
+  lp_token_policy: PolicyId,
+  lp_token_name: AssetName,
+  total_lp_supply: Int,
+
+  // Pool parameters
+  fee_bps: Int,              // Trading fee in basis points
+  protocol_fee_bps: Int,     // Protocol fee in basis points
+
+  // Governance and security
+  creator: Address,
+  pool_nft_policy: PolicyId, // Unique pool identifier
+  pool_nft_name: AssetName,
+
+  // Pool state tracking
+  last_interaction: Int,     // Slot number of last interaction
+  cumulative_volume_ada: Int,
+  cumulative_volume_token: Int,
+}
+
+// Enhanced redeemer types with security validations
+type PoolRedeemer {
+  // Swap tokens with slippage protection
+  Swap {
+    input_amount: Int,
+    min_output: Int,
+    deadline: Int,           // Slot deadline for MEV protection
+    recipient: Address,      // Where to send output tokens
+  }
+
+  // Add liquidity with balanced deposits
+  AddLiquidity {
+    ada_amount: Int,
+    token_amount: Int,
+    min_lp_tokens: Int,      // Minimum LP tokens to receive
+    deadline: Int,
+  }
+
+  // Remove liquidity with minimum output guarantees
+  RemoveLiquidity {
+    lp_tokens: Int,
+    min_ada_out: Int,        // Minimum ADA to receive
+    min_token_out: Int,      // Minimum tokens to receive
+    deadline: Int,
+  }
+
+  // Pool creation (one-time operation)
+  CreatePool {
+    initial_ada: Int,
+    initial_token: Int,
+    fee_bps: Int,
+  }
+
+  // Emergency operations (governance only)
+  EmergencyPause
+  EmergencyUnpause
+}
+
+// Main pool validator - handles all pool operations
+validator pool_validator(ctx: ScriptContext, datum: PoolDatum, redeemer: PoolRedeemer) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find the pool input and output
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate basic constraints
+      expect validate_basic_constraints(pool_input, pool_output, datum, ctx)
+
+      // Handle specific operations
+      when redeemer is {
+        Swap { input_amount, min_output, deadline, recipient } ->
+          validate_swap_operation(pool_input, pool_output, datum, input_amount, min_output, deadline, recipient, ctx)
+
+        AddLiquidity { ada_amount, token_amount, min_lp_tokens, deadline } ->
+          validate_add_liquidity_operation(pool_input, pool_output, datum, ada_amount, token_amount, min_lp_tokens, deadline, ctx)
+
+        RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, deadline } ->
+          validate_remove_liquidity_operation(pool_input, pool_output, datum, lp_tokens, min_ada_out, min_token_out, deadline, ctx)
+
+        CreatePool { initial_ada, initial_token, fee_bps } ->
+          validate_pool_creation(pool_input, pool_output, datum, initial_ada, initial_token, fee_bps, ctx)
+
+        EmergencyPause ->
+          validate_emergency_pause(pool_input, pool_output, datum, ctx)
+
+        EmergencyUnpause ->
+          validate_emergency_unpause(pool_input, pool_output, datum, ctx)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate basic constraints that apply to all operations
+fn validate_basic_constraints(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Ensure pool output has minimum ADA
+  let pool_output_ada = quantity_of(pool_output.value, ada_policy_id, ada_asset_name)
+  expect pool_output_ada >= min_ada
+
+  // Ensure pool NFT is preserved (exactly one)
+  let input_nft_count = quantity_of(pool_input.output.value, datum.pool_nft_policy, datum.pool_nft_name)
+  let output_nft_count = quantity_of(pool_output.value, datum.pool_nft_policy, datum.pool_nft_name)
+  expect input_nft_count == 1 && output_nft_count == 1
+
+  // Validate datum structure is preserved
+  expect Some(output_datum) = pool_output.datum
+  expect output_pool_datum: PoolDatum = output_datum
+
+  // Core pool parameters must remain unchanged
+  expect output_pool_datum.token_policy == datum.token_policy
+  expect output_pool_datum.token_name == datum.token_name
+  expect output_pool_datum.lp_token_policy == datum.lp_token_policy
+  expect output_pool_datum.lp_token_name == datum.lp_token_name
+  expect output_pool_datum.pool_nft_policy == datum.pool_nft_policy
+  expect output_pool_datum.pool_nft_name == datum.pool_nft_name
+  expect output_pool_datum.creator == datum.creator
+
+  True
+}
+
+// Validate swap operation with enhanced security
+fn validate_swap_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  input_amount: Int,
+  min_output: Int,
+  deadline: Int,
+  recipient: Address,
+  ctx: ScriptContext
+) -> Bool {
+  // Check deadline
+  expect validate_deadline(deadline, ctx)
+
+  // Get current and new pool state
+  expect Some(output_datum) = pool_output.datum
+  expect new_pool_datum: PoolDatum = output_datum
+
+  // Calculate swap using constant product formula
+  let (expected_output, new_ada_reserve, new_token_reserve) =
+    calculate_swap_output(datum.ada_reserve, datum.token_reserve, input_amount, datum.fee_bps)
+
+  // Validate reserves are updated correctly
+  expect new_pool_datum.ada_reserve == new_ada_reserve
+  expect new_pool_datum.token_reserve == new_token_reserve
+
+  // Validate minimum output is met
+  expect expected_output >= min_output
+
+  // Validate recipient receives correct amount
+  let recipient_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == recipient
+  })
+
+  let total_received = list.fold(recipient_outputs, 0, fn(output, acc) {
+    acc + quantity_of(output.value, datum.token_policy, datum.token_name)
+  })
+
+  expect total_received >= expected_output
+
+  True
+}
+
+// Validate liquidity addition with proper LP token minting
+fn validate_add_liquidity(
+  input: transaction.Input,
+  output: transaction.Output,
+  datum: PoolDatum,
+  ada_amount: Int,
+  token_amount: Int,
+  ctx: ScriptContext
+) -> Bool {
+  expect Some(input_datum) = input.output.datum
+  expect input_pool_datum: PoolDatum = input_datum
+  
+  expect Some(output_datum) = output.datum
+  expect output_pool_datum: PoolDatum = output_datum
+  
+  // Calculate LP tokens to mint based on proportional share
+  let total_lp_supply = get_total_lp_supply(ctx, datum.lp_token_policy, datum.lp_token_name)
+  
+  let lp_tokens_to_mint = if total_lp_supply == 0 {
+    // Initial liquidity - use geometric mean
+    math.sqrt(ada_amount * token_amount)
+  } else {
+    // Proportional to existing reserves
+    let ada_ratio = ada_amount * total_lp_supply / datum.ada_reserve
+    let token_ratio = token_amount * total_lp_supply / datum.token_reserve
+    math.min(ada_ratio, token_ratio)
+  }
+  
+  // Validate reserves updated correctly
+  output_pool_datum.ada_reserve == datum.ada_reserve + ada_amount &&
+  output_pool_datum.token_reserve == datum.token_reserve + token_amount &&
+  lp_tokens_to_mint > 0
+}
+
+// Validate liquidity removal with LP token burning
+fn validate_remove_liquidity(
+  input: transaction.Input,
+  output: transaction.Output,
+  datum: PoolDatum,
+  lp_tokens: Int,
+  ctx: ScriptContext
+) -> Bool {
+  expect Some(input_datum) = input.output.datum
+  expect input_pool_datum: PoolDatum = input_datum
+  
+  expect Some(output_datum) = output.datum
+  expect output_pool_datum: PoolDatum = output_datum
+  
+  let total_lp_supply = get_total_lp_supply(ctx, datum.lp_token_policy, datum.lp_token_name)
+  
+  // Calculate proportional share to withdraw
+  let ada_to_withdraw = datum.ada_reserve * lp_tokens / total_lp_supply
+  let token_to_withdraw = datum.token_reserve * lp_tokens / total_lp_supply
+  
+  // Validate reserves updated correctly
+  output_pool_datum.ada_reserve == datum.ada_reserve - ada_to_withdraw &&
+  output_pool_datum.token_reserve == datum.token_reserve - token_to_withdraw
+}
+
+// Core AMM calculation using constant product formula (x * y = k)
+fn calculate_swap_output(
+  ada_reserve: Int,
+  token_reserve: Int,
+  input_amount: Int,
+  fee_bps: Int
+) -> (Int, Int, Int) {
+  // Calculate fee
+  let fee_amount = input_amount * fee_bps / 10000
+  let input_after_fee = input_amount - fee_amount
+
+  // Apply constant product formula: (x + dx) * (y - dy) = x * y
+  // Solving for dy: dy = y * dx / (x + dx)
+  let new_ada_reserve = ada_reserve + input_after_fee
+  let output_amount = token_reserve * input_after_fee / new_ada_reserve
+  let new_token_reserve = token_reserve - output_amount
+
+  // Return (output_amount, new_ada_reserve, new_token_reserve)
+  (output_amount, new_ada_reserve, new_token_reserve)
+}
+
+// Validate deadline hasn't passed
+fn validate_deadline(deadline: Int, ctx: ScriptContext) -> Bool {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    transaction.Finite(upper_bound) -> upper_bound <= deadline
+    transaction.PosInfinity -> True
+    _ -> False
+  }
+}
+
+// Calculate LP tokens to mint for liquidity addition
+fn calculate_lp_tokens_to_mint(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  total_lp_supply: Int
+) -> Int {
+  if total_lp_supply == 0 {
+    // Initial liquidity: use geometric mean
+    math.sqrt(ada_amount * token_amount)
+  } else {
+    // Proportional liquidity: min of the two ratios
+    let ada_ratio = ada_amount * total_lp_supply / ada_reserve
+    let token_ratio = token_amount * total_lp_supply / token_reserve
+    math.min(ada_ratio, token_ratio)
+  }
+}
+
+// Calculate tokens to withdraw for liquidity removal
+fn calculate_withdrawal_amounts(
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_tokens: Int,
+  total_lp_supply: Int
+) -> (Int, Int) {
+  let ada_to_withdraw = ada_reserve * lp_tokens / total_lp_supply
+  let token_to_withdraw = token_reserve * lp_tokens / total_lp_supply
+  (ada_to_withdraw, token_to_withdraw)
+}

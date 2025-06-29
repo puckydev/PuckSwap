@@ -1,0 +1,13 @@
+{
+  "network": "preprod",
+  "deployedAt": "2025-06-26T20:06:50.334Z",
+  "validators": {
+    "factory": "addr_test1wqldqrfqwjp4wj4h0hfgppluzxq6m73frk4gc95rvchv8xcayk6j4",
+    "liquidityProvision": "addr_test1wzuzxlayuz0lfytfk4hcl4y2clfrc06avur9aer5med462c73967d",
+    "swap": "addr_test1wrsdra0xecvtm5tnarj9p6lvukj7p6wskq65hv6w0hpn7mqht39hz"
+  },
+  "policies": {
+    "authentication": "f78cda912365edd6b6c8d29424fcb7dfbf8ef59b96c62636a5c52334",
+    "lpMinting": "67d57ba00801f0038eed3c45ec548f578b622882584578a80022f729"
+  }
+}

@@ -1,0 +1,491 @@
+use aiken/transaction.{ScriptContext, Output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, from_lovelace, tokens, flatten
+}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/cbor
+use aiken/dict.{Dict}
+
+// Import value utilities
+use puckswap/lib/value_utils.{
+  get_ada_quantity, get_native_assets, value_to_asset_list
+}
+
+// =============================================================================
+// MIN ADA CONSTANTS AND CONFIGURATION
+// =============================================================================
+
+// Base minimum ADA per UTxO (Cardano protocol parameter)
+pub const base_min_ada: Int = 1_000_000
+
+// Enhanced minimum ADA for script UTxOs (higher due to datum overhead)
+pub const script_min_ada: Int = 2_000_000
+
+// Minimum ADA for pool UTxOs (includes NFT, tokens, and complex datum)
+pub const pool_min_ada: Int = 3_000_000
+
+// Minimum ADA for factory UTxOs (includes configuration datum)
+pub const factory_min_ada: Int = 2_500_000
+
+// Minimum ADA for LP token UTxOs
+pub const lp_token_min_ada: Int = 2_000_000
+
+// Additional ADA per native asset in UTxO
+pub const ada_per_asset: Int = 344_798
+
+// Additional ADA per byte of datum
+pub const ada_per_datum_byte: Int = 4_310
+
+// Maximum reasonable UTxO size (to prevent bloat attacks)
+pub const max_utxo_size_bytes: Int = 16_384
+
+// =============================================================================
+// MIN ADA CALCULATION FUNCTIONS
+// =============================================================================
+
+// Calculate minimum ADA required for a UTxO based on its contents
+pub fn calculate_min_ada_for_utxo(
+  value: Value,
+  datum_size_bytes: Int,
+  is_script_address: Bool
+) -> Int {
+  // Start with base minimum
+  let base_amount = if is_script_address {
+    script_min_ada
+  } else {
+    base_min_ada
+  }
+  
+  // Add cost for native assets
+  let native_assets = get_native_assets(value)
+  let asset_cost = list.length(native_assets) * ada_per_asset
+  
+  // Add cost for datum size
+  let datum_cost = datum_size_bytes * ada_per_datum_byte
+  
+  // Calculate total minimum ADA
+  let total_min_ada = base_amount + asset_cost + datum_cost
+  
+  // Ensure it doesn't exceed reasonable limits
+  if datum_size_bytes > max_utxo_size_bytes {
+    // Penalize oversized UTxOs
+    total_min_ada + (datum_size_bytes - max_utxo_size_bytes) * ada_per_datum_byte * 2
+  } else {
+    total_min_ada
+  }
+}
+
+// Calculate minimum ADA for pool UTxO specifically
+pub fn calculate_pool_min_ada(
+  pool_value: Value,
+  pool_datum_size: Int,
+  has_nft: Bool,
+  token_count: Int
+) -> Int {
+  // Start with pool-specific minimum
+  let base_pool_ada = pool_min_ada
+  
+  // Add cost for pool NFT if present
+  let nft_cost = if has_nft { ada_per_asset } else { 0 }
+  
+  // Add cost for each token pair in the pool
+  let token_cost = token_count * ada_per_asset
+  
+  // Add datum overhead
+  let datum_cost = pool_datum_size * ada_per_datum_byte
+  
+  // Calculate total with safety margin (10% buffer)
+  let total_min_ada = base_pool_ada + nft_cost + token_cost + datum_cost
+  total_min_ada + (total_min_ada / 10)
+}
+
+// Calculate minimum ADA for user output UTxO
+pub fn calculate_user_output_min_ada(
+  output_value: Value,
+  has_datum: Bool
+) -> Int {
+  let base_amount = base_min_ada
+  
+  // Add cost for native assets
+  let native_assets = get_native_assets(output_value)
+  let asset_cost = list.length(native_assets) * ada_per_asset
+  
+  // Add cost for datum if present
+  let datum_cost = if has_datum { 
+    // Assume small datum for user outputs
+    50 * ada_per_datum_byte 
+  } else { 
+    0 
+  }
+  
+  base_amount + asset_cost + datum_cost
+}
+
+// Calculate minimum ADA for factory UTxO
+pub fn calculate_factory_min_ada(
+  factory_value: Value,
+  factory_datum_size: Int
+) -> Int {
+  let base_factory_ada = factory_min_ada
+  let datum_cost = factory_datum_size * ada_per_datum_byte
+  
+  // Add small buffer for factory operations
+  base_factory_ada + datum_cost + (factory_min_ada / 20) // 5% buffer
+}
+
+// Calculate minimum ADA for LP token UTxO
+pub fn calculate_lp_token_min_ada(
+  lp_value: Value,
+  metadata_size: Int
+) -> Int {
+  let base_lp_ada = lp_token_min_ada
+  let metadata_cost = metadata_size * ada_per_datum_byte
+  
+  base_lp_ada + metadata_cost
+}
+
+// =============================================================================
+// UTxO VALIDATION FUNCTIONS
+// =============================================================================
+
+// UTxO type classification for min ADA calculation
+pub type UTxOType {
+  PoolUTxO { has_nft: Bool, token_count: Int }
+  FactoryUTxO
+  LPTokenUTxO { metadata_size: Int }
+  UserUTxO { has_datum: Bool }
+  GenericUTxO
+}
+
+// Pool operation types for validation
+pub type PoolOperationType {
+  SwapOperation
+  AddLiquidityOperation
+  RemoveLiquidityOperation
+  CreatePoolOperation
+}
+
+// Validate that a UTxO meets minimum ADA requirements
+pub fn validate_utxo_min_ada(
+  output: Output,
+  expected_datum_size: Int,
+  utxo_type: UTxOType
+) -> Bool {
+  let ada_amount = get_ada_quantity(output.value)
+  let is_script = is_script_address(output.address)
+  
+  let required_min_ada = when utxo_type is {
+    PoolUTxO { has_nft, token_count } -> 
+      calculate_pool_min_ada(output.value, expected_datum_size, has_nft, token_count)
+    
+    FactoryUTxO -> 
+      calculate_factory_min_ada(output.value, expected_datum_size)
+    
+    LPTokenUTxO { metadata_size } -> 
+      calculate_lp_token_min_ada(output.value, metadata_size)
+    
+    UserUTxO { has_datum } -> 
+      calculate_user_output_min_ada(output.value, has_datum)
+    
+    GenericUTxO -> 
+      calculate_min_ada_for_utxo(output.value, expected_datum_size, is_script)
+  }
+  
+  ada_amount >= required_min_ada
+}
+
+// Validate all outputs in a transaction meet min ADA requirements
+pub fn validate_transaction_min_ada(
+  outputs: List<Output>,
+  output_specifications: List<(Int, UTxOType)> // (datum_size, utxo_type) pairs
+) -> Bool {
+  let output_pairs = list.zip(outputs, output_specifications)
+  
+  list.all(output_pairs, fn(pair) {
+    let (output, spec) = pair
+    let (datum_size, utxo_type) = spec
+    validate_utxo_min_ada(output, datum_size, utxo_type)
+  })
+}
+
+// Check if address is a script address
+pub fn is_script_address(address: Address) -> Bool {
+  when address.payment_credential is {
+    credential.ScriptCredential(_) -> True
+    _ -> False
+  }
+}
+
+// Estimate datum size in bytes (simplified)
+pub fn estimate_datum_size(datum: Data) -> Int {
+  // Simplified estimation - in practice would use actual CBOR size
+  let serialized = cbor.serialise(datum)
+  bytearray.length(serialized)
+}
+
+// Calculate safety buffer for min ADA (percentage-based)
+pub fn calculate_safety_buffer(base_amount: Int, buffer_percentage: Int) -> Int {
+  base_amount + (base_amount * buffer_percentage / 100)
+}
+
+// Validate that ADA amount covers minimum with buffer
+pub fn validate_ada_with_buffer(
+  ada_amount: Int,
+  required_min_ada: Int,
+  buffer_percentage: Int
+) -> Bool {
+  let min_with_buffer = calculate_safety_buffer(required_min_ada, buffer_percentage)
+  ada_amount >= min_with_buffer
+}
+
+// =============================================================================
+// POOL-SPECIFIC MIN ADA VALIDATION
+// =============================================================================
+
+// Validate pool operation maintains minimum ADA
+pub fn validate_pool_operation_min_ada(
+  pool_input: Output,
+  pool_output: Output,
+  pool_datum_size: Int,
+  operation_type: PoolOperationType
+) -> Bool {
+  // Validate input had sufficient ADA
+  let input_valid = validate_utxo_min_ada(
+    pool_input,
+    pool_datum_size,
+    PoolUTxO { has_nft: True, token_count: 1 }
+  )
+
+  // Validate output has sufficient ADA
+  let output_valid = validate_utxo_min_ada(
+    pool_output,
+    pool_datum_size,
+    PoolUTxO { has_nft: True, token_count: 1 }
+  )
+
+  // Additional validation based on operation type
+  let operation_valid = when operation_type is {
+    SwapOperation -> {
+      // Ensure ADA reserves don't go below minimum
+      let ada_reserve = get_ada_quantity(pool_output.value)
+      let min_pool_ada = calculate_pool_min_ada(pool_output.value, pool_datum_size, True, 1)
+      ada_reserve >= min_pool_ada
+    }
+
+    AddLiquidityOperation -> {
+      // Ensure added ADA maintains minimum
+      let input_ada = get_ada_quantity(pool_input.value)
+      let output_ada = get_ada_quantity(pool_output.value)
+      output_ada >= input_ada // ADA should increase or stay same
+    }
+
+    RemoveLiquidityOperation -> {
+      // Ensure remaining ADA is sufficient
+      let remaining_ada = get_ada_quantity(pool_output.value)
+      let min_pool_ada = calculate_pool_min_ada(pool_output.value, pool_datum_size, True, 1)
+      remaining_ada >= min_pool_ada
+    }
+
+    CreatePoolOperation -> {
+      // Validate initial pool funding
+      let initial_ada = get_ada_quantity(pool_output.value)
+      let min_pool_ada = calculate_pool_min_ada(pool_output.value, pool_datum_size, True, 1)
+      initial_ada >= min_pool_ada
+    }
+  }
+
+  input_valid && output_valid && operation_valid
+}
+
+// Validate swap operation doesn't drain pool below minimum
+pub fn validate_swap_min_ada_preservation(
+  input_ada_reserve: Int,
+  output_ada_reserve: Int,
+  pool_value: Value,
+  pool_datum_size: Int
+) -> Bool {
+  let min_pool_ada = calculate_pool_min_ada(pool_value, pool_datum_size, True, 1)
+
+  // Ensure both input and output reserves are above minimum
+  input_ada_reserve >= min_pool_ada && output_ada_reserve >= min_pool_ada
+}
+
+// Validate liquidity removal doesn't break minimum ADA
+pub fn validate_liquidity_removal_min_ada(
+  initial_ada_reserve: Int,
+  final_ada_reserve: Int,
+  ada_to_withdraw: Int,
+  pool_value: Value,
+  pool_datum_size: Int
+) -> Bool {
+  let min_pool_ada = calculate_pool_min_ada(pool_value, pool_datum_size, True, 1)
+
+  // Ensure final reserves are above minimum
+  final_ada_reserve >= min_pool_ada &&
+  // Ensure withdrawal amount is reasonable
+  ada_to_withdraw <= (initial_ada_reserve - min_pool_ada) &&
+  // Ensure calculation is correct
+  final_ada_reserve == initial_ada_reserve - ada_to_withdraw
+}
+
+// =============================================================================
+// USER OUTPUT VALIDATION
+// =============================================================================
+
+// Validate user receives sufficient ADA in swap
+pub fn validate_user_swap_output_min_ada(
+  user_output: Output,
+  is_ada_output: Bool
+) -> Bool {
+  if is_ada_output {
+    // User receiving ADA - ensure it meets minimum
+    let ada_amount = get_ada_quantity(user_output.value)
+    let min_user_ada = calculate_user_output_min_ada(user_output.value, False)
+    ada_amount >= min_user_ada
+  } else {
+    // User receiving tokens - ensure UTxO has minimum ADA
+    let ada_amount = get_ada_quantity(user_output.value)
+    let min_user_ada = calculate_user_output_min_ada(user_output.value, False)
+    ada_amount >= min_user_ada
+  }
+}
+
+// Validate all user outputs in transaction
+pub fn validate_all_user_outputs_min_ada(
+  user_outputs: List<Output>
+) -> Bool {
+  list.all(user_outputs, fn(output) {
+    validate_utxo_min_ada(output, 0, UserUTxO { has_datum: False })
+  })
+}
+
+// =============================================================================
+// FACTORY AND LP TOKEN VALIDATION
+// =============================================================================
+
+// Validate factory UTxO min ADA requirements
+pub fn validate_factory_min_ada(
+  factory_input: Output,
+  factory_output: Output,
+  factory_datum_size: Int
+) -> Bool {
+  let input_valid = validate_utxo_min_ada(
+    factory_input,
+    factory_datum_size,
+    FactoryUTxO
+  )
+
+  let output_valid = validate_utxo_min_ada(
+    factory_output,
+    factory_datum_size,
+    FactoryUTxO
+  )
+
+  input_valid && output_valid
+}
+
+// Validate LP token minting/burning min ADA
+pub fn validate_lp_token_min_ada(
+  lp_outputs: List<Output>,
+  metadata_size: Int
+) -> Bool {
+  list.all(lp_outputs, fn(output) {
+    validate_utxo_min_ada(output, metadata_size, LPTokenUTxO { metadata_size: metadata_size })
+  })
+}
+
+// =============================================================================
+// COMPREHENSIVE TRANSACTION VALIDATION
+// =============================================================================
+
+// Validate entire transaction maintains min ADA requirements
+pub fn validate_transaction_comprehensive_min_ada(
+  ctx: ScriptContext,
+  pool_datum_size: Int,
+  operation_type: PoolOperationType
+) -> Bool {
+  let outputs = ctx.transaction.outputs
+
+  // Find pool outputs
+  let pool_outputs = list.filter(outputs, fn(output) {
+    is_script_address(output.address)
+  })
+
+  // Find user outputs
+  let user_outputs = list.filter(outputs, fn(output) {
+    !is_script_address(output.address)
+  })
+
+  // Validate pool outputs
+  let pool_valid = list.all(pool_outputs, fn(output) {
+    validate_utxo_min_ada(output, pool_datum_size, PoolUTxO { has_nft: True, token_count: 1 })
+  })
+
+  // Validate user outputs
+  let user_valid = validate_all_user_outputs_min_ada(user_outputs)
+
+  pool_valid && user_valid
+}
+
+// =============================================================================
+// ERROR REPORTING AND DEBUGGING
+// =============================================================================
+
+// Calculate min ADA deficit for debugging
+pub fn calculate_min_ada_deficit(
+  actual_ada: Int,
+  required_min_ada: Int
+) -> Int {
+  if actual_ada >= required_min_ada {
+    0
+  } else {
+    required_min_ada - actual_ada
+  }
+}
+
+// Generate min ADA report for UTxO
+pub fn generate_min_ada_report(
+  output: Output,
+  datum_size: Int,
+  utxo_type: UTxOType
+) -> MinAdaReport {
+  let actual_ada = get_ada_quantity(output.value)
+  let is_script = is_script_address(output.address)
+
+  let required_min_ada = when utxo_type is {
+    PoolUTxO { has_nft, token_count } ->
+      calculate_pool_min_ada(output.value, datum_size, has_nft, token_count)
+    FactoryUTxO ->
+      calculate_factory_min_ada(output.value, datum_size)
+    LPTokenUTxO { metadata_size } ->
+      calculate_lp_token_min_ada(output.value, metadata_size)
+    UserUTxO { has_datum } ->
+      calculate_user_output_min_ada(output.value, has_datum)
+    GenericUTxO ->
+      calculate_min_ada_for_utxo(output.value, datum_size, is_script)
+  }
+
+  let deficit = calculate_min_ada_deficit(actual_ada, required_min_ada)
+  let is_valid = deficit == 0
+
+  MinAdaReport {
+    actual_ada: actual_ada,
+    required_min_ada: required_min_ada,
+    deficit: deficit,
+    is_valid: is_valid,
+    utxo_type: utxo_type
+  }
+}
+
+// Min ADA report type for debugging
+pub type MinAdaReport {
+  actual_ada: Int,
+  required_min_ada: Int,
+  deficit: Int,
+  is_valid: Bool,
+  utxo_type: UTxOType
+}

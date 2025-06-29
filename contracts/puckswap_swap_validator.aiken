@@ -1,0 +1,549 @@
+use aiken/transaction.{ScriptContext, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, from_lovelace, merge, negate, flatten
+}
+use aiken/list
+use aiken/math
+use aiken/option
+use aiken/dict.{Dict}
+use puckswap/lib/value_utils.{
+  get_ada_quantity, get_asset_quantity, value_difference, validate_exact_assets,
+  get_native_assets, validate_min_ada, contains_asset, value_geq
+}
+use puckswap/lib/cip68_types.{
+  PoolCIP68Datum, PoolState, PoolConfig, PoolStats, CIP68Metadata,
+  validate_cip68_structure, update_pool_stats, get_metadata_value,
+  metadata_key_name, metadata_key_pool_fee
+}
+
+// Enhanced redeemer with CIP-68 support
+type SwapRedeemer {
+  swap_in_token: Bool,  // true if swapping token -> ADA, false for ADA -> token
+  amount_in: Int,
+  min_out: Int,
+  deadline_slot: Int,   // Added deadline validation
+  user_address: Address, // For validation
+}
+
+// Main pool validator with full CIP-68 support
+validator puckswap_pool_cip68(
+  ctx: ScriptContext,
+  datum: PoolCIP68Datum,
+  redeemer: SwapRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Validate CIP-68 structure
+      expect validate_cip68_structure(datum)
+
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      validate_cip68_swap_operation(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// Core AMM calculation using constant product formula with 0.3% fee
+fn get_amount_out(amount_in: Int, reserve_in: Int, reserve_out: Int) -> Int {
+  // Uniswap-style fee: 0.3% = 997/1000 after fee
+  let fee_numerator = 997
+  let fee_denominator = 1000
+
+  let amount_in_with_fee = amount_in * fee_numerator
+  let numerator = amount_in_with_fee * reserve_out
+  let denominator = (reserve_in * fee_denominator) + amount_in_with_fee
+
+  numerator / denominator
+}
+
+// Main swap validator
+validator puckswap_swap(ctx: ScriptContext, datum: PoolDatum, redeemer: SwapRedeemer) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      validate_swap_operation(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// Enhanced CIP-68 swap operation validation
+fn validate_cip68_swap_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolCIP68Datum,
+  redeemer: SwapRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate CIP-68 datum versions are compatible
+  expect validate_datum_compatibility(pool_input, pool_output, datum)
+
+  // Validate deadline hasn't passed
+  expect validate_swap_deadline(redeemer.deadline_slot, ctx)
+
+  // Extract pool state and config from CIP-68 datum
+  let pool_state = datum.pool_state
+  let pool_config = datum.pool_config
+  let pool_stats = datum.pool_stats
+
+  // Validate pool is not paused
+  expect !pool_config.is_paused
+
+  // Extract and validate reserves
+  let (input_ada, input_token) = extract_cip68_pool_reserves(pool_input.output.value, pool_config)
+  let (output_ada, output_token) = extract_cip68_pool_reserves(pool_output.value, pool_config)
+
+  // Validate reserves match datum state
+  expect input_ada == pool_state.ada_reserve
+  expect input_token == pool_state.token_reserve
+
+  // Calculate and validate the swap with CIP-68 data
+  let swap_result = calculate_cip68_swap(
+    input_ada, input_token, output_ada, output_token,
+    redeemer, pool_config, pool_stats, ctx
+  )
+
+  // Validate user receives correct assets
+  expect validate_cip68_user_payment(swap_result, redeemer, pool_config, ctx)
+
+  // Validate updated pool datum structure
+  expect validate_updated_cip68_datum(pool_output, swap_result, datum, ctx)
+
+  True
+}
+
+// Validate CIP-68 datum compatibility between input and output
+fn validate_datum_compatibility(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  input_datum: PoolCIP68Datum
+) -> Bool {
+  expect Some(output_datum_data) = pool_output.datum
+  expect output_datum: PoolCIP68Datum = output_datum_data
+
+  // Version should remain the same or be upgraded
+  expect output_datum.version >= input_datum.version
+
+  // Core configuration should remain unchanged
+  expect output_datum.pool_config.token_policy == input_datum.pool_config.token_policy
+  expect output_datum.pool_config.token_name == input_datum.pool_config.token_name
+  expect output_datum.pool_config.lp_token_policy == input_datum.pool_config.lp_token_policy
+  expect output_datum.pool_config.creator == input_datum.pool_config.creator
+
+  // Essential metadata should be preserved
+  let input_name = get_metadata_value(input_datum.metadata, metadata_key_name)
+  let output_name = get_metadata_value(output_datum.metadata, metadata_key_name)
+  expect input_name == output_name
+
+  True
+}
+
+// Validate swap deadline
+fn validate_swap_deadline(deadline_slot: Int, ctx: ScriptContext) -> Bool {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    transaction.Finite(upper_bound) -> upper_bound <= deadline_slot
+    transaction.PosInfinity -> True
+    _ -> False
+  }
+}
+
+// Extract pool reserves from CIP-68 structure
+fn extract_cip68_pool_reserves(pool_value: Value, pool_config: PoolConfig) -> (Int, Int) {
+  let ada_amount = get_ada_quantity(pool_value)
+  let token_amount = get_asset_quantity(pool_value, pool_config.token_policy, pool_config.token_name)
+
+  // Validate reserves are positive
+  expect ada_amount > 0
+  expect token_amount > 0
+
+  (ada_amount, token_amount)
+}
+
+// Validate pool value structure (only contains expected assets)
+fn validate_pool_value_structure(
+  input_value: Value,
+  output_value: Value,
+  datum: PoolDatum
+) -> Bool {
+  // Get all native assets in both values
+  let input_native = get_native_assets(input_value)
+  let output_native = get_native_assets(output_value)
+
+  // Pool should only contain the trading token and LP token
+  let allowed_policies = [datum.token_policy, datum.lp_token_policy]
+
+  // Validate input value structure
+  let input_valid = list.all(input_native, fn(asset) {
+    let (policy_id, _, _) = asset
+    list.has(allowed_policies, policy_id)
+  })
+
+  // Validate output value structure
+  let output_valid = list.all(output_native, fn(asset) {
+    let (policy_id, _, _) = asset
+    list.has(allowed_policies, policy_id)
+  })
+
+  input_valid && output_valid
+}
+
+// Enhanced CIP-68 swap calculation with statistics tracking
+fn calculate_cip68_swap(
+  input_ada: Int,
+  input_token: Int,
+  output_ada: Int,
+  output_token: Int,
+  redeemer: SwapRedeemer,
+  pool_config: PoolConfig,
+  pool_stats: PoolStats,
+  ctx: ScriptContext
+) -> CIP68SwapResult {
+  // Get current slot for statistics
+  let current_slot = get_current_slot(ctx)
+
+  if redeemer.swap_in_token {
+    // Token -> ADA swap
+    let expected_ada_out = get_amount_out_with_fees(
+      redeemer.amount_in,
+      input_token,
+      input_ada,
+      pool_config.fee_bps,
+      pool_config.protocol_fee_bps
+    )
+
+    // Validate minimum output
+    expect expected_ada_out.user_amount >= redeemer.min_out
+
+    // Validate reserves updated correctly
+    let expected_new_ada = input_ada - expected_ada_out.user_amount
+    let expected_new_token = input_token + redeemer.amount_in
+
+    expect output_ada == expected_new_ada
+    expect output_token == expected_new_token
+
+    // Calculate new price (ADA per token, scaled by 1e6)
+    let new_price = expected_new_ada * 1_000_000 / expected_new_token
+
+    CIP68SwapResult {
+      is_ada_to_token: False,
+      input_amount: redeemer.amount_in,
+      output_amount: expected_ada_out.user_amount,
+      fee_amount: expected_ada_out.fee_amount,
+      protocol_fee_amount: expected_ada_out.protocol_fee_amount,
+      output_policy: ada_policy_id,
+      output_name: ada_asset_name,
+      new_ada_reserve: expected_new_ada,
+      new_token_reserve: expected_new_token,
+      new_price: new_price,
+      swap_slot: current_slot,
+    }
+  } else {
+    // ADA -> Token swap
+    let expected_token_out = get_amount_out_with_fees(
+      redeemer.amount_in,
+      input_ada,
+      input_token,
+      pool_config.fee_bps,
+      pool_config.protocol_fee_bps
+    )
+
+    // Validate minimum output
+    expect expected_token_out.user_amount >= redeemer.min_out
+
+    // Validate reserves updated correctly
+    let expected_new_ada = input_ada + redeemer.amount_in
+    let expected_new_token = input_token - expected_token_out.user_amount
+
+    expect output_ada == expected_new_ada
+    expect output_token == expected_new_token
+
+    // Calculate new price (ADA per token, scaled by 1e6)
+    let new_price = expected_new_ada * 1_000_000 / expected_new_token
+
+    CIP68SwapResult {
+      is_ada_to_token: True,
+      input_amount: redeemer.amount_in,
+      output_amount: expected_token_out.user_amount,
+      fee_amount: expected_token_out.fee_amount,
+      protocol_fee_amount: expected_token_out.protocol_fee_amount,
+      output_policy: pool_config.token_policy,
+      output_name: pool_config.token_name,
+      new_ada_reserve: expected_new_ada,
+      new_token_reserve: expected_new_token,
+      new_price: new_price,
+      swap_slot: current_slot,
+    }
+  }
+}
+
+// Enhanced CIP-68 swap result with comprehensive data
+type CIP68SwapResult {
+  is_ada_to_token: Bool,
+  input_amount: Int,
+  output_amount: Int,
+  fee_amount: Int,
+  protocol_fee_amount: Int,
+  output_policy: PolicyId,
+  output_name: AssetName,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  new_price: Int,
+  swap_slot: Int,
+}
+
+// Fee calculation result
+type FeeCalculationResult {
+  user_amount: Int,
+  fee_amount: Int,
+  protocol_fee_amount: Int,
+}
+
+// Enhanced AMM calculation with protocol fees
+fn get_amount_out_with_fees(
+  amount_in: Int,
+  reserve_in: Int,
+  reserve_out: Int,
+  fee_bps: Int,
+  protocol_fee_bps: Int
+) -> FeeCalculationResult {
+  // Calculate total fee (trading fee + protocol fee)
+  let total_fee_bps = fee_bps + protocol_fee_bps
+  let fee_numerator = 10000 - total_fee_bps
+  let fee_denominator = 10000
+
+  let amount_in_with_fee = amount_in * fee_numerator
+  let numerator = amount_in_with_fee * reserve_out
+  let denominator = (reserve_in * fee_denominator) + amount_in_with_fee
+  let user_amount = numerator / denominator
+
+  // Calculate fee breakdown
+  let total_fee = amount_in * total_fee_bps / 10000
+  let protocol_fee = amount_in * protocol_fee_bps / 10000
+  let trading_fee = total_fee - protocol_fee
+
+  FeeCalculationResult {
+    user_amount: user_amount,
+    fee_amount: trading_fee,
+    protocol_fee_amount: protocol_fee,
+  }
+}
+
+// Get current slot from transaction context
+fn get_current_slot(ctx: ScriptContext) -> Int {
+  when ctx.transaction.validity_range.lower_bound.bound_type is {
+    transaction.Finite(lower_bound) -> lower_bound
+    _ -> 0
+  }
+}
+
+// Validate Token -> ADA swap
+fn validate_token_to_ada_swap(
+  input_ada: Int,
+  input_token: Int,
+  output_ada: Int,
+  output_token: Int,
+  amount_in: Int,
+  min_out: Int,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Calculate expected ADA output using AMM formula
+  let expected_ada_out = get_amount_out(amount_in, input_token, input_ada)
+
+  // Validate minimum output requirement
+  expect expected_ada_out >= min_out
+
+  // Validate pool reserves are updated correctly
+  let expected_new_ada = input_ada - expected_ada_out
+  let expected_new_token = input_token + amount_in
+
+  // Check that pool reserves match expected values
+  expect output_ada == expected_new_ada
+  expect output_token == expected_new_token
+
+  // Validate user receives the ADA (check transaction outputs)
+  validate_user_receives_ada(expected_ada_out, ctx)
+}
+
+// Enhanced CIP-68 user payment validation
+fn validate_cip68_user_payment(
+  swap_result: CIP68SwapResult,
+  redeemer: SwapRedeemer,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Get pool script address for filtering
+  let pool_address = get_pool_script_address(ctx)
+
+  // Find outputs to the user's address
+  let user_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == redeemer.user_address
+  })
+
+  // Calculate total output assets sent to user
+  let total_user_output = calculate_total_user_assets(
+    user_outputs,
+    swap_result.output_policy,
+    swap_result.output_name
+  )
+
+  // Validate user receives at least the expected amount
+  expect total_user_output >= swap_result.output_amount
+
+  // Validate protocol fees are handled correctly (if any)
+  if swap_result.protocol_fee_amount > 0 {
+    validate_protocol_fee_collection(swap_result, pool_config, ctx)
+  } else {
+    True
+  }
+}
+
+// Validate protocol fee collection
+fn validate_protocol_fee_collection(
+  swap_result: CIP68SwapResult,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find outputs to protocol fee address (admin address for now)
+  let fee_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == pool_config.admin
+  })
+
+  // Calculate total protocol fees collected
+  let total_fees_collected = if swap_result.is_ada_to_token {
+    // For ADA->Token swaps, protocol fee is in ADA
+    list.fold(fee_outputs, 0, fn(output, acc) {
+      acc + get_ada_quantity(output.value)
+    })
+  } else {
+    // For Token->ADA swaps, protocol fee is in tokens
+    list.fold(fee_outputs, 0, fn(output, acc) {
+      acc + get_asset_quantity(output.value, pool_config.token_policy, pool_config.token_name)
+    })
+  }
+
+  // Validate correct protocol fee amount is collected
+  total_fees_collected >= swap_result.protocol_fee_amount
+}
+
+// Calculate total assets of specific type sent to users
+fn calculate_total_user_assets(
+  user_outputs: List<transaction.Output>,
+  asset_policy: PolicyId,
+  asset_name: AssetName
+) -> Int {
+  list.fold(user_outputs, 0, fn(output, acc) {
+    let asset_amount = get_asset_quantity(output.value, asset_policy, asset_name)
+    acc + asset_amount
+  })
+}
+
+// Validate only authorized assets are involved in the transaction
+fn validate_authorized_assets_only(
+  input_value: Value,
+  output_value: Value,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Calculate value difference (what was added/removed)
+  let value_diff = value_difference(output_value, input_value)
+
+  // Get all assets in the difference
+  let diff_assets = get_native_assets(value_diff)
+
+  // Only the trading token should change (plus ADA)
+  list.all(diff_assets, fn(asset) {
+    let (policy_id, asset_name, _) = asset
+    // Allow trading token changes
+    (policy_id == datum.token_policy && asset_name == datum.token_name) ||
+    // Allow LP token changes (for liquidity operations)
+    (policy_id == datum.lp_token_policy && asset_name == datum.lp_token_name)
+  })
+}
+
+// Validate updated CIP-68 datum structure
+fn validate_updated_cip68_datum(
+  pool_output: transaction.Output,
+  swap_result: CIP68SwapResult,
+  original_datum: PoolCIP68Datum,
+  ctx: ScriptContext
+) -> Bool {
+  expect Some(new_datum_data) = pool_output.datum
+  expect new_datum: PoolCIP68Datum = new_datum_data
+
+  // Validate pool state is updated correctly
+  expect new_datum.pool_state.ada_reserve == swap_result.new_ada_reserve
+  expect new_datum.pool_state.token_reserve == swap_result.new_token_reserve
+  expect new_datum.pool_state.last_interaction_slot == swap_result.swap_slot
+
+  // Validate pool configuration remains unchanged
+  expect new_datum.pool_config == original_datum.pool_config
+
+  // Validate pool statistics are updated
+  let expected_stats = update_pool_stats(
+    original_datum.pool_stats,
+    if swap_result.is_ada_to_token { swap_result.input_amount } else { 0 },
+    if swap_result.is_ada_to_token { 0 } else { swap_result.input_amount },
+    swap_result.fee_amount,
+    swap_result.new_price,
+    swap_result.swap_slot
+  )
+
+  expect new_datum.pool_stats.total_volume_ada == expected_stats.total_volume_ada
+  expect new_datum.pool_stats.total_volume_token == expected_stats.total_volume_token
+  expect new_datum.pool_stats.total_fees_collected == expected_stats.total_fees_collected
+  expect new_datum.pool_stats.swap_count == expected_stats.swap_count
+  expect new_datum.pool_stats.last_price_ada_per_token == expected_stats.last_price_ada_per_token
+
+  // Validate CIP-68 metadata is preserved
+  expect new_datum.metadata == original_datum.metadata
+  expect new_datum.version == original_datum.version
+
+  True
+}
+
+// Get pool script address from transaction context
+fn get_pool_script_address(ctx: ScriptContext) -> Address {
+  // Find the script input being spent
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      expect Some(script_input) = find_input(ctx.transaction.inputs, output_ref)
+      script_input.output.address
+    }
+    _ -> error @"Invalid script purpose"
+  }
+}
+
+// Validate transaction inputs contain required assets
+fn validate_transaction_inputs(
+  swap_result: SwapResult,
+  redeemer: SwapRedeemer,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Calculate total input assets from user (non-pool inputs)
+  let pool_address = get_pool_script_address(ctx)
+  let user_inputs = list.filter(ctx.transaction.inputs, fn(input) {
+    input.output.address != pool_address
+  })
+
+  if swap_result.is_ada_to_token {
+    // ADA -> Token: validate user provided enough ADA
+    let total_user_ada = list.fold(user_inputs, 0, fn(input, acc) {
+      acc + get_ada_quantity(input.output.value)
+    })
+    total_user_ada >= redeemer.amount_in
+  } else {
+    // Token -> ADA: validate user provided enough tokens
+    let total_user_tokens = list.fold(user_inputs, 0, fn(input, acc) {
+      acc + get_asset_quantity(input.output.value, datum.token_policy, datum.token_name)
+    })
+    total_user_tokens >= redeemer.amount_in
+  }
+}

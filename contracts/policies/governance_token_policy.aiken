@@ -1,0 +1,482 @@
+// PuckSwap v4 Enterprise - Governance Token Policy
+// DAO governance token minting and distribution with comprehensive controls
+// CIP-68 compliant with anti-manipulation measures
+
+use aiken/transaction.{ScriptContext, Mint, find_input, find_output}
+use aiken/transaction/credential.{Address, ScriptCredential, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, tokens, merge, from_lovelace, flatten}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/option
+use aiken/hash.{blake2b_256}
+
+// Import shared types and utilities
+use puckswap/lib/cip68_types.{CIP68Metadata, CIP68_REFERENCE_PREFIX, CIP68_USER_PREFIX}
+use puckswap/lib/min_ada_utils.{min_ada, validate_min_ada_output}
+use puckswap/lib/value_utils.{ada_policy_id, ada_asset_name}
+
+// Governance token distribution schedule
+type DistributionSchedule {
+  total_supply: Int,
+  initial_distribution: Int,
+  team_allocation: Int,
+  community_allocation: Int,
+  liquidity_mining_allocation: Int,
+  treasury_allocation: Int,
+  
+  // Vesting parameters
+  team_vesting_period_slots: Int,
+  community_vesting_period_slots: Int,
+  
+  // Distribution timing
+  distribution_start_slot: Int,
+  distribution_intervals: List<DistributionInterval>,
+}
+
+type DistributionInterval {
+  start_slot: Int,
+  end_slot: Int,
+  amount_per_slot: Int,
+  recipient_type: RecipientType,
+}
+
+type RecipientType {
+  Team { team_members: List<Address> }
+  Community { community_pool: Address }
+  LiquidityMining { mining_contract: Address }
+  Treasury { treasury_address: Address }
+  Governance { governance_contract: Address }
+  PublicSale { sale_contract: Address }
+}
+
+// Governance token minting context
+type GovernanceTokenContext {
+  distribution_schedule: DistributionSchedule,
+  governance_address: Address,
+  admin_addresses: List<Address>,
+  emergency_admin: Address,
+  
+  // Anti-manipulation measures
+  max_mint_per_tx: Int,
+  max_mint_per_slot: Int,
+  mint_cooldown_slots: Int,
+  
+  // Governance controls
+  minting_paused: Bool,
+  requires_governance_approval: Bool,
+  min_governance_approval_votes: Int,
+}
+
+// Governance token operations
+type GovernanceTokenOperation {
+  // Initial distribution
+  InitialMint {
+    recipients: List<Address>,
+    amounts: List<Int>,
+    distribution_type: RecipientType,
+  }
+  
+  // Scheduled distribution
+  ScheduledMint {
+    interval_id: Int,
+    recipients: List<Address>,
+    amounts: List<Int>,
+  }
+  
+  // Liquidity mining rewards
+  LiquidityMiningReward {
+    mining_participants: List<Address>,
+    reward_amounts: List<Int>,
+    mining_period_id: Int,
+  }
+  
+  // Governance rewards
+  GovernanceReward {
+    voters: List<Address>,
+    voting_rewards: List<Int>,
+    proposal_id: Int,
+  }
+  
+  // Community grants
+  CommunityGrant {
+    grant_recipients: List<Address>,
+    grant_amounts: List<Int>,
+    grant_proposal_id: Int,
+  }
+  
+  // Emergency mint (admin only)
+  EmergencyMint {
+    emergency_recipients: List<Address>,
+    emergency_amounts: List<Int>,
+    emergency_reason: ByteArray,
+  }
+  
+  // Token burn (deflationary mechanism)
+  BurnTokens {
+    burn_amount: Int,
+    burn_reason: ByteArray,
+  }
+}
+
+// Enhanced governance token minting policy
+minting_policy governance_token_policy(
+  ctx: ScriptContext,
+  token_context: GovernanceTokenContext,
+  operation: GovernanceTokenOperation
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Validate governance token context
+      expect validate_governance_token_context(token_context, ctx)
+      
+      // Get minted/burned tokens
+      let minted_tokens = flatten(ctx.transaction.mint)
+      let governance_tokens = filter_governance_tokens(minted_tokens, policy_id)
+      
+      // Handle different operation types
+      when operation is {
+        InitialMint { recipients, amounts, distribution_type } ->
+          validate_initial_governance_mint(
+            governance_tokens, recipients, amounts, distribution_type, token_context, ctx
+          )
+        
+        ScheduledMint { interval_id, recipients, amounts } ->
+          validate_scheduled_governance_mint(
+            governance_tokens, interval_id, recipients, amounts, token_context, ctx
+          )
+        
+        LiquidityMiningReward { mining_participants, reward_amounts, mining_period_id } ->
+          validate_liquidity_mining_reward_mint(
+            governance_tokens, mining_participants, reward_amounts, mining_period_id, token_context, ctx
+          )
+        
+        GovernanceReward { voters, voting_rewards, proposal_id } ->
+          validate_governance_reward_mint(
+            governance_tokens, voters, voting_rewards, proposal_id, token_context, ctx
+          )
+        
+        CommunityGrant { grant_recipients, grant_amounts, grant_proposal_id } ->
+          validate_community_grant_mint(
+            governance_tokens, grant_recipients, grant_amounts, grant_proposal_id, token_context, ctx
+          )
+        
+        EmergencyMint { emergency_recipients, emergency_amounts, emergency_reason } ->
+          validate_emergency_governance_mint(
+            governance_tokens, emergency_recipients, emergency_amounts, emergency_reason, token_context, ctx
+          )
+        
+        BurnTokens { burn_amount, burn_reason } ->
+          validate_governance_token_burn(
+            governance_tokens, burn_amount, burn_reason, token_context, ctx
+          )
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate governance token context
+fn validate_governance_token_context(
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate distribution schedule
+  expect validate_distribution_schedule(token_context.distribution_schedule)
+  
+  // Validate addresses
+  expect validate_address_structure(token_context.governance_address)
+  expect validate_address_list(token_context.admin_addresses)
+  expect validate_address_structure(token_context.emergency_admin)
+  
+  // Validate anti-manipulation parameters
+  expect token_context.max_mint_per_tx > 0
+  expect token_context.max_mint_per_slot > 0
+  expect token_context.mint_cooldown_slots >= 0
+  
+  // Validate governance parameters
+  expect token_context.min_governance_approval_votes > 0
+  
+  True
+}
+
+// Validate initial governance mint
+fn validate_initial_governance_mint(
+  governance_tokens: List<(AssetName, Int)>,
+  recipients: List<Address>,
+  amounts: List<Int>,
+  distribution_type: RecipientType,
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Check minting is not paused
+  expect !token_context.minting_paused
+  
+  // Validate recipients and amounts match
+  expect list.length(recipients) == list.length(amounts)
+  expect list.length(recipients) > 0
+  
+  // Validate all amounts are positive
+  expect all_amounts_positive(amounts)
+  
+  // Calculate total mint amount
+  let total_mint_amount = sum_amounts(amounts)
+  
+  // Validate against distribution schedule
+  expect validate_initial_distribution_amount(total_mint_amount, distribution_type, token_context.distribution_schedule)
+  
+  // Validate minting limits
+  expect total_mint_amount <= token_context.max_mint_per_tx
+  
+  // Validate governance tokens being minted
+  expect list.length(governance_tokens) == 1
+  expect Some((gov_token_name, gov_amount)) = list.head(governance_tokens)
+  expect gov_amount == total_mint_amount
+  
+  // Validate recipients receive correct amounts
+  expect validate_governance_token_recipients(ctx.transaction.outputs, recipients, amounts, gov_token_name)
+  
+  // Validate admin authorization
+  expect validate_admin_authorization(token_context.admin_addresses, ctx)
+  
+  True
+}
+
+// Validate scheduled governance mint
+fn validate_scheduled_governance_mint(
+  governance_tokens: List<(AssetName, Int)>,
+  interval_id: Int,
+  recipients: List<Address>,
+  amounts: List<Int>,
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Check minting is not paused
+  expect !token_context.minting_paused
+  
+  // Validate interval ID
+  expect interval_id >= 0
+  expect interval_id < list.length(token_context.distribution_schedule.distribution_intervals)
+  
+  // Get distribution interval
+  expect Some(interval) = list.at(token_context.distribution_schedule.distribution_intervals, interval_id)
+  
+  // Validate current slot is within interval
+  expect validate_slot_within_interval(interval, ctx)
+  
+  // Validate recipients and amounts
+  expect list.length(recipients) == list.length(amounts)
+  expect list.length(recipients) > 0
+  expect all_amounts_positive(amounts)
+  
+  // Calculate total mint amount
+  let total_mint_amount = sum_amounts(amounts)
+  
+  // Validate against interval allocation
+  expect validate_interval_mint_amount(total_mint_amount, interval, ctx)
+  
+  // Validate minting limits
+  expect total_mint_amount <= token_context.max_mint_per_tx
+  
+  // Validate governance tokens being minted
+  expect list.length(governance_tokens) == 1
+  expect Some((gov_token_name, gov_amount)) = list.head(governance_tokens)
+  expect gov_amount == total_mint_amount
+  
+  // Validate recipients receive correct amounts
+  expect validate_governance_token_recipients(ctx.transaction.outputs, recipients, amounts, gov_token_name)
+  
+  True
+}
+
+// Validate liquidity mining reward mint
+fn validate_liquidity_mining_reward_mint(
+  governance_tokens: List<(AssetName, Int)>,
+  mining_participants: List<Address>,
+  reward_amounts: List<Int>,
+  mining_period_id: Int,
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Check minting is not paused
+  expect !token_context.minting_paused
+  
+  // Validate mining period
+  expect mining_period_id >= 0
+  
+  // Validate participants and rewards
+  expect list.length(mining_participants) == list.length(reward_amounts)
+  expect list.length(mining_participants) > 0
+  expect all_amounts_positive(reward_amounts)
+  
+  // Calculate total reward amount
+  let total_reward_amount = sum_amounts(reward_amounts)
+  
+  // Validate against liquidity mining allocation
+  expect validate_liquidity_mining_allocation(total_reward_amount, token_context.distribution_schedule)
+  
+  // Validate minting limits
+  expect total_reward_amount <= token_context.max_mint_per_tx
+  
+  // Validate governance tokens being minted
+  expect list.length(governance_tokens) == 1
+  expect Some((gov_token_name, gov_amount)) = list.head(governance_tokens)
+  expect gov_amount == total_reward_amount
+  
+  // Validate mining participants receive rewards
+  expect validate_governance_token_recipients(ctx.transaction.outputs, mining_participants, reward_amounts, gov_token_name)
+  
+  // Validate liquidity mining contract authorization
+  expect validate_liquidity_mining_authorization(token_context, ctx)
+  
+  True
+}
+
+// Validate governance reward mint
+fn validate_governance_reward_mint(
+  governance_tokens: List<(AssetName, Int)>,
+  voters: List<Address>,
+  voting_rewards: List<Int>,
+  proposal_id: Int,
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Check minting is not paused
+  expect !token_context.minting_paused
+  
+  // Validate proposal ID
+  expect proposal_id > 0
+  
+  // Validate voters and rewards
+  expect list.length(voters) == list.length(voting_rewards)
+  expect list.length(voters) > 0
+  expect all_amounts_positive(voting_rewards)
+  
+  // Calculate total reward amount
+  let total_reward_amount = sum_amounts(voting_rewards)
+  
+  // Validate minting limits
+  expect total_reward_amount <= token_context.max_mint_per_tx
+  
+  // Validate governance tokens being minted
+  expect list.length(governance_tokens) == 1
+  expect Some((gov_token_name, gov_amount)) = list.head(governance_tokens)
+  expect gov_amount == total_reward_amount
+  
+  // Validate voters receive rewards
+  expect validate_governance_token_recipients(ctx.transaction.outputs, voters, voting_rewards, gov_token_name)
+  
+  // Validate governance contract authorization
+  expect validate_governance_authorization(token_context.governance_address, ctx)
+  
+  True
+}
+
+// Validate governance token burn
+fn validate_governance_token_burn(
+  governance_tokens: List<(AssetName, Int)>,
+  burn_amount: Int,
+  burn_reason: ByteArray,
+  token_context: GovernanceTokenContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate burn amount
+  expect burn_amount > 0
+  expect bytearray.length(burn_reason) > 0
+  
+  // Validate governance tokens being burned (negative amount)
+  expect list.length(governance_tokens) == 1
+  expect Some((gov_token_name, gov_amount)) = list.head(governance_tokens)
+  expect gov_amount == -burn_amount
+  
+  // Validate governance approval for burning
+  if token_context.requires_governance_approval {
+    expect validate_governance_authorization(token_context.governance_address, ctx)
+  } else {
+    expect validate_admin_authorization(token_context.admin_addresses, ctx)
+  }
+  
+  True
+}
+
+// Helper function to filter governance tokens from minted tokens
+fn filter_governance_tokens(
+  minted_tokens: List<(PolicyId, AssetName, Int)>,
+  gov_policy: PolicyId
+) -> List<(AssetName, Int)> {
+  when minted_tokens is {
+    [] -> []
+    [(policy, name, amount), ..tail] ->
+      if policy == gov_policy {
+        [(name, amount), ..filter_governance_tokens(tail, gov_policy)]
+      } else {
+        filter_governance_tokens(tail, gov_policy)
+      }
+  }
+}
+
+// Validate distribution schedule
+fn validate_distribution_schedule(schedule: DistributionSchedule) -> Bool {
+  expect schedule.total_supply > 0
+  expect schedule.initial_distribution > 0
+  expect schedule.team_allocation > 0
+  expect schedule.community_allocation > 0
+  expect schedule.liquidity_mining_allocation > 0
+  expect schedule.treasury_allocation > 0
+  
+  // Validate total allocation doesn't exceed total supply
+  let total_allocation = schedule.initial_distribution + 
+                        schedule.team_allocation + 
+                        schedule.community_allocation + 
+                        schedule.liquidity_mining_allocation + 
+                        schedule.treasury_allocation
+  
+  expect total_allocation <= schedule.total_supply
+  
+  // Validate vesting periods
+  expect schedule.team_vesting_period_slots > 0
+  expect schedule.community_vesting_period_slots > 0
+  
+  // Validate distribution intervals
+  expect list.length(schedule.distribution_intervals) > 0
+  
+  True
+}
+
+// Helper function to check all amounts are positive
+fn all_amounts_positive(amounts: List<Int>) -> Bool {
+  when amounts is {
+    [] -> True
+    [head, ..tail] ->
+      if head > 0 {
+        all_amounts_positive(tail)
+      } else {
+        False
+      }
+  }
+}
+
+// Helper function to sum amounts
+fn sum_amounts(amounts: List<Int>) -> Int {
+  when amounts is {
+    [] -> 0
+    [head, ..tail] -> head + sum_amounts(tail)
+  }
+}
+
+// Validate address list
+fn validate_address_list(addresses: List<Address>) -> Bool {
+  when addresses is {
+    [] -> True
+    [head, ..tail] ->
+      validate_address_structure(head) && validate_address_list(tail)
+  }
+}
+
+// Validate address structure
+fn validate_address_structure(address: Address) -> Bool {
+  when address.payment_credential is {
+    ScriptCredential(_) -> True
+    VerificationKeyCredential(_) -> True
+  }
+}

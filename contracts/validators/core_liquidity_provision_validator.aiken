@@ -1,0 +1,307 @@
+// PuckSwap Core Liquidity Provision Validator - Production Ready
+// Handles proportional ADA + PUCKY deposits with LP token minting
+// Full CIP-68 compliance with Aiken standard library usage
+
+use aiken/transaction.{ScriptContext, Spend, Input, Output, OutputReference, Finite}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of}
+use cardano/assets
+use aiken/option.{Option, Some, None}
+use aiken/error
+use aiken/list
+use aiken/math
+use aiken/cbor
+
+// Import CIP-68 types and utilities
+use lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use lib/min_ada_utils.{validate_min_ada_output}
+
+// =============================================================================
+// CORE LIQUIDITY PROVISION VALIDATOR - PRODUCTION READY
+// =============================================================================
+// 
+// Features:
+// - Proportional ADA + PUCKY deposits
+// - LP token minting coordination
+// - CIP-68 compliant datum structure
+// - Minimum ADA requirement validation
+// - Balanced liquidity validation
+// - Initial liquidity support
+// =============================================================================
+
+// Core liquidity provision redeemer
+pub type CoreLiquidityRedeemer {
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  is_initial_liquidity: Bool,
+  user_address: Address,
+  deadline_slot: Int,
+}
+
+// Liquidity calculation result
+pub type LiquidityResult {
+  lp_tokens_minted: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  new_total_lp_supply: Int,
+}
+
+// Main liquidity provision validator
+validator core_liquidity_provision_validator(
+  ctx: ScriptContext,
+  datum: PoolCIP68Datum,
+  redeemer: CoreLiquidityRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find pool input and output UTxOs
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate CIP-68 structure integrity
+      expect validate_cip68_structure(datum)
+
+      // Validate and execute the liquidity provision operation
+      validate_core_liquidity_provision(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// Validate core liquidity provision operation
+fn validate_core_liquidity_provision(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolCIP68Datum,
+  redeemer: CoreLiquidityRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Extract pool state and configuration
+  let pool_state = datum.pool_state
+  let pool_config = datum.pool_config
+
+  // Validate pool is not paused
+  expect !pool_config.is_paused
+
+  // Validate deadline hasn't passed
+  expect validate_deadline(redeemer.deadline_slot, ctx)
+
+  // Validate redeemer parameters
+  expect validate_redeemer_parameters(redeemer)
+
+  // Get current pool reserves from UTxO values
+  let (current_ada_reserve, current_token_reserve) = 
+    extract_pool_reserves(pool_input.output.value, pool_config)
+
+  // Verify reserves match datum
+  expect current_ada_reserve == pool_state.ada_reserve
+  expect current_token_reserve == pool_state.token_reserve
+
+  // Calculate liquidity provision
+  let liquidity_result = calculate_core_liquidity_provision(
+    current_ada_reserve,
+    current_token_reserve,
+    pool_state.total_lp_supply,
+    redeemer.ada_amount,
+    redeemer.token_amount,
+    redeemer.is_initial_liquidity
+  )
+
+  // Validate minimum LP tokens requirement
+  expect liquidity_result.lp_tokens_minted >= redeemer.min_lp_tokens
+
+  // Validate pool output UTxO
+  expect validate_pool_output(pool_output, datum, liquidity_result, ctx)
+
+  // Validate LP token minting
+  expect validate_lp_token_minting(liquidity_result.lp_tokens_minted, pool_config, ctx)
+
+  // Validate user provides correct input amounts
+  expect validate_user_input(redeemer.user_address, redeemer.ada_amount, redeemer.token_amount, pool_config, ctx)
+
+  // Validate minimum ADA requirements
+  expect validate_min_ada_output(pool_output)
+
+  True
+}
+
+// Calculate core liquidity provision
+fn calculate_core_liquidity_provision(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  is_initial_liquidity: Bool
+) -> LiquidityResult {
+  // Validate input parameters
+  expect ada_amount > 0
+  expect token_amount > 0
+
+  let (lp_tokens_minted, new_ada_reserve, new_token_reserve, new_total_lp_supply) = 
+    if is_initial_liquidity {
+      // Initial liquidity: LP tokens = sqrt(ada_amount * token_amount)
+      expect ada_reserve == 0
+      expect token_reserve == 0
+      expect total_lp_supply == 0
+      
+      let initial_lp_tokens = math.sqrt(ada_amount * token_amount)
+      expect initial_lp_tokens > 0
+      
+      (initial_lp_tokens, ada_amount, token_amount, initial_lp_tokens)
+    } else {
+      // Subsequent liquidity: maintain pool ratio
+      expect ada_reserve > 0
+      expect token_reserve > 0
+      expect total_lp_supply > 0
+
+      // Calculate proportional amounts
+      let ada_ratio = (ada_amount * 1000000) / ada_reserve  // Scale for precision
+      let token_ratio = (token_amount * 1000000) / token_reserve
+
+      // Validate amounts are proportional (within 1% tolerance)
+      let ratio_diff = if ada_ratio > token_ratio { ada_ratio - token_ratio } else { token_ratio - ada_ratio }
+      expect ratio_diff <= 10000  // 1% tolerance
+
+      // Calculate LP tokens based on proportion of pool
+      let lp_tokens = (total_lp_supply * ada_amount) / ada_reserve
+      expect lp_tokens > 0
+
+      (lp_tokens, ada_reserve + ada_amount, token_reserve + token_amount, total_lp_supply + lp_tokens)
+    }
+
+  LiquidityResult {
+    lp_tokens_minted: lp_tokens_minted,
+    new_ada_reserve: new_ada_reserve,
+    new_token_reserve: new_token_reserve,
+    new_total_lp_supply: new_total_lp_supply,
+  }
+}
+
+// Validate CIP-68 structure integrity
+fn validate_cip68_structure(datum: PoolCIP68Datum) -> Bool {
+  // Validate version is supported
+  expect datum.version >= 1
+
+  // Validate pool configuration
+  expect datum.pool_config.fee_bps >= 0 && datum.pool_config.fee_bps <= 10000
+
+  True
+}
+
+// Validate deadline hasn't passed
+fn validate_deadline(deadline_slot: Int, ctx: ScriptContext) -> Bool {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    Finite(upper_slot) -> deadline_slot >= upper_slot
+    _ -> True  // No upper bound means no deadline constraint
+  }
+}
+
+// Validate redeemer parameters
+fn validate_redeemer_parameters(redeemer: CoreLiquidityRedeemer) -> Bool {
+  expect redeemer.ada_amount > 0
+  expect redeemer.token_amount > 0
+  expect redeemer.min_lp_tokens >= 0
+  expect redeemer.deadline_slot > 0
+  True
+}
+
+// Extract pool reserves from UTxO value
+fn extract_pool_reserves(value: Value, config: PoolConfig) -> (Int, Int) {
+  let ada_amount = quantity_of(value, ada_policy_id(), ada_asset_name())
+  let token_amount = quantity_of(value, config.token_policy, config.token_name)
+  (ada_amount, token_amount)
+}
+
+// Validate pool output UTxO has correct updated state
+fn validate_pool_output(
+  pool_output: Output,
+  input_datum: PoolCIP68Datum,
+  liquidity_result: LiquidityResult,
+  ctx: ScriptContext
+) -> Bool {
+  // Extract output datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect output_datum: PoolCIP68Datum = output_datum_data
+
+  // Validate pool state is correctly updated
+  expect output_datum.pool_state.ada_reserve == liquidity_result.new_ada_reserve
+  expect output_datum.pool_state.token_reserve == liquidity_result.new_token_reserve
+  expect output_datum.pool_state.total_lp_supply == liquidity_result.new_total_lp_supply
+
+  // Validate other fields remain unchanged
+  expect output_datum.pool_config == input_datum.pool_config
+  expect output_datum.version == input_datum.version
+
+  // Validate pool UTxO value matches new reserves
+  let expected_ada = liquidity_result.new_ada_reserve
+  let expected_token = liquidity_result.new_token_reserve
+  let actual_ada = quantity_of(pool_output.value, ada_policy_id(), ada_asset_name())
+  let actual_token = quantity_of(pool_output.value, input_datum.pool_config.token_policy, input_datum.pool_config.token_name)
+
+  expect actual_ada == expected_ada
+  expect actual_token == expected_token
+
+  True
+}
+
+// Validate LP token minting occurs correctly
+fn validate_lp_token_minting(
+  lp_tokens_minted: Int,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find minting in transaction
+  let minted_value = ctx.transaction.mint
+  let minted_lp_tokens = quantity_of(minted_value, pool_config.lp_token_policy, pool_config.lp_token_name)
+  
+  expect minted_lp_tokens == lp_tokens_minted
+  expect lp_tokens_minted > 0
+
+  True
+}
+
+// Validate user provides correct input amounts
+fn validate_user_input(
+  user_address: Address,
+  ada_amount: Int,
+  token_amount: Int,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find user input UTxO(s)
+  let user_inputs = list.filter(
+    ctx.transaction.inputs,
+    fn(input) { input.output.address == user_address }
+  )
+
+  // Calculate total user input amounts
+  let total_ada_input = list.foldr(
+    user_inputs,
+    0,
+    fn(input, acc) { acc + quantity_of(input.output.value, ada_policy_id(), ada_asset_name()) }
+  )
+
+  let total_token_input = list.foldr(
+    user_inputs,
+    0,
+    fn(input, acc) { acc + quantity_of(input.output.value, pool_config.token_policy, pool_config.token_name) }
+  )
+
+  // Validate user has provided sufficient amounts
+  expect total_ada_input >= ada_amount
+  expect total_token_input >= token_amount
+
+  True
+}
+
+// Find input UTxO by output reference
+fn find_input(inputs: List<Input>, output_ref: OutputReference) -> Option<Input> {
+  list.find(inputs, fn(input) { input.output_reference == output_ref })
+}
+
+// Find output UTxO by address
+fn find_output(outputs: List<Output>, address: Address) -> Option<Output> {
+  list.find(outputs, fn(output) { output.address == address })
+}

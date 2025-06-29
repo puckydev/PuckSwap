@@ -1,0 +1,388 @@
+use aiken/transaction.{ScriptContext, Input, Output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import shared types
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use puckswap/lib/value_utils.{get_ada_quantity, get_asset_quantity}
+
+// =============================================================================
+// WITHDRAWAL UTILITIES
+// =============================================================================
+// 
+// Comprehensive utilities for liquidity withdrawal calculations
+// - Proportional withdrawal calculations
+// - LP token burning validation
+// - Pool draining prevention
+// - Withdrawal claim verification
+// =============================================================================
+
+// Withdrawal calculation constants
+pub const MIN_POOL_ADA_RESERVE: Int = 10_000_000      // 10 ADA minimum in pool
+pub const MIN_POOL_TOKEN_RESERVE: Int = 1_000_000     // 1 token minimum in pool
+pub const MIN_LP_SUPPLY: Int = 1000                   // Minimum LP supply to prevent total draining
+pub const MIN_LP_TOKENS_TO_BURN: Int = 1000           // Minimum LP tokens to burn (dust protection)
+pub const MAX_SINGLE_WITHDRAWAL_BPS: Int = 5000       // 50% maximum single withdrawal
+pub const MAX_EMERGENCY_WITHDRAWAL_BPS: Int = 9900    // 99% maximum emergency withdrawal
+
+// Withdrawal calculation result
+pub type WithdrawalCalculationResult {
+  ada_to_withdraw: Int,
+  token_to_withdraw: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  new_total_lp_supply: Int,
+  withdrawal_share_percentage: Int,
+  is_valid: Bool,
+  error_message: ByteArray,
+}
+
+// Withdrawal validation result
+pub type WithdrawalValidationResult {
+  is_valid: Bool,
+  error_message: ByteArray,
+  max_withdrawable_lp_tokens: Int,
+  estimated_ada_out: Int,
+  estimated_token_out: Int,
+}
+
+// =============================================================================
+// CORE WITHDRAWAL CALCULATIONS
+// =============================================================================
+
+// Calculate proportional withdrawal amounts
+pub fn calculate_withdrawal_amounts(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int
+) -> WithdrawalCalculationResult {
+  // Validate input parameters
+  if ada_reserve <= 0 || token_reserve <= 0 || total_lp_supply <= 0 || lp_tokens_to_burn <= 0 {
+    return WithdrawalCalculationResult {
+      ada_to_withdraw: 0,
+      token_to_withdraw: 0,
+      new_ada_reserve: ada_reserve,
+      new_token_reserve: token_reserve,
+      new_total_lp_supply: total_lp_supply,
+      withdrawal_share_percentage: 0,
+      is_valid: False,
+      error_message: #"Invalid input parameters",
+    }
+  }
+
+  // Validate sufficient LP tokens exist
+  if lp_tokens_to_burn > total_lp_supply {
+    return WithdrawalCalculationResult {
+      ada_to_withdraw: 0,
+      token_to_withdraw: 0,
+      new_ada_reserve: ada_reserve,
+      new_token_reserve: token_reserve,
+      new_total_lp_supply: total_lp_supply,
+      withdrawal_share_percentage: 0,
+      is_valid: False,
+      error_message: #"Insufficient LP tokens",
+    }
+  }
+
+  // Calculate proportional withdrawal amounts
+  let ada_to_withdraw = ada_reserve * lp_tokens_to_burn / total_lp_supply
+  let token_to_withdraw = token_reserve * lp_tokens_to_burn / total_lp_supply
+
+  // Calculate new reserves after withdrawal
+  let new_ada_reserve = ada_reserve - ada_to_withdraw
+  let new_token_reserve = token_reserve - token_to_withdraw
+  let new_total_lp_supply = total_lp_supply - lp_tokens_to_burn
+
+  // Calculate withdrawal share percentage (scaled by 1e6)
+  let withdrawal_share_percentage = lp_tokens_to_burn * 1000000 / total_lp_supply
+
+  WithdrawalCalculationResult {
+    ada_to_withdraw: ada_to_withdraw,
+    token_to_withdraw: token_to_withdraw,
+    new_ada_reserve: new_ada_reserve,
+    new_token_reserve: new_token_reserve,
+    new_total_lp_supply: new_total_lp_supply,
+    withdrawal_share_percentage: withdrawal_share_percentage,
+    is_valid: True,
+    error_message: #"",
+  }
+}
+
+// =============================================================================
+// WITHDRAWAL VALIDATION
+// =============================================================================
+
+// Validate withdrawal claim against LP burn amount
+pub fn validate_withdrawal_claim(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int,
+  claimed_ada_out: Int,
+  claimed_token_out: Int
+) -> WithdrawalValidationResult {
+  // Calculate expected withdrawal amounts
+  let calculation_result = calculate_withdrawal_amounts(
+    ada_reserve, token_reserve, total_lp_supply, lp_tokens_to_burn
+  )
+
+  if !calculation_result.is_valid {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: calculation_result.error_message,
+      max_withdrawable_lp_tokens: 0,
+      estimated_ada_out: 0,
+      estimated_token_out: 0,
+    }
+  }
+
+  // Validate claimed amounts don't exceed calculated amounts
+  if claimed_ada_out > calculation_result.ada_to_withdraw {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: #"Claimed ADA exceeds proportional share",
+      max_withdrawable_lp_tokens: total_lp_supply,
+      estimated_ada_out: calculation_result.ada_to_withdraw,
+      estimated_token_out: calculation_result.token_to_withdraw,
+    }
+  }
+
+  if claimed_token_out > calculation_result.token_to_withdraw {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: #"Claimed tokens exceed proportional share",
+      max_withdrawable_lp_tokens: total_lp_supply,
+      estimated_ada_out: calculation_result.ada_to_withdraw,
+      estimated_token_out: calculation_result.token_to_withdraw,
+    }
+  }
+
+  WithdrawalValidationResult {
+    is_valid: True,
+    error_message: #"",
+    max_withdrawable_lp_tokens: total_lp_supply,
+    estimated_ada_out: calculation_result.ada_to_withdraw,
+    estimated_token_out: calculation_result.token_to_withdraw,
+  }
+}
+
+// =============================================================================
+// POOL DRAINING PROTECTION
+// =============================================================================
+
+// Validate withdrawal doesn't drain the pool
+pub fn validate_pool_draining_protection(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int,
+  is_emergency: Bool
+) -> WithdrawalValidationResult {
+  let calculation_result = calculate_withdrawal_amounts(
+    ada_reserve, token_reserve, total_lp_supply, lp_tokens_to_burn
+  )
+
+  if !calculation_result.is_valid {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: calculation_result.error_message,
+      max_withdrawable_lp_tokens: 0,
+      estimated_ada_out: 0,
+      estimated_token_out: 0,
+    }
+  }
+
+  // Define minimum reserves based on withdrawal type
+  let (min_ada_reserve, min_token_reserve, min_lp_supply) = if is_emergency {
+    (1_000_000, 100_000, 100)  // Emergency: 1 ADA, 0.1 token, 100 LP
+  } else {
+    (MIN_POOL_ADA_RESERVE, MIN_POOL_TOKEN_RESERVE, MIN_LP_SUPPLY)  // Normal: 10 ADA, 1 token, 1000 LP
+  }
+
+  // Check if withdrawal would violate minimum reserves
+  if calculation_result.new_ada_reserve < min_ada_reserve {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: #"Withdrawal would drain ADA reserves below minimum",
+      max_withdrawable_lp_tokens: calculate_max_withdrawable_lp_tokens(
+        ada_reserve, token_reserve, total_lp_supply, min_ada_reserve, min_token_reserve, min_lp_supply
+      ),
+      estimated_ada_out: 0,
+      estimated_token_out: 0,
+    }
+  }
+
+  if calculation_result.new_token_reserve < min_token_reserve {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: #"Withdrawal would drain token reserves below minimum",
+      max_withdrawable_lp_tokens: calculate_max_withdrawable_lp_tokens(
+        ada_reserve, token_reserve, total_lp_supply, min_ada_reserve, min_token_reserve, min_lp_supply
+      ),
+      estimated_ada_out: 0,
+      estimated_token_out: 0,
+    }
+  }
+
+  if calculation_result.new_total_lp_supply < min_lp_supply {
+    return WithdrawalValidationResult {
+      is_valid: False,
+      error_message: #"Withdrawal would drain LP supply below minimum",
+      max_withdrawable_lp_tokens: calculate_max_withdrawable_lp_tokens(
+        ada_reserve, token_reserve, total_lp_supply, min_ada_reserve, min_token_reserve, min_lp_supply
+      ),
+      estimated_ada_out: 0,
+      estimated_token_out: 0,
+    }
+  }
+
+  WithdrawalValidationResult {
+    is_valid: True,
+    error_message: #"",
+    max_withdrawable_lp_tokens: total_lp_supply,
+    estimated_ada_out: calculation_result.ada_to_withdraw,
+    estimated_token_out: calculation_result.token_to_withdraw,
+  }
+}
+
+// Calculate maximum withdrawable LP tokens without draining pool
+fn calculate_max_withdrawable_lp_tokens(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  min_ada_reserve: Int,
+  min_token_reserve: Int,
+  min_lp_supply: Int
+) -> Int {
+  // Calculate maximum LP tokens that can be burned while maintaining minimums
+  let max_ada_withdrawal = ada_reserve - min_ada_reserve
+  let max_token_withdrawal = token_reserve - min_token_reserve
+  let max_lp_burn_for_supply = total_lp_supply - min_lp_supply
+
+  // Calculate LP tokens corresponding to each constraint
+  let lp_for_ada = if ada_reserve > 0 { max_ada_withdrawal * total_lp_supply / ada_reserve } else { 0 }
+  let lp_for_token = if token_reserve > 0 { max_token_withdrawal * total_lp_supply / token_reserve } else { 0 }
+
+  // Use the most restrictive constraint
+  let max_lp_tokens = math.min(lp_for_ada, lp_for_token)
+  math.min(max_lp_tokens, max_lp_burn_for_supply)
+}
+
+// =============================================================================
+// WITHDRAWAL AMOUNT VALIDATION
+// =============================================================================
+
+// Validate minimum withdrawal amounts
+pub fn validate_minimum_withdrawal_amounts(
+  lp_tokens_to_burn: Int,
+  estimated_ada_out: Int,
+  estimated_token_out: Int
+) -> Bool {
+  // Validate minimum LP tokens to burn (dust protection)
+  if lp_tokens_to_burn < MIN_LP_TOKENS_TO_BURN {
+    False
+  } else {
+    // Validate estimated outputs are reasonable (not dust)
+    estimated_ada_out >= 100_000 && estimated_token_out >= 1000  // 0.1 ADA, 0.001 token minimum
+  }
+}
+
+// Validate maximum withdrawal amounts relative to pool size
+pub fn validate_maximum_withdrawal_amounts(
+  lp_tokens_to_burn: Int,
+  total_lp_supply: Int,
+  is_emergency: Bool
+) -> Bool {
+  let max_withdrawal_bps = if is_emergency { MAX_EMERGENCY_WITHDRAWAL_BPS } else { MAX_SINGLE_WITHDRAWAL_BPS }
+  let max_lp_tokens = total_lp_supply * max_withdrawal_bps / 10000
+
+  lp_tokens_to_burn <= max_lp_tokens
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Calculate withdrawal share percentage
+pub fn calculate_withdrawal_share_percentage(
+  lp_tokens_to_burn: Int,
+  total_lp_supply: Int
+) -> Int {
+  if total_lp_supply == 0 {
+    0
+  } else {
+    // Return percentage scaled by 1e6 (1000000 = 100%)
+    lp_tokens_to_burn * 1000000 / total_lp_supply
+  }
+}
+
+// Calculate estimated withdrawal amounts for UI
+pub fn calculate_estimated_withdrawal(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int
+) -> (Int, Int) {
+  if total_lp_supply == 0 {
+    (0, 0)
+  } else {
+    let ada_out = ada_reserve * lp_tokens_to_burn / total_lp_supply
+    let token_out = token_reserve * lp_tokens_to_burn / total_lp_supply
+    (ada_out, token_out)
+  }
+}
+
+// Validate withdrawal doesn't create price impact
+pub fn calculate_withdrawal_price_impact(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_to_withdraw: Int,
+  token_to_withdraw: Int
+) -> Int {
+  if ada_reserve == 0 || token_reserve == 0 {
+    0
+  } else {
+    // Calculate original price (ADA per token, scaled by 1e6)
+    let original_price = ada_reserve * 1000000 / token_reserve
+    
+    // Calculate new price after withdrawal
+    let new_ada_reserve = ada_reserve - ada_to_withdraw
+    let new_token_reserve = token_reserve - token_to_withdraw
+    
+    if new_ada_reserve == 0 || new_token_reserve == 0 {
+      // Complete withdrawal - no price impact calculation
+      0
+    } else {
+      let new_price = new_ada_reserve * 1000000 / new_token_reserve
+      
+      // Calculate price impact in basis points
+      let price_diff = math.abs(new_price - original_price)
+      price_diff * 10000 / original_price
+    }
+  }
+}
+
+// Validate that withdrawal maintains pool health
+pub fn validate_pool_health_after_withdrawal(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int
+) -> Bool {
+  let calculation_result = calculate_withdrawal_amounts(
+    ada_reserve, token_reserve, total_lp_supply, lp_tokens_to_burn
+  )
+
+  if !calculation_result.is_valid {
+    False
+  } else {
+    // Validate pool remains functional after withdrawal
+    calculation_result.new_ada_reserve > 0 &&
+    calculation_result.new_token_reserve > 0 &&
+    calculation_result.new_total_lp_supply >= 0
+  }
+}

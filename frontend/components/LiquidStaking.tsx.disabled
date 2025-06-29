@@ -1,0 +1,861 @@
+'use client';
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { depositStaking, withdrawStaking, syncStakingRewards, StakingDatum } from '../../src/lucid/staking';
+import { StakingMonitor, StakingEvent, StakingAnalytics } from '../../src/context7/staking_monitor';
+import { createLucidInstance, connectWallet } from '../../src/lib/lucid-config';
+import { formatADA, formatNumber, formatPercentage } from '../../src/lib/format-utils';
+import { getEnvironmentConfig } from '../../src/lib/environment-config';
+
+// Master Schema StakingDatum structure (CIP-68 compliant)
+interface StakingDatum {
+  total_staked: bigint;
+  total_pADA_minted: bigint;
+  stake_pool_id: string;
+  last_rewards_sync_slot: bigint;
+}
+
+// Transaction state interface
+interface TransactionState {
+  isLoading: boolean;
+  txHash: string;
+  error: string;
+  success: boolean;
+}
+
+// Wallet state interface
+interface WalletState {
+  isConnected: boolean;
+  address: string;
+  balance: {
+    ada: bigint;
+    pADA: bigint;
+  };
+  walletName: string;
+}
+
+export default function LiquidStaking() {
+  // Core state management
+  const [stakingDatum, setStakingDatum] = useState<StakingDatum | null>(null);
+  const [walletState, setWalletState] = useState<WalletState>({
+    isConnected: false,
+    address: '',
+    balance: { ada: 0n, pADA: 0n },
+    walletName: ''
+  });
+  const [stakingMonitor, setStakingMonitor] = useState<StakingMonitor | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  
+  // Transaction states
+  const [depositTx, setDepositTx] = useState<TransactionState>({
+    isLoading: false, txHash: '', error: '', success: false
+  });
+  const [withdrawTx, setWithdrawTx] = useState<TransactionState>({
+    isLoading: false, txHash: '', error: '', success: false
+  });
+  const [syncTx, setSyncTx] = useState<TransactionState>({
+    isLoading: false, txHash: '', error: '', success: false
+  });
+
+  // Form inputs
+  const [depositAmount, setDepositAmount] = useState('');
+  const [withdrawAmount, setWithdrawAmount] = useState('');
+  const [newRewardsSlot, setNewRewardsSlot] = useState('');
+
+  // Environment configuration
+  const envConfig = getEnvironmentConfig();
+  const isDemoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
+
+  // Demo data for showcase
+  const demoStakingDatum: StakingDatum = {
+    total_staked: 5000000000000n, // 5M ADA
+    total_pADA_minted: 4800000000000n, // 4.8M pADA
+    stake_pool_id: 'pool1abc123def456789...',
+    last_rewards_sync_slot: 125000000n
+  };
+
+  // Initialize staking monitor and load initial state
+  useEffect(() => {
+    const initializeStaking = async () => {
+      try {
+        setIsLoading(true);
+        
+        if (isDemoMode) {
+          // Demo mode setup
+          setStakingDatum(demoStakingDatum);
+          setWalletState({
+            isConnected: true,
+            address: 'addr_test1...demo_address',
+            balance: { ada: 10000000000n, pADA: 5000000000n },
+            walletName: 'eternl'
+          });
+          return;
+        }
+
+        // Real mode: Initialize Context7 staking monitor
+        const monitor = new StakingMonitor({
+          stakingAddress: envConfig.stakingAddress || 'addr_test1...',
+          pADAPolicyId: envConfig.pADAPolicyId || 'policy_id...',
+          blockfrostApiKey: envConfig.blockfrostApiKey,
+          network: envConfig.network as "mainnet" | "preview" | "preprod",
+          enableWebSocket: true
+        });
+
+        await monitor.initialize();
+        setStakingMonitor(monitor);
+
+        // Subscribe to staking state updates
+        monitor.addEventListener('state_change', handleStakingUpdate);
+        monitor.addEventListener('deposit', handleStakingUpdate);
+        monitor.addEventListener('withdrawal', handleStakingUpdate);
+        monitor.addEventListener('reward_sync', handleStakingUpdate);
+
+        // Load initial staking state
+        const currentState = monitor.getCurrentState();
+        if (currentState) {
+          setStakingDatum(currentState);
+        }
+
+      } catch (err) {
+        console.error('Failed to initialize staking:', err);
+        setError('Failed to initialize liquid staking system');
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    initializeStaking();
+
+    // Cleanup
+    return () => {
+      if (stakingMonitor) {
+        stakingMonitor.stop();
+      }
+    };
+  }, [isDemoMode]);
+
+  // Handle staking state updates from Context7 monitor
+  const handleStakingUpdate = useCallback((event: StakingEvent) => {
+    console.log('Staking update received:', event);
+    setStakingDatum(event.stakingDatum);
+    
+    // Show notification for significant events
+    if (event.type === 'deposit') {
+      toast.success('New deposit detected!', { icon: '🏦' });
+    } else if (event.type === 'withdrawal') {
+      toast.success('Withdrawal processed!', { icon: '💰' });
+    } else if (event.type === 'reward_sync') {
+      toast.success('Rewards synchronized!', { icon: '🔄' });
+    }
+  }, []);
+
+  // Connect wallet using Lucid Evolution CIP-30
+  const handleConnectWallet = async (walletName: "eternl" | "nami" | "vespr" | "lace" = "eternl") => {
+    try {
+      setIsLoading(true);
+      setError('');
+
+
+
+      // Real wallet connection
+      const lucid = await createLucidInstance();
+      await connectWallet(lucid, walletName);
+
+      const address = await lucid.wallet().address();
+      const utxos = await lucid.wallet().getUtxos();
+      
+      // Calculate ADA balance
+      const adaBalance = utxos.reduce((sum, utxo) => sum + utxo.assets.lovelace, 0n);
+      
+      // Calculate pADA balance (assuming pADA policy ID is available)
+      const pADAPolicyId = envConfig.pADAPolicyId || '';
+      const pADABalance = utxos.reduce((sum, utxo) => {
+        const pADAAssets = Object.entries(utxo.assets).filter(([unit]) => 
+          unit.startsWith(pADAPolicyId)
+        );
+        return sum + pADAAssets.reduce((assetSum, [, amount]) => assetSum + amount, 0n);
+      }, 0n);
+
+      setWalletState({
+        isConnected: true,
+        address,
+        balance: { ada: adaBalance, pADA: pADABalance },
+        walletName
+      });
+
+      toast.success(`${walletName} wallet connected successfully!`, { icon: '✅' });
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to connect wallet';
+      setError(errorMsg);
+      toast.error(errorMsg);
+      console.error('Wallet connection failed:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // 1️⃣ DEPOSIT ADA (Stake) - Call depositStaking from staking.ts
+  const handleDepositStaking = async () => {
+    if (!walletState.isConnected && !isDemoMode) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    if (!depositAmount || parseFloat(depositAmount) <= 0) {
+      toast.error('Please enter a valid ADA amount');
+      return;
+    }
+
+    try {
+      setDepositTx({ isLoading: true, txHash: '', error: '', success: false });
+
+      const adaAmount = BigInt(Math.floor(parseFloat(depositAmount) * 1_000_000));
+      const minPADAOut = BigInt(Math.floor(parseFloat(depositAmount) * 0.95 * 1_000_000)); // 5% slippage
+
+      if (isDemoMode) {
+        // Demo mode simulation
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const mockTxHash = `demo_deposit_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        setDepositTx({ 
+          isLoading: false, 
+          txHash: mockTxHash, 
+          error: '', 
+          success: true 
+        });
+        
+        toast.success(`Demo deposit of ${depositAmount} ADA completed!`, { 
+          icon: '🏦',
+          duration: 5000 
+        });
+        
+        // Update demo balances
+        setWalletState(prev => ({
+          ...prev,
+          balance: {
+            ada: prev.balance.ada - adaAmount,
+            pADA: prev.balance.pADA + adaAmount
+          }
+        }));
+        
+        setDepositAmount('');
+        return;
+      }
+
+      // Real transaction using staking.ts builder
+      const txHash = await depositStaking(
+        envConfig.stakingValidatorCbor || 'mock_cbor',
+        envConfig.pADAMintingPolicyCbor || 'mock_cbor',
+        envConfig.stakingAddress || 'addr_test1...',
+        {
+          adaAmount,
+          minPADAOut,
+          userAddress: walletState.address
+        },
+        walletState.walletName as any
+      );
+
+      setDepositTx({ 
+        isLoading: false, 
+        txHash, 
+        error: '', 
+        success: true 
+      });
+
+      toast.success(`ADA deposit successful! TX: ${txHash.slice(0, 8)}...`, { 
+        icon: '✅',
+        duration: 10000 
+      });
+
+      // Clear form and refresh balances
+      setDepositAmount('');
+      // Wallet balances will be updated via Context7 monitor
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Deposit failed';
+      setDepositTx({ 
+        isLoading: false, 
+        txHash: '', 
+        error: errorMsg, 
+        success: false 
+      });
+      toast.error(errorMsg);
+      console.error('Deposit error:', err);
+    }
+  };
+
+  // 2️⃣ WITHDRAW ADA (Unstake) - Call withdrawStaking from staking.ts
+  const handleWithdrawStaking = async () => {
+    if (!walletState.isConnected && !isDemoMode) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    if (!withdrawAmount || parseFloat(withdrawAmount) <= 0) {
+      toast.error('Please enter a valid pADA amount');
+      return;
+    }
+
+    try {
+      setWithdrawTx({ isLoading: true, txHash: '', error: '', success: false });
+
+      const pADAAmount = BigInt(Math.floor(parseFloat(withdrawAmount) * 1_000_000));
+      const minADAOut = BigInt(Math.floor(parseFloat(withdrawAmount) * 0.95 * 1_000_000)); // 5% slippage
+
+      if (isDemoMode) {
+        // Demo mode simulation
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const mockTxHash = `demo_withdraw_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        setWithdrawTx({
+          isLoading: false,
+          txHash: mockTxHash,
+          error: '',
+          success: true
+        });
+
+        toast.success(`Demo withdrawal of ${withdrawAmount} pADA completed!`, {
+          icon: '💰',
+          duration: 5000
+        });
+
+        // Update demo balances
+        setWalletState(prev => ({
+          ...prev,
+          balance: {
+            ada: prev.balance.ada + pADAAmount,
+            pADA: prev.balance.pADA - pADAAmount
+          }
+        }));
+
+        setWithdrawAmount('');
+        return;
+      }
+
+      // Real transaction using staking.ts builder
+      const txHash = await withdrawStaking(
+        envConfig.stakingValidatorCbor || 'mock_cbor',
+        envConfig.pADAMintingPolicyCbor || 'mock_cbor',
+        envConfig.stakingAddress || 'addr_test1...',
+        {
+          pADAAmount,
+          minADAOut,
+          userAddress: walletState.address
+        },
+        walletState.walletName as any
+      );
+
+      setWithdrawTx({
+        isLoading: false,
+        txHash,
+        error: '',
+        success: true
+      });
+
+      toast.success(`pADA withdrawal successful! TX: ${txHash.slice(0, 8)}...`, {
+        icon: '✅',
+        duration: 10000
+      });
+
+      // Clear form and refresh balances
+      setWithdrawAmount('');
+      // Wallet balances will be updated via Context7 monitor
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Withdrawal failed';
+      setWithdrawTx({
+        isLoading: false,
+        txHash: '',
+        error: errorMsg,
+        success: false
+      });
+      toast.error(errorMsg);
+      console.error('Withdrawal error:', err);
+    }
+  };
+
+  // 3️⃣ SYNC STAKING REWARDS (Admin/Oracle Action) - Call syncStakingRewards from staking.ts
+  const handleSyncStakingRewards = async () => {
+    if (!walletState.isConnected && !isDemoMode) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    if (!newRewardsSlot || parseInt(newRewardsSlot) <= 0) {
+      toast.error('Please enter a valid rewards sync slot');
+      return;
+    }
+
+    try {
+      setSyncTx({ isLoading: true, txHash: '', error: '', success: false });
+
+      const rewardsSlot = BigInt(parseInt(newRewardsSlot));
+
+      if (isDemoMode) {
+        // Demo mode simulation
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const mockTxHash = `demo_sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        setSyncTx({
+          isLoading: false,
+          txHash: mockTxHash,
+          error: '',
+          success: true
+        });
+
+        toast.success(`Demo rewards sync to slot ${newRewardsSlot} completed!`, {
+          icon: '🔄',
+          duration: 5000
+        });
+
+        // Update demo staking datum
+        setStakingDatum(prev => prev ? {
+          ...prev,
+          last_rewards_sync_slot: rewardsSlot
+        } : null);
+
+        setNewRewardsSlot('');
+        return;
+      }
+
+      // Real transaction using staking.ts builder
+      const txHash = await syncStakingRewards(
+        envConfig.stakingValidatorCbor || 'mock_cbor',
+        envConfig.stakingAddress || 'addr_test1...',
+        {
+          newRewardsSlot: rewardsSlot,
+          oracleAddress: walletState.address
+        },
+        walletState.walletName as any
+      );
+
+      setSyncTx({
+        isLoading: false,
+        txHash,
+        error: '',
+        success: true
+      });
+
+      toast.success(`Rewards sync successful! TX: ${txHash.slice(0, 8)}...`, {
+        icon: '✅',
+        duration: 10000
+      });
+
+      // Clear form
+      setNewRewardsSlot('');
+      // Staking datum will be updated via Context7 monitor
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Rewards sync failed';
+      setSyncTx({
+        isLoading: false,
+        txHash: '',
+        error: errorMsg,
+        success: false
+      });
+      toast.error(errorMsg);
+      console.error('Rewards sync error:', err);
+    }
+  };
+
+  // Calculate exchange rate
+  const exchangeRate = useMemo(() => {
+    if (!stakingDatum || stakingDatum.total_pADA_minted === 0n) return 1;
+    return Number(stakingDatum.total_staked) / Number(stakingDatum.total_pADA_minted);
+  }, [stakingDatum]);
+
+  return (
+    <div className="min-h-screen bg-terminal-black text-terminal-green font-mono">
+      {/* Header */}
+      <div className="border-b border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-glow">
+                LIQUID_STAKING_V5.exe
+              </h1>
+              <p className="text-terminal-green/70 text-sm mt-1">
+                Stake ADA • Mint pADA • Earn Rewards • Maintain Liquidity
+              </p>
+              {isDemoMode && (
+                <div className="text-xs text-terminal-red mt-1">
+                  [DEMO MODE - No real transactions]
+                </div>
+              )}
+            </div>
+
+            {stakingDatum && (
+              <div className="flex items-center space-x-6 text-sm">
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {formatADA(Number(stakingDatum.total_staked) / 1_000_000)}
+                  </div>
+                  <div className="text-terminal-green/70">Total Staked</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {formatADA(Number(stakingDatum.total_pADA_minted) / 1_000_000)}
+                  </div>
+                  <div className="text-terminal-green/70">Total pADA</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {stakingDatum.last_rewards_sync_slot.toString()}
+                  </div>
+                  <div className="text-terminal-green/70">Last Sync Slot</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {exchangeRate.toFixed(6)}
+                  </div>
+                  <div className="text-terminal-green/70">Exchange Rate</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto px-4 py-8">
+        {/* Error Display */}
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6 p-4 bg-terminal-red/20 border border-terminal-red/50 rounded text-terminal-red"
+          >
+            <div className="flex items-center justify-between">
+              <span>{error}</span>
+              <button
+                onClick={() => setError('')}
+                className="text-terminal-red hover:text-terminal-red/70"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+
+        {/* Loading State */}
+        {isLoading && (
+          <div className="text-center py-8">
+            <div className="text-terminal-green font-mono">
+              Initializing liquid staking system...
+            </div>
+          </div>
+        )}
+
+        {/* Wallet Connection */}
+        {!walletState.isConnected && (
+          <div className="terminal-card p-6 mb-8">
+            <h2 className="text-xl font-bold mb-4 text-glow">WALLET_CONNECTION.exe</h2>
+            <p className="text-terminal-green/70 mb-4">
+              Connect your Cardano wallet to start liquid staking
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              {(['eternl', 'nami', 'vespr', 'lace'] as const).map((wallet) => (
+                <motion.button
+                  key={wallet}
+                  onClick={() => handleConnectWallet(wallet)}
+                  disabled={isLoading}
+                  className="terminal-button py-3 px-4 text-sm"
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  {wallet.toUpperCase()}
+                </motion.button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Wallet Status */}
+        {walletState.isConnected && (
+          <div className="terminal-card p-6 mb-8">
+            <h2 className="text-xl font-bold mb-4 text-glow">WALLET_STATUS.dat</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div>
+                <div className="text-terminal-green/70 text-sm">Connected Wallet:</div>
+                <div className="text-terminal-amber font-bold">
+                  {walletState.walletName.toUpperCase()}
+                </div>
+                <div className="text-terminal-green/50 text-xs mt-1">
+                  {walletState.address.slice(0, 12)}...{walletState.address.slice(-8)}
+                </div>
+              </div>
+              <div>
+                <div className="text-terminal-green/70 text-sm">ADA Balance:</div>
+                <div className="text-terminal-amber font-bold">
+                  {formatADA(Number(walletState.balance.ada) / 1_000_000)}
+                </div>
+              </div>
+              <div>
+                <div className="text-terminal-green/70 text-sm">pADA Balance:</div>
+                <div className="text-terminal-amber font-bold">
+                  {formatADA(Number(walletState.balance.pADA) / 1_000_000)}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Staking Data Display */}
+        {stakingDatum && (
+          <div className="terminal-card p-6 mb-8">
+            <h2 className="text-xl font-bold mb-4 text-glow">STAKING_STATE.dat</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              <div>
+                <div className="text-terminal-green/70 text-sm">Total ADA Staked:</div>
+                <div className="text-terminal-amber font-bold text-lg">
+                  {formatADA(Number(stakingDatum.total_staked) / 1_000_000)}
+                </div>
+              </div>
+              <div>
+                <div className="text-terminal-green/70 text-sm">Total pADA Minted:</div>
+                <div className="text-terminal-amber font-bold text-lg">
+                  {formatADA(Number(stakingDatum.total_pADA_minted) / 1_000_000)}
+                </div>
+              </div>
+              <div>
+                <div className="text-terminal-green/70 text-sm">Stake Pool ID:</div>
+                <div className="text-terminal-green font-mono text-sm">
+                  {stakingDatum.stake_pool_id.slice(0, 16)}...
+                </div>
+              </div>
+              <div>
+                <div className="text-terminal-green/70 text-sm">Last Rewards Sync Slot:</div>
+                <div className="text-terminal-green font-bold">
+                  {stakingDatum.last_rewards_sync_slot.toString()}
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 pt-4 border-t border-terminal-green/30">
+              <div className="text-terminal-green/70 text-sm">Exchange Rate:</div>
+              <div className="text-terminal-amber font-bold">
+                1 pADA = {exchangeRate.toFixed(6)} ADA
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Main Functions Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* 1️⃣ DEPOSIT ADA (Stake) */}
+          <div className="terminal-card p-6">
+            <h2 className="text-xl font-bold mb-6 text-glow">1️⃣ DEPOSIT_ADA.exe</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-bold mb-2 text-terminal-green/70">
+                  ADA Amount to Stake:
+                </label>
+                <input
+                  type="number"
+                  value={depositAmount}
+                  onChange={(e) => setDepositAmount(e.target.value)}
+                  placeholder="Enter ADA amount"
+                  className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none font-mono"
+                  step="0.000001"
+                  min="0"
+                />
+              </div>
+
+              {depositAmount && stakingDatum && (
+                <div className="p-3 bg-terminal-green/10 border border-terminal-green/30 rounded">
+                  <div className="text-sm text-terminal-green/70">Estimated pADA Output:</div>
+                  <div className="text-lg font-bold text-terminal-amber">
+                    {formatNumber(parseFloat(depositAmount) / exchangeRate, 6)} pADA
+                  </div>
+                </div>
+              )}
+
+              <motion.button
+                onClick={handleDepositStaking}
+                disabled={depositTx.isLoading || !depositAmount || (!walletState.isConnected && !isDemoMode)}
+                className="w-full py-3 px-6 bg-terminal-green text-terminal-black font-bold rounded hover:bg-terminal-green/80 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300"
+                whileHover={{ scale: !depositTx.isLoading && depositAmount && (walletState.isConnected || isDemoMode) ? 1.02 : 1 }}
+                whileTap={{ scale: !depositTx.isLoading && depositAmount && (walletState.isConnected || isDemoMode) ? 0.98 : 1 }}
+              >
+                {depositTx.isLoading ? 'STAKING...' : 'STAKE ADA'}
+              </motion.button>
+
+              {/* Transaction Status */}
+              <AnimatePresence>
+                {depositTx.txHash && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-terminal-green/20 border border-terminal-green/50 rounded"
+                  >
+                    <div className="text-sm text-terminal-green">
+                      ✅ Transaction Submitted
+                    </div>
+                    <div className="text-xs text-terminal-green/70 mt-1 font-mono">
+                      TX: {depositTx.txHash.slice(0, 16)}...{depositTx.txHash.slice(-8)}
+                    </div>
+                  </motion.div>
+                )}
+                {depositTx.error && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-terminal-red/20 border border-terminal-red/50 rounded text-terminal-red"
+                  >
+                    <div className="text-sm">❌ {depositTx.error}</div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* 2️⃣ WITHDRAW ADA (Unstake) */}
+          <div className="terminal-card p-6">
+            <h2 className="text-xl font-bold mb-6 text-glow">2️⃣ WITHDRAW_ADA.exe</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-bold mb-2 text-terminal-green/70">
+                  pADA Amount to Burn:
+                </label>
+                <input
+                  type="number"
+                  value={withdrawAmount}
+                  onChange={(e) => setWithdrawAmount(e.target.value)}
+                  placeholder="Enter pADA amount"
+                  className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none font-mono"
+                  step="0.000001"
+                  min="0"
+                />
+              </div>
+
+              {withdrawAmount && stakingDatum && (
+                <div className="p-3 bg-terminal-amber/10 border border-terminal-amber/30 rounded">
+                  <div className="text-sm text-terminal-green/70">Estimated ADA Output:</div>
+                  <div className="text-lg font-bold text-terminal-amber">
+                    {formatNumber(parseFloat(withdrawAmount) * exchangeRate, 6)} ADA
+                  </div>
+                </div>
+              )}
+
+              <motion.button
+                onClick={handleWithdrawStaking}
+                disabled={withdrawTx.isLoading || !withdrawAmount || (!walletState.isConnected && !isDemoMode)}
+                className="w-full py-3 px-6 bg-terminal-amber text-terminal-black font-bold rounded hover:bg-terminal-amber/80 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300"
+                whileHover={{ scale: !withdrawTx.isLoading && withdrawAmount && (walletState.isConnected || isDemoMode) ? 1.02 : 1 }}
+                whileTap={{ scale: !withdrawTx.isLoading && withdrawAmount && (walletState.isConnected || isDemoMode) ? 0.98 : 1 }}
+              >
+                {withdrawTx.isLoading ? 'WITHDRAWING...' : 'WITHDRAW ADA'}
+              </motion.button>
+
+              {/* Transaction Status */}
+              <AnimatePresence>
+                {withdrawTx.txHash && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-terminal-amber/20 border border-terminal-amber/50 rounded"
+                  >
+                    <div className="text-sm text-terminal-amber">
+                      ✅ Transaction Submitted
+                    </div>
+                    <div className="text-xs text-terminal-green/70 mt-1 font-mono">
+                      TX: {withdrawTx.txHash.slice(0, 16)}...{withdrawTx.txHash.slice(-8)}
+                    </div>
+                  </motion.div>
+                )}
+                {withdrawTx.error && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-terminal-red/20 border border-terminal-red/50 rounded text-terminal-red"
+                  >
+                    <div className="text-sm">❌ {withdrawTx.error}</div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* 3️⃣ SYNC STAKING REWARDS (Admin/Oracle Action) */}
+          <div className="terminal-card p-6">
+            <h2 className="text-xl font-bold mb-6 text-glow">3️⃣ SYNC_REWARDS.exe</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-bold mb-2 text-terminal-green/70">
+                  New Rewards Sync Slot:
+                </label>
+                <input
+                  type="number"
+                  value={newRewardsSlot}
+                  onChange={(e) => setNewRewardsSlot(e.target.value)}
+                  placeholder="Enter slot number"
+                  className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none font-mono"
+                  min="0"
+                />
+              </div>
+
+              {stakingDatum && (
+                <div className="p-3 bg-blue-900/20 border border-blue-500/30 rounded">
+                  <div className="text-sm text-terminal-green/70">Current Last Sync Slot:</div>
+                  <div className="text-lg font-bold text-blue-400">
+                    {stakingDatum.last_rewards_sync_slot.toString()}
+                  </div>
+                </div>
+              )}
+
+              <div className="text-xs text-terminal-green/50 p-2 bg-terminal-gray/20 rounded">
+                ⚠️ Admin/Oracle Action: This function is typically used by authorized oracles to sync staking rewards from the Cardano network.
+              </div>
+
+              <motion.button
+                onClick={handleSyncStakingRewards}
+                disabled={syncTx.isLoading || !newRewardsSlot || (!walletState.isConnected && !isDemoMode)}
+                className="w-full py-3 px-6 bg-blue-600 text-white font-bold rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300"
+                whileHover={{ scale: !syncTx.isLoading && newRewardsSlot && (walletState.isConnected || isDemoMode) ? 1.02 : 1 }}
+                whileTap={{ scale: !syncTx.isLoading && newRewardsSlot && (walletState.isConnected || isDemoMode) ? 0.98 : 1 }}
+              >
+                {syncTx.isLoading ? 'SYNCING...' : 'SYNC REWARDS'}
+              </motion.button>
+
+              {/* Transaction Status */}
+              <AnimatePresence>
+                {syncTx.txHash && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-blue-900/20 border border-blue-500/50 rounded"
+                  >
+                    <div className="text-sm text-blue-400">
+                      ✅ Transaction Submitted
+                    </div>
+                    <div className="text-xs text-terminal-green/70 mt-1 font-mono">
+                      TX: {syncTx.txHash.slice(0, 16)}...{syncTx.txHash.slice(-8)}
+                    </div>
+                  </motion.div>
+                )}
+                {syncTx.error && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -20 }}
+                    className="p-3 bg-terminal-red/20 border border-terminal-red/50 rounded text-terminal-red"
+                  >
+                    <div className="text-sm">❌ {syncTx.error}</div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

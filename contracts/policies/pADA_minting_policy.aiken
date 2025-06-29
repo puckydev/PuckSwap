@@ -1,0 +1,377 @@
+// PuckSwap v5 DeFi - pADA Minting Policy
+// Secure liquid staking token minting policy
+// Only allows minting during valid staking deposit transactions
+// Prevents unauthorized minting with comprehensive security validations
+// Full CIP-68 compliance with canonical datum structure
+
+use aiken/transaction.{ScriptContext, Mint, Spend, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, ScriptCredential, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of, flatten}
+use cardano/assets
+use aiken/option.{Option, Some, None}
+use aiken/error
+use aiken/list
+use aiken/bytearray
+
+// Canonical StakingDatum from PuckSwap v5 Master Schema
+type StakingDatum {
+  total_staked: Int,
+  total_pADA_minted: Int,
+  stake_pool_id: ByteArray,
+  last_rewards_sync_slot: Int,
+}
+
+// Canonical StakingRedeemer from PuckSwap v5 Master Schema
+type StakingRedeemer {
+  deposit: Option<Int>,
+  withdraw: Option<Int>,
+  sync: Bool,
+}
+
+// pADA minting redeemer - secure and focused
+type PADAMintingRedeemer {
+  // Only two operations allowed: mint and burn
+  MintForDeposit {
+    staking_validator_hash: ByteArray,
+    deposit_amount: Int,
+  }
+
+  BurnForWithdrawal {
+    staking_validator_hash: ByteArray,
+    withdrawal_amount: Int,
+  }
+}
+
+// Main pADA minting policy - secure and focused
+// Only allows minting during valid staking deposit transactions
+// Prevents all unauthorized minting attempts
+validator pADA_minting_policy(
+  redeemer: PADAMintingRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Get minted/burned tokens for this policy
+      let minted_tokens = flatten(ctx.transaction.mint)
+      let pADA_tokens = filter_pADA_tokens(minted_tokens, policy_id)
+
+      // Handle only authorized operations
+      when redeemer is {
+        MintForDeposit { staking_validator_hash, deposit_amount } ->
+          validate_mint_for_deposit(
+            policy_id, pADA_tokens, staking_validator_hash, deposit_amount, ctx
+          )
+
+        BurnForWithdrawal { staking_validator_hash, withdrawal_amount } ->
+          validate_burn_for_withdrawal(
+            policy_id, pADA_tokens, staking_validator_hash, withdrawal_amount, ctx
+          )
+      }
+    }
+    _ -> error.void("invalid_script_purpose")
+  }
+}
+
+// =============================================================================
+// CORE VALIDATION FUNCTIONS - SECURE MINTING ONLY
+// =============================================================================
+
+// Validate mint for deposit operation
+// This is the ONLY authorized way to mint pADA tokens
+fn validate_mint_for_deposit(
+  policy_id: PolicyId,
+  pADA_tokens: List<(AssetName, Int)>,
+  staking_validator_hash: ByteArray,
+  deposit_amount: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // 1. CRITICAL: Validate staking validator is being executed in this transaction
+  expect validate_staking_validator_execution(staking_validator_hash, ctx)
+
+  // 2. Find the staking validator input and output to validate state transition
+  expect Some((staking_input, staking_output)) = find_staking_utxos(staking_validator_hash, ctx)
+
+  // 3. Parse input and output datums
+  expect Some(input_datum_data) = staking_input.output.datum
+  expect input_datum: StakingDatum = input_datum_data
+  expect Some(output_datum_data) = staking_output.datum
+  expect output_datum: StakingDatum = output_datum_data
+
+  // 4. Calculate expected pADA to mint based on current ratio
+  let expected_pADA_amount = calculate_pADA_to_mint(deposit_amount, input_datum)
+
+  // 5. Validate deposit amount is positive and within reasonable bounds
+  expect deposit_amount > 0
+  expect deposit_amount >= 1_000_000 // Minimum 1 ADA deposit
+  expect deposit_amount <= 1_000_000_000_000 // Maximum 1M ADA deposit
+
+  // 6. Validate exactly one pADA token is being minted
+  expect list.length(pADA_tokens) == 1
+  expect Some((pADA_token_name, pADA_mint_amount)) = list.head(pADA_tokens)
+  expect pADA_mint_amount == expected_pADA_amount
+  expect pADA_mint_amount > 0
+
+  // 7. Validate pADA token name follows proper naming convention
+  expect validate_pADA_token_name(pADA_token_name)
+
+  // 8. Validate StakingDatum state transition is correct
+  expect validate_deposit_state_transition(input_datum, output_datum, deposit_amount, expected_pADA_amount)
+
+  // 9. Validate ADA balance increase in staking contract
+  expect validate_ada_balance_increase(staking_input, staking_output, deposit_amount)
+
+  // 10. Validate minimum ADA requirement
+  expect validate_min_ada_requirement(staking_output)
+
+  True
+}
+
+// Validate burn for withdrawal operation
+// This is the ONLY authorized way to burn pADA tokens
+fn validate_burn_for_withdrawal(
+  policy_id: PolicyId,
+  pADA_tokens: List<(AssetName, Int)>,
+  staking_validator_hash: ByteArray,
+  withdrawal_amount: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // 1. CRITICAL: Validate staking validator is being executed in this transaction
+  expect validate_staking_validator_execution(staking_validator_hash, ctx)
+
+  // 2. Find the staking validator input and output to validate state transition
+  expect Some((staking_input, staking_output)) = find_staking_utxos(staking_validator_hash, ctx)
+
+  // 3. Parse input and output datums
+  expect Some(input_datum_data) = staking_input.output.datum
+  expect input_datum: StakingDatum = input_datum_data
+  expect Some(output_datum_data) = staking_output.datum
+  expect output_datum: StakingDatum = output_datum_data
+
+  // 4. Calculate expected ADA to release based on current ratio
+  let expected_ada_release = calculate_ada_to_release(withdrawal_amount, input_datum)
+
+  // 5. Validate withdrawal amount is positive and reasonable
+  expect withdrawal_amount > 0
+  expect withdrawal_amount <= 1_000_000_000_000 // Maximum 1M pADA burn
+
+  // 6. Validate exactly one pADA token is being burned (negative amount)
+  expect list.length(pADA_tokens) == 1
+  expect Some((pADA_token_name, pADA_burn_amount)) = list.head(pADA_tokens)
+  expect pADA_burn_amount == -withdrawal_amount
+  expect pADA_burn_amount < 0
+
+  // 7. Validate pADA token name follows proper naming convention
+  expect validate_pADA_token_name(pADA_token_name)
+
+  // 8. Validate StakingDatum state transition is correct
+  expect validate_withdrawal_state_transition(input_datum, output_datum, withdrawal_amount, expected_ada_release)
+
+  // 9. Validate ADA balance decrease in staking contract
+  expect validate_ada_balance_decrease(staking_input, staking_output, expected_ada_release)
+
+  // 10. Validate minimum ADA requirement
+  expect validate_min_ada_requirement(staking_output)
+
+  True
+}
+
+// =============================================================================
+// CALCULATION FUNCTIONS
+// =============================================================================
+
+// Calculate pADA to mint for ADA deposit
+fn calculate_pADA_to_mint(ada_amount: Int, datum: StakingDatum) -> Int {
+  if datum.total_pADA_minted == 0 {
+    // Initial deposit - 1:1 ratio
+    ada_amount
+  } else {
+    // Proportional minting based on current ratio
+    // pADA_to_mint = (ada_amount * total_pADA_minted) / total_staked
+    (ada_amount * datum.total_pADA_minted) / datum.total_staked
+  }
+}
+
+// Calculate ADA to release for pADA burn
+fn calculate_ada_to_release(pADA_amount: Int, datum: StakingDatum) -> Int {
+  if datum.total_pADA_minted == 0 {
+    error.void("no_pADA_minted")
+  } else {
+    // Proportional release based on current ratio
+    // ada_to_release = (pADA_amount * total_staked) / total_pADA_minted
+    (pADA_amount * datum.total_staked) / datum.total_pADA_minted
+  }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS - SECURITY VALIDATIONS
+// =============================================================================
+
+// Filter pADA tokens from minted tokens
+fn filter_pADA_tokens(
+  minted_tokens: List<(PolicyId, AssetName, Int)>,
+  pADA_policy: PolicyId
+) -> List<(AssetName, Int)> {
+  when minted_tokens is {
+    [] -> []
+    [(policy, name, amount), ..tail] ->
+      if policy == pADA_policy {
+        [(name, amount), ..filter_pADA_tokens(tail, pADA_policy)]
+      } else {
+        filter_pADA_tokens(tail, pADA_policy)
+      }
+  }
+}
+
+// Find staking validator UTxOs (input and output)
+fn find_staking_utxos(
+  staking_validator_hash: ByteArray,
+  ctx: ScriptContext
+) -> Option<(Input, Output)> {
+  // Find input controlled by staking validator
+  let staking_input = list.find(ctx.transaction.inputs, fn(input) {
+    when input.output.address.payment_credential is {
+      ScriptCredential(script_hash) -> script_hash == staking_validator_hash
+      _ -> False
+    }
+  })
+
+  // Find output going to staking validator
+  let staking_output = list.find(ctx.transaction.outputs, fn(output) {
+    when output.address.payment_credential is {
+      ScriptCredential(script_hash) -> script_hash == staking_validator_hash
+      _ -> False
+    }
+  })
+
+  when (staking_input, staking_output) is {
+    (Some(input), Some(output)) -> Some((input, output))
+    _ -> None
+  }
+}
+
+// Validate staking validator is being executed
+// This is the CRITICAL security check - pADA can only be minted/burned
+// when the staking validator is being executed in the same transaction
+fn validate_staking_validator_execution(
+  staking_validator_hash: ByteArray,
+  ctx: ScriptContext
+) -> Bool {
+  // Check that the staking validator hash is 28 bytes (valid script hash)
+  expect bytearray.length(staking_validator_hash) == 28
+
+  // Check that a script with this hash is being executed in the transaction
+  list.any(ctx.transaction.redeemers, fn(redeemer) {
+    when redeemer.purpose is {
+      Spend(output_ref) -> {
+        // Find the input being spent
+        when list.find(ctx.transaction.inputs, fn(input) {
+          input.output_reference == output_ref
+        }) is {
+          Some(input) -> {
+            // Check if this input is controlled by the staking validator
+            when input.output.address.payment_credential is {
+              ScriptCredential(script_hash) -> script_hash == staking_validator_hash
+              _ -> False
+            }
+          }
+          None -> False
+        }
+      }
+      _ -> False
+    }
+  })
+}
+
+// Validate pADA token name follows proper naming convention
+fn validate_pADA_token_name(token_name: AssetName) -> Bool {
+  // pADA token name should be "pADA" or follow CIP-68 naming
+  let name_bytes = token_name
+  let name_length = bytearray.length(name_bytes)
+
+  // Allow "pADA" (4 bytes) or CIP-68 format (longer)
+  name_length >= 4 && name_length <= 32
+}
+
+// Validate deposit state transition
+fn validate_deposit_state_transition(
+  input_datum: StakingDatum,
+  output_datum: StakingDatum,
+  deposit_amount: Int,
+  pADA_amount: Int
+) -> Bool {
+  // Validate total_staked increases by deposit amount
+  expect output_datum.total_staked == input_datum.total_staked + deposit_amount
+
+  // Validate total_pADA_minted increases by minted amount
+  expect output_datum.total_pADA_minted == input_datum.total_pADA_minted + pADA_amount
+
+  // Validate stake_pool_id remains unchanged
+  expect output_datum.stake_pool_id == input_datum.stake_pool_id
+
+  // Validate last_rewards_sync_slot remains unchanged (or can be updated by oracle)
+  expect output_datum.last_rewards_sync_slot >= input_datum.last_rewards_sync_slot
+
+  True
+}
+
+// Validate withdrawal state transition
+fn validate_withdrawal_state_transition(
+  input_datum: StakingDatum,
+  output_datum: StakingDatum,
+  withdrawal_amount: Int,
+  ada_release: Int
+) -> Bool {
+  // Validate total_staked decreases by ADA release amount
+  expect output_datum.total_staked == input_datum.total_staked - ada_release
+
+  // Validate total_pADA_minted decreases by burned amount
+  expect output_datum.total_pADA_minted == input_datum.total_pADA_minted - withdrawal_amount
+
+  // Validate stake_pool_id remains unchanged
+  expect output_datum.stake_pool_id == input_datum.stake_pool_id
+
+  // Validate last_rewards_sync_slot remains unchanged (or can be updated by oracle)
+  expect output_datum.last_rewards_sync_slot >= input_datum.last_rewards_sync_slot
+
+  True
+}
+
+// Validate ADA balance increase in staking contract
+fn validate_ada_balance_increase(
+  staking_input: Input,
+  staking_output: Output,
+  deposit_amount: Int
+) -> Bool {
+  let input_ada = assets.quantity_of(staking_input.output.value, ada_policy_id(), ada_asset_name())
+  let output_ada = assets.quantity_of(staking_output.value, ada_policy_id(), ada_asset_name())
+
+  // Output ADA should be at least input ADA + deposit amount
+  expect output_ada >= input_ada + deposit_amount
+
+  True
+}
+
+// Validate ADA balance decrease in staking contract
+fn validate_ada_balance_decrease(
+  staking_input: Input,
+  staking_output: Output,
+  ada_release: Int
+) -> Bool {
+  let input_ada = assets.quantity_of(staking_input.output.value, ada_policy_id(), ada_asset_name())
+  let output_ada = assets.quantity_of(staking_output.value, ada_policy_id(), ada_asset_name())
+
+  // Input ADA should be at least output ADA + release amount
+  expect input_ada >= output_ada + ada_release
+
+  True
+}
+
+// Validate minimum ADA requirement
+fn validate_min_ada_requirement(output: Output) -> Bool {
+  let ada_amount = assets.quantity_of(output.value, ada_policy_id(), ada_asset_name())
+
+  // Ensure minimum ADA requirement (2 ADA minimum for UTxO with datum)
+  expect ada_amount >= 2_000_000
+
+  True
+}

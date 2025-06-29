@@ -1,0 +1,694 @@
+// PuckSwap v5 DeFi - Cross-Chain Router Component
+// Comprehensive cross-chain bridge interface with message passing and multi-chain support
+// Retro terminal aesthetic with professional DeFi functionality
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { 
+  PuckSwapCrossChainRouter, 
+  CrossChainRouterState, 
+  ChainConnection, 
+  TrustedBridge,
+  OutboundMessage,
+  InboundMessage,
+  CrossChainTransferParams 
+} from '../lucid/crosschain';
+import { CrossChainMonitor, CrossChainAnalytics } from '../context7/crosschain-monitor';
+import { formatADA, formatToken, formatPercentage, formatTimeRemaining } from '../lib/format-utils';
+
+// Cross-chain interfaces
+interface CrossChainRouterProps {
+  router?: PuckSwapCrossChainRouter;
+  monitor?: CrossChainMonitor;
+  isDemoMode?: boolean;
+}
+
+interface TransferFormData {
+  destinationChain: string;
+  recipient: string;
+  tokenPolicy: string;
+  tokenName: string;
+  amount: string;
+  bridgeId: string;
+  deadline: string;
+}
+
+interface ChainInfo {
+  chainId: number;
+  name: string;
+  icon: string;
+  color: string;
+  isActive: boolean;
+}
+
+export default function CrossChainRouter({ 
+  router, 
+  monitor, 
+  isDemoMode = false 
+}: CrossChainRouterProps) {
+  // State management
+  const [routerState, setRouterState] = useState<CrossChainRouterState | null>(null);
+  const [analytics, setAnalytics] = useState<CrossChainAnalytics | null>(null);
+  const [activeTab, setActiveTab] = useState<'transfer' | 'history' | 'bridges' | 'analytics'>('transfer');
+  const [userOutboundMessages, setUserOutboundMessages] = useState<OutboundMessage[]>([]);
+  const [userInboundMessages, setUserInboundMessages] = useState<InboundMessage[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isTransferring, setIsTransferring] = useState(false);
+
+  // Form state
+  const [transferForm, setTransferForm] = useState<TransferFormData>({
+    destinationChain: '',
+    recipient: '',
+    tokenPolicy: '',
+    tokenName: '',
+    amount: '',
+    bridgeId: '',
+    deadline: ''
+  });
+
+  // Supported chains data
+  const supportedChains: ChainInfo[] = [
+    { chainId: 1, name: 'Ethereum', icon: '⟠', color: 'text-blue-400', isActive: true },
+    { chainId: 56, name: 'BSC', icon: '🟡', color: 'text-yellow-400', isActive: true },
+    { chainId: 137, name: 'Polygon', icon: '🟣', color: 'text-purple-400', isActive: true },
+    { chainId: 43114, name: 'Avalanche', icon: '🔺', color: 'text-red-400', isActive: true },
+    { chainId: 250, name: 'Fantom', icon: '👻', color: 'text-blue-300', isActive: false },
+    { chainId: 42161, name: 'Arbitrum', icon: '🔵', color: 'text-blue-500', isActive: true }
+  ];
+
+  // Load router state
+  const loadRouterState = useCallback(async () => {
+    if (isDemoMode) {
+      // Demo data
+      const demoState: CrossChainRouterState = {
+        totalVolume: 15000000000000n, // 15M ADA
+        lastProcessedNonce: 5000,
+        chainConnections: [
+          {
+            chainId: 1,
+            chainName: "Ethereum",
+            bridgeAddress: "0x1234567890abcdef",
+            nativeTokenPolicy: "",
+            wrappedTokenPolicy: "wrapped_eth_policy",
+            isActive: true,
+            lastSyncSlot: 1000000,
+            totalLocked: 5000000000000n, // 5M ADA
+            totalMinted: 5000000000000n
+          },
+          {
+            chainId: 56,
+            chainName: "BSC",
+            bridgeAddress: "0xabcdef1234567890",
+            nativeTokenPolicy: "",
+            wrappedTokenPolicy: "wrapped_bnb_policy",
+            isActive: true,
+            lastSyncSlot: 1000000,
+            totalLocked: 3000000000000n, // 3M ADA
+            totalMinted: 3000000000000n
+          },
+          {
+            chainId: 137,
+            chainName: "Polygon",
+            bridgeAddress: "0xfedcba0987654321",
+            nativeTokenPolicy: "",
+            wrappedTokenPolicy: "wrapped_matic_policy",
+            isActive: true,
+            lastSyncSlot: 1000000,
+            totalLocked: 2000000000000n, // 2M ADA
+            totalMinted: 2000000000000n
+          }
+        ],
+        outboundMessages: [
+          {
+            messageId: "msg_demo_1",
+            nonce: 4999,
+            destinationChain: 1,
+            recipient: "0xdemo1234567890abcdef",
+            tokenPolicy: "",
+            tokenName: "",
+            amount: 1000000000n, // 1K ADA
+            sender: "addr1_demo_user",
+            createdSlot: 999000,
+            status: 'Completed',
+            bridgeId: "bridge_ethereum",
+            confirmations: 12,
+            executionHash: "0xdemo_execution_hash"
+          },
+          {
+            messageId: "msg_demo_2",
+            nonce: 5000,
+            destinationChain: 56,
+            recipient: "0xdemo_bsc_recipient",
+            tokenPolicy: "",
+            tokenName: "",
+            amount: 500000000n, // 500 ADA
+            sender: "addr1_demo_user",
+            createdSlot: 1000000,
+            status: 'Processing',
+            bridgeId: "bridge_bsc",
+            confirmations: 3,
+            executionHash: ""
+          }
+        ],
+        inboundMessages: [],
+        processedMessageHashes: [],
+        trustedBridges: [
+          {
+            bridgeId: "bridge_ethereum",
+            bridgeAddress: "addr1_bridge_eth",
+            supportedChains: [1, 42161],
+            publicKey: "eth_bridge_pubkey",
+            isActive: true,
+            reputationScore: 98,
+            totalVolume: 8000000000000n,
+            successRate: 9980 // 99.8%
+          },
+          {
+            bridgeId: "bridge_bsc",
+            bridgeAddress: "addr1_bridge_bsc",
+            supportedChains: [56],
+            publicKey: "bsc_bridge_pubkey",
+            isActive: true,
+            reputationScore: 95,
+            totalVolume: 4000000000000n,
+            successRate: 9950 // 99.5%
+          },
+          {
+            bridgeId: "bridge_polygon",
+            bridgeAddress: "addr1_bridge_polygon",
+            supportedChains: [137],
+            publicKey: "polygon_bridge_pubkey",
+            isActive: true,
+            reputationScore: 96,
+            totalVolume: 3000000000000n,
+            successRate: 9960 // 99.6%
+          }
+        ],
+        bridgeOperators: ["addr1_operator_1", "addr1_operator_2"],
+        governanceAddress: "addr1_governance",
+        minConfirmations: 3,
+        maxMessageAgeSlots: 604800,
+        nonceWindow: 1000,
+        emergencyPause: false,
+        crossChainFeeBps: 30, // 0.3%
+        bridgeFeeBps: 20, // 0.2%
+        operatorFeeBps: 10, // 0.1%
+        maxTransferAmount: 1000000000000n, // 1M ADA
+        dailyTransferLimit: 10000000000000n, // 10M ADA
+        lastResetSlot: 1000000,
+        dailyVolume: 3000000000000n, // 3M ADA
+        totalTransfers: 12500,
+        totalFeesCollected: 150000000000n, // 150K ADA
+        successfulTransfers: 12375,
+        failedTransfers: 125
+      };
+
+      const demoAnalytics: CrossChainAnalytics = {
+        totalVolume: 15000000000000n,
+        totalTransfers: 12500,
+        successRate: 99.0,
+        averageTransferTime: 45, // minutes
+        volumeByChain: new Map([
+          [1, 8000000000000n],
+          [56, 4000000000000n],
+          [137, 3000000000000n]
+        ]),
+        transfersByChain: new Map([
+          [1, 6000],
+          [56, 4000],
+          [137, 2500]
+        ]),
+        bridgePerformance: new Map(),
+        dailyVolume: [],
+        topUsers: [],
+        securityMetrics: {
+          failedTransfers: 125,
+          suspiciousActivities: 5,
+          emergencyPauses: 0,
+          averageConfirmations: 8.5
+        }
+      };
+
+      setRouterState(demoState);
+      setAnalytics(demoAnalytics);
+      setUserOutboundMessages(demoState.outboundMessages);
+      return;
+    }
+
+    if (!router || !monitor) return;
+
+    try {
+      setIsLoading(true);
+      
+      const state = await router.getRouterState();
+      if (state) {
+        setRouterState(state);
+      }
+
+      const analyticsData = monitor.getAnalytics();
+      if (analyticsData) {
+        setAnalytics(analyticsData);
+      }
+
+      const outboundMessages = await router.getUserOutboundMessages();
+      setUserOutboundMessages(outboundMessages);
+
+      const inboundMessages = await router.getUserInboundMessages();
+      setUserInboundMessages(inboundMessages);
+
+    } catch (error) {
+      console.error('Error loading router state:', error);
+      toast.error('Failed to load cross-chain data');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [router, monitor, isDemoMode]);
+
+  // Load data on component mount
+  useEffect(() => {
+    loadRouterState();
+  }, [loadRouterState]);
+
+  // Set up real-time updates
+  useEffect(() => {
+    if (!monitor || isDemoMode) return;
+
+    const handleRouterUpdate = () => {
+      loadRouterState();
+    };
+
+    monitor.addEventListener('*', handleRouterUpdate);
+
+    return () => {
+      monitor.removeEventListener('*', handleRouterUpdate);
+    };
+  }, [monitor, isDemoMode, loadRouterState]);
+
+  // Handle cross-chain transfer
+  const handleCrossChainTransfer = async () => {
+    if (!router && !isDemoMode) {
+      toast.error('Cross-chain router not connected');
+      return;
+    }
+
+    if (!transferForm.destinationChain || !transferForm.recipient || !transferForm.amount) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    try {
+      setIsTransferring(true);
+
+      const amount = BigInt(Math.floor(parseFloat(transferForm.amount) * 1_000_000));
+      const deadline = transferForm.deadline ? 
+        Math.floor(new Date(transferForm.deadline).getTime() / 1000) : 
+        Math.floor(Date.now() / 1000) + 3600; // 1 hour default
+
+      if (isDemoMode) {
+        // Simulate cross-chain transfer
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        toast.success(`Demo transfer of ${transferForm.amount} ADA to ${getChainName(parseInt(transferForm.destinationChain))} initiated!`, {
+          duration: 5000,
+          icon: '🌉'
+        });
+        
+        // Reset form
+        setTransferForm({
+          destinationChain: '',
+          recipient: '',
+          tokenPolicy: '',
+          tokenName: '',
+          amount: '',
+          bridgeId: '',
+          deadline: ''
+        });
+      } else if (router) {
+        const params: CrossChainTransferParams = {
+          destinationChain: parseInt(transferForm.destinationChain),
+          recipient: transferForm.recipient,
+          tokenPolicy: transferForm.tokenPolicy || "",
+          tokenName: transferForm.tokenName || "",
+          amount,
+          bridgeId: transferForm.bridgeId,
+          deadline
+        };
+
+        const txHash = await router.initiateTransfer(params);
+        toast.success(`Cross-chain transfer initiated! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '🌉'
+        });
+
+        // Reset form and reload data
+        setTransferForm({
+          destinationChain: '',
+          recipient: '',
+          tokenPolicy: '',
+          tokenName: '',
+          amount: '',
+          bridgeId: '',
+          deadline: ''
+        });
+        await loadRouterState();
+      }
+    } catch (error) {
+      console.error('Error initiating cross-chain transfer:', error);
+      toast.error('Failed to initiate cross-chain transfer');
+    } finally {
+      setIsTransferring(false);
+    }
+  };
+
+  // Get chain name by ID
+  const getChainName = (chainId: number): string => {
+    const chain = supportedChains.find(c => c.chainId === chainId);
+    return chain ? chain.name : `Chain ${chainId}`;
+  };
+
+  // Get chain icon by ID
+  const getChainIcon = (chainId: number): string => {
+    const chain = supportedChains.find(c => c.chainId === chainId);
+    return chain ? chain.icon : '🔗';
+  };
+
+  // Calculate transfer fees
+  const calculateTransferFees = useMemo(() => {
+    if (!transferForm.amount || !routerState) return null;
+    
+    const amount = parseFloat(transferForm.amount);
+    const crossChainFee = (amount * routerState.crossChainFeeBps) / 10000;
+    const bridgeFee = (amount * routerState.bridgeFeeBps) / 10000;
+    const operatorFee = (amount * routerState.operatorFeeBps) / 10000;
+    const totalFees = crossChainFee + bridgeFee + operatorFee;
+    
+    return {
+      crossChainFee,
+      bridgeFee,
+      operatorFee,
+      totalFees,
+      netAmount: amount - totalFees
+    };
+  }, [transferForm.amount, routerState]);
+
+  // Memoized calculations
+  const routerStats = useMemo(() => {
+    if (!routerState || !analytics) return null;
+
+    const successRate = routerState.totalTransfers > 0 ? 
+      (routerState.successfulTransfers / routerState.totalTransfers) * 100 : 0;
+
+    const dailyLimitUsed = routerState.dailyTransferLimit > 0n ? 
+      Number(routerState.dailyVolume * 100n / routerState.dailyTransferLimit) : 0;
+
+    return {
+      totalVolume: Number(routerState.totalVolume) / 1_000_000,
+      totalTransfers: routerState.totalTransfers,
+      successRate,
+      averageTransferTime: analytics.averageTransferTime,
+      activeBridges: routerState.trustedBridges.filter(b => b.isActive).length,
+      supportedChains: routerState.chainConnections.filter(c => c.isActive).length,
+      dailyVolume: Number(routerState.dailyVolume) / 1_000_000,
+      dailyLimit: Number(routerState.dailyTransferLimit) / 1_000_000,
+      dailyLimitUsed,
+      totalFees: Number(routerState.totalFeesCollected) / 1_000_000,
+      isPaused: routerState.emergencyPause
+    };
+  }, [routerState, analytics]);
+
+  return (
+    <div className="min-h-screen bg-terminal-black text-terminal-green font-mono">
+      {/* Header */}
+      <div className="border-b border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-glow">
+                CROSS_CHAIN_ROUTER.exe
+              </h1>
+              <p className="text-terminal-green/70 text-sm mt-1">
+                Multi-Chain Bridge • Message Passing • Asset Transfer • Cross-Chain DeFi
+              </p>
+            </div>
+            
+            {routerStats && (
+              <div className="flex items-center space-x-6 text-sm">
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {formatADA(routerStats.totalVolume)}
+                  </div>
+                  <div className="text-terminal-green/70">Total Volume</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {routerStats.successRate.toFixed(1)}%
+                  </div>
+                  <div className="text-terminal-green/70">Success Rate</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {routerStats.supportedChains}
+                  </div>
+                  <div className="text-terminal-green/70">Chains</div>
+                </div>
+                <div className="text-center">
+                  <div className={`font-bold ${routerStats.isPaused ? 'text-red-400' : 'text-terminal-green'}`}>
+                    {routerStats.isPaused ? 'PAUSED' : 'ACTIVE'}
+                  </div>
+                  <div className="text-terminal-green/70">Status</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Navigation Tabs */}
+      <div className="max-w-7xl mx-auto px-4 py-4">
+        <div className="flex space-x-1 bg-terminal-gray/10 p-1 rounded border border-terminal-green/30">
+          {[
+            { id: 'transfer', label: 'TRANSFER', icon: '🌉' },
+            { id: 'history', label: 'HISTORY', icon: '📋' },
+            { id: 'bridges', label: 'BRIDGES', icon: '🔗' },
+            { id: 'analytics', label: 'ANALYTICS', icon: '📊' }
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`flex-1 py-3 px-4 text-sm font-bold transition-all duration-300 rounded ${
+                activeTab === tab.id
+                  ? 'bg-terminal-green text-terminal-black'
+                  : 'text-terminal-green hover:bg-terminal-green/10'
+              }`}
+            >
+              <span className="mr-2">{tab.icon}</span>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto px-4 pb-8">
+        <AnimatePresence mode="wait">
+          {activeTab === 'transfer' && (
+            <motion.div
+              key="transfer"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <TransferInterface 
+                transferForm={transferForm}
+                setTransferForm={setTransferForm}
+                onTransfer={handleCrossChainTransfer}
+                supportedChains={supportedChains}
+                routerState={routerState}
+                calculateTransferFees={calculateTransferFees}
+                isTransferring={isTransferring}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'history' && (
+            <motion.div
+              key="history"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <TransferHistory 
+                outboundMessages={userOutboundMessages}
+                inboundMessages={userInboundMessages}
+                supportedChains={supportedChains}
+                getChainName={getChainName}
+                getChainIcon={getChainIcon}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'bridges' && (
+            <motion.div
+              key="bridges"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <BridgeManagement 
+                routerState={routerState}
+                supportedChains={supportedChains}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'analytics' && (
+            <motion.div
+              key="analytics"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <CrossChainAnalyticsInterface 
+                analytics={analytics}
+                routerState={routerState}
+                monitor={monitor}
+                supportedChains={supportedChains}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+}
+
+// Placeholder components for different interfaces
+function TransferInterface({ transferForm, setTransferForm, onTransfer, supportedChains, routerState, calculateTransferFees, isTransferring, isLoading }: any) {
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+      {/* Transfer Form */}
+      <div className="terminal-card p-6">
+        <h2 className="text-xl font-bold mb-6 text-glow">CROSS_CHAIN_TRANSFER.exe</h2>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-bold mb-2">Destination Chain</label>
+            <select
+              value={transferForm.destinationChain}
+              onChange={(e) => setTransferForm({ ...transferForm, destinationChain: e.target.value })}
+              className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green focus:border-terminal-green focus:outline-none"
+            >
+              <option value="">Select destination chain</option>
+              {supportedChains.filter((chain: any) => chain.isActive).map((chain: any) => (
+                <option key={chain.chainId} value={chain.chainId}>
+                  {chain.icon} {chain.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold mb-2">Recipient Address</label>
+            <input
+              type="text"
+              value={transferForm.recipient}
+              onChange={(e) => setTransferForm({ ...transferForm, recipient: e.target.value })}
+              placeholder="Enter recipient address on destination chain"
+              className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold mb-2">Amount (ADA)</label>
+            <input
+              type="number"
+              value={transferForm.amount}
+              onChange={(e) => setTransferForm({ ...transferForm, amount: e.target.value })}
+              placeholder="Enter amount to transfer"
+              className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none"
+            />
+          </div>
+
+          {calculateTransferFees && (
+            <div className="p-3 bg-terminal-green/10 border border-terminal-green/30 rounded">
+              <div className="text-sm text-terminal-green/70 mb-2">Transfer Fees:</div>
+              <div className="space-y-1 text-sm">
+                <div className="flex justify-between">
+                  <span>Cross-chain Fee:</span>
+                  <span>{calculateTransferFees.crossChainFee.toFixed(6)} ADA</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Bridge Fee:</span>
+                  <span>{calculateTransferFees.bridgeFee.toFixed(6)} ADA</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Operator Fee:</span>
+                  <span>{calculateTransferFees.operatorFee.toFixed(6)} ADA</span>
+                </div>
+                <div className="border-t border-terminal-green/30 pt-1 mt-2">
+                  <div className="flex justify-between font-bold">
+                    <span>Net Amount:</span>
+                    <span className="text-terminal-amber">{calculateTransferFees.netAmount.toFixed(6)} ADA</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <button
+            onClick={onTransfer}
+            disabled={isTransferring || isLoading || !transferForm.destinationChain || !transferForm.recipient || !transferForm.amount}
+            className="w-full py-3 px-6 bg-terminal-green text-terminal-black font-bold rounded hover:bg-terminal-green/80 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300"
+          >
+            {isTransferring ? 'TRANSFERRING...' : 'INITIATE TRANSFER'}
+          </button>
+        </div>
+      </div>
+
+      {/* Chain Status */}
+      <div className="terminal-card p-6">
+        <h2 className="text-xl font-bold mb-6 text-glow">CHAIN_STATUS.dat</h2>
+        
+        <div className="space-y-4">
+          {supportedChains.map((chain: any) => (
+            <div key={chain.chainId} className="flex items-center justify-between p-3 bg-terminal-gray/20 rounded border border-terminal-green/20">
+              <div className="flex items-center space-x-3">
+                <span className="text-2xl">{chain.icon}</span>
+                <div>
+                  <div className="font-bold">{chain.name}</div>
+                  <div className="text-sm text-terminal-green/70">Chain ID: {chain.chainId}</div>
+                </div>
+              </div>
+              <div className={`px-2 py-1 rounded text-xs font-bold ${
+                chain.isActive ? 'bg-terminal-green text-terminal-black' : 'bg-red-500 text-white'
+              }`}>
+                {chain.isActive ? 'ACTIVE' : 'INACTIVE'}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Placeholder components
+function TransferHistory(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">TRANSFER_HISTORY.exe</h2><p className="text-terminal-green/70 mt-4">Transfer history interface coming soon...</p></div>;
+}
+
+function BridgeManagement(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">BRIDGE_MANAGEMENT.exe</h2><p className="text-terminal-green/70 mt-4">Bridge management interface coming soon...</p></div>;
+}
+
+function CrossChainAnalyticsInterface(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">CROSSCHAIN_ANALYTICS.exe</h2><p className="text-terminal-green/70 mt-4">Cross-chain analytics interface coming soon...</p></div>;
+}

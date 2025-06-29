@@ -1,0 +1,575 @@
+// PuckSwap v5 DeFi - Liquid Staking Component
+// Comprehensive liquid staking interface with pADA minting, deposits, withdrawals, and analytics
+// Retro terminal aesthetic with professional DeFi functionality
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { PuckSwapLiquidStaking, StakingState, WithdrawalRequest, StakingDepositParams, WithdrawalRequestParams } from '../lucid/staking';
+import { StakingMonitor, StakingAnalytics } from '../context7/staking-monitor';
+import { formatADA, formatToken, formatPercentage, formatTimeRemaining } from '../lib/format-utils';
+
+// Liquid staking interfaces
+interface LiquidStakingProps {
+  staking?: PuckSwapLiquidStaking;
+  monitor?: StakingMonitor;
+  isDemoMode?: boolean;
+}
+
+interface StakeFormData {
+  amount: string;
+  minPADAOut: string;
+  deadline: string;
+}
+
+interface WithdrawFormData {
+  pADAAmount: string;
+  minADAOut: string;
+}
+
+export default function LiquidStaking({ 
+  staking, 
+  monitor, 
+  isDemoMode = false 
+}: LiquidStakingProps) {
+  // State management
+  const [stakingState, setStakingState] = useState<StakingState | null>(null);
+  const [analytics, setAnalytics] = useState<StakingAnalytics | null>(null);
+  const [activeTab, setActiveTab] = useState<'stake' | 'unstake' | 'rewards' | 'analytics'>('stake');
+  const [userPADABalance, setUserPADABalance] = useState<bigint>(0n);
+  const [userWithdrawals, setUserWithdrawals] = useState<WithdrawalRequest[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isStaking, setIsStaking] = useState(false);
+  const [isWithdrawing, setIsWithdrawing] = useState(false);
+
+  // Form states
+  const [stakeForm, setStakeForm] = useState<StakeFormData>({
+    amount: '',
+    minPADAOut: '',
+    deadline: ''
+  });
+
+  const [withdrawForm, setWithdrawForm] = useState<WithdrawFormData>({
+    pADAAmount: '',
+    minADAOut: ''
+  });
+
+  // Load staking state
+  const loadStakingState = useCallback(async () => {
+    if (isDemoMode) {
+      // Demo data
+      const demoState: StakingState = {
+        totalStaked: 5000000000000n, // 5M ADA
+        totalPADAMinted: 5000000000000n, // 5M pADA
+        stakePoolId: "pool1demo...",
+        lastRewardsSyncSlot: 1000000,
+        accumulatedRewards: 250000000000n, // 250K ADA
+        rewardRate: 520, // 5.2% APY
+        lastEpochRewards: 50000000000n, // 50K ADA
+        stakingPoolAddress: "addr1_demo_staking_pool",
+        oracleAddress: "addr1_demo_oracle",
+        governanceAddress: "addr1_demo_governance",
+        minStakeAmount: 1000000n, // 1 ADA
+        maxStakeAmount: 1000000000000n, // 1M ADA
+        withdrawalDelaySlots: 432000, // 5 days
+        rewardSyncInterval: 432000, // 5 days
+        paused: false,
+        emergencyAdmin: "addr1_demo_emergency",
+        oraclePublicKey: "demo_oracle_key",
+        depositFeeBps: 50, // 0.5%
+        withdrawalFeeBps: 50, // 0.5%
+        managementFeeBps: 200, // 2%
+        totalDepositors: 2500,
+        totalWithdrawals: 150,
+        totalRewardsDistributed: 500000000000n // 500K ADA
+      };
+
+      const demoAnalytics: StakingAnalytics = {
+        totalValueLocked: 5000000000000n,
+        totalStakers: 2500,
+        averageStakeSize: 2000000000n, // 2K ADA
+        stakingAPY: 5.2,
+        exchangeRate: 1.05,
+        rewardDistributionHistory: [
+          { epoch: 450, totalRewards: 50000000000n, rewardRate: 520, timestamp: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000) },
+          { epoch: 449, totalRewards: 48000000000n, rewardRate: 515, timestamp: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000) },
+          { epoch: 448, totalRewards: 52000000000n, rewardRate: 525, timestamp: new Date(Date.now() - 15 * 24 * 60 * 60 * 1000) }
+        ],
+        depositHistory: [],
+        topStakers: [],
+        performanceMetrics: {
+          uptimePercentage: 99.8,
+          averageRewardDelay: 2.5,
+          successfulTransactions: 15420,
+          failedTransactions: 23
+        }
+      };
+
+      setStakingState(demoState);
+      setAnalytics(demoAnalytics);
+      setUserStADABalance(10000000000n); // 10K stADA
+      return;
+    }
+
+    if (!staking || !monitor) return;
+
+    try {
+      setIsLoading(true);
+      
+      const state = await staking.getStakingState();
+      if (state) {
+        setStakingState(state);
+      }
+
+      const analyticsData = monitor.getAnalytics();
+      if (analyticsData) {
+        setAnalytics(analyticsData);
+      }
+
+      const balance = await staking.getUserStADABalance();
+      setUserStADABalance(balance);
+
+      const withdrawals = await staking.getUserWithdrawalRequests();
+      setUserWithdrawals(withdrawals);
+
+    } catch (error) {
+      console.error('Error loading staking state:', error);
+      toast.error('Failed to load staking data');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [staking, monitor, isDemoMode]);
+
+  // Load data on component mount
+  useEffect(() => {
+    loadStakingState();
+  }, [loadStakingState]);
+
+  // Set up real-time updates
+  useEffect(() => {
+    if (!monitor || isDemoMode) return;
+
+    const handleStakingUpdate = () => {
+      loadStakingState();
+    };
+
+    monitor.addEventListener('*', handleStakingUpdate);
+
+    return () => {
+      monitor.removeEventListener('*', handleStakingUpdate);
+    };
+  }, [monitor, isDemoMode, loadStakingState]);
+
+  // Handle stake deposit
+  const handleStakeDeposit = async () => {
+    if (!staking && !isDemoMode) {
+      toast.error('Staking system not connected');
+      return;
+    }
+
+    if (!stakeForm.amount || parseFloat(stakeForm.amount) <= 0) {
+      toast.error('Please enter a valid stake amount');
+      return;
+    }
+
+    try {
+      setIsStaking(true);
+
+      const amount = BigInt(Math.floor(parseFloat(stakeForm.amount) * 1_000_000));
+      const minStADAOut = stakeForm.minStADAOut ? 
+        BigInt(Math.floor(parseFloat(stakeForm.minStADAOut) * 1_000_000)) : 0n;
+      const deadline = stakeForm.deadline ? 
+        Math.floor(new Date(stakeForm.deadline).getTime() / 1000) : 
+        Math.floor(Date.now() / 1000) + 3600; // 1 hour default
+
+      if (isDemoMode) {
+        // Simulate staking
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        toast.success(`Demo stake of ${stakeForm.amount} ADA completed!`, {
+          duration: 5000,
+          icon: '🥩'
+        });
+        
+        // Reset form
+        setStakeForm({ amount: '', minStADAOut: '', deadline: '' });
+      } else if (staking) {
+        const params: StakingDepositParams = {
+          amount,
+          minStADAOut,
+          deadline
+        };
+
+        const txHash = await staking.depositStaking(params);
+        toast.success(`Stake deposited! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '🥩'
+        });
+
+        // Reset form and reload data
+        setStakeForm({ amount: '', minStADAOut: '', deadline: '' });
+        await loadStakingState();
+      }
+    } catch (error) {
+      console.error('Error staking:', error);
+      toast.error('Failed to stake ADA');
+    } finally {
+      setIsStaking(false);
+    }
+  };
+
+  // Handle withdrawal request
+  const handleWithdrawalRequest = async () => {
+    if (!staking && !isDemoMode) {
+      toast.error('Staking system not connected');
+      return;
+    }
+
+    if (!withdrawForm.stADAAmount || parseFloat(withdrawForm.stADAAmount) <= 0) {
+      toast.error('Please enter a valid stADA amount');
+      return;
+    }
+
+    try {
+      setIsWithdrawing(true);
+
+      const stADAAmount = BigInt(Math.floor(parseFloat(withdrawForm.stADAAmount) * 1_000_000));
+      const minADAOut = withdrawForm.minADAOut ? 
+        BigInt(Math.floor(parseFloat(withdrawForm.minADAOut) * 1_000_000)) : 0n;
+
+      if (isDemoMode) {
+        // Simulate withdrawal request
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        toast.success(`Demo withdrawal request for ${withdrawForm.stADAAmount} stADA submitted!`, {
+          duration: 5000,
+          icon: '📤'
+        });
+        
+        // Reset form
+        setWithdrawForm({ stADAAmount: '', minADAOut: '' });
+      } else if (staking) {
+        const params: WithdrawalRequestParams = {
+          stADAAmount,
+          minADAOut
+        };
+
+        const txHash = await staking.requestWithdrawal(params);
+        toast.success(`Withdrawal requested! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '📤'
+        });
+
+        // Reset form and reload data
+        setWithdrawForm({ stADAAmount: '', minADAOut: '' });
+        await loadStakingState();
+      }
+    } catch (error) {
+      console.error('Error requesting withdrawal:', error);
+      toast.error('Failed to request withdrawal');
+    } finally {
+      setIsWithdrawing(false);
+    }
+  };
+
+  // Calculate estimated pADA output
+  const calculateEstimatedPADA = useMemo(() => {
+    if (!stakeForm.amount || !stakingState) return 0;
+
+    const amount = parseFloat(stakeForm.amount);
+    const exchangeRate = stakingState.totalPADAMinted === 0n ? 1 :
+      Number(stakingState.totalPADAMinted) / Number(stakingState.totalStaked);
+
+    return amount * exchangeRate;
+  }, [stakeForm.amount, stakingState]);
+
+  // Calculate estimated ADA output
+  const calculateEstimatedADA = useMemo(() => {
+    if (!withdrawForm.pADAAmount || !stakingState) return 0;
+
+    const pADAAmount = parseFloat(withdrawForm.pADAAmount);
+    const exchangeRate = stakingState.totalPADAMinted === 0n ? 1 :
+      Number(stakingState.totalStaked) / Number(stakingState.totalPADAMinted);
+
+    return pADAAmount * exchangeRate;
+  }, [withdrawForm.pADAAmount, stakingState]);
+
+  // Memoized calculations
+  const stakingStats = useMemo(() => {
+    if (!stakingState || !analytics) return null;
+
+    const exchangeRate = stakingState.totalPADAMinted === 0n ? 1 :
+      Number(stakingState.totalStaked) / Number(stakingState.totalPADAMinted);
+    
+    const apy = (stakingState.rewardRate / 100) * (365.25 / 5); // Assuming 5-day epochs
+    
+    const userStakedValue = Number(userStADABalance) * exchangeRate / 1_000_000; // Convert to ADA
+
+    return {
+      totalStaked: Number(stakingState.totalStaked) / 1_000_000,
+      totalStADAMinted: Number(stakingState.totalStADAMinted) / 1_000_000,
+      exchangeRate,
+      apy,
+      totalStakers: stakingState.totalDepositors,
+      userStADABalance: Number(userStADABalance) / 1_000_000,
+      userStakedValue,
+      totalRewards: Number(stakingState.totalRewardsDistributed) / 1_000_000,
+      lastEpochRewards: Number(stakingState.lastEpochRewards) / 1_000_000,
+      uptime: analytics.performanceMetrics.uptimePercentage
+    };
+  }, [stakingState, analytics, userStADABalance]);
+
+  return (
+    <div className="min-h-screen bg-terminal-black text-terminal-green font-mono">
+      {/* Header */}
+      <div className="border-b border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-glow">
+                LIQUID_STAKING.exe
+              </h1>
+              <p className="text-terminal-green/70 text-sm mt-1">
+                Stake ADA • Mint stADA • Earn Rewards • Maintain Liquidity
+              </p>
+            </div>
+            
+            {stakingStats && (
+              <div className="flex items-center space-x-6 text-sm">
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {formatADA(stakingStats.totalStaked)}
+                  </div>
+                  <div className="text-terminal-green/70">Total Staked</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {stakingStats.apy.toFixed(2)}%
+                  </div>
+                  <div className="text-terminal-green/70">APY</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {stakingStats.exchangeRate.toFixed(4)}
+                  </div>
+                  <div className="text-terminal-green/70">Exchange Rate</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {formatADA(stakingStats.userStADABalance)}
+                  </div>
+                  <div className="text-terminal-green/70">Your stADA</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Navigation Tabs */}
+      <div className="max-w-7xl mx-auto px-4 py-4">
+        <div className="flex space-x-1 bg-terminal-gray/10 p-1 rounded border border-terminal-green/30">
+          {[
+            { id: 'stake', label: 'STAKE', icon: '🥩' },
+            { id: 'unstake', label: 'UNSTAKE', icon: '📤' },
+            { id: 'rewards', label: 'REWARDS', icon: '💰' },
+            { id: 'analytics', label: 'ANALYTICS', icon: '📊' }
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`flex-1 py-3 px-4 text-sm font-bold transition-all duration-300 rounded ${
+                activeTab === tab.id
+                  ? 'bg-terminal-green text-terminal-black'
+                  : 'text-terminal-green hover:bg-terminal-green/10'
+              }`}
+            >
+              <span className="mr-2">{tab.icon}</span>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto px-4 pb-8">
+        <AnimatePresence mode="wait">
+          {activeTab === 'stake' && (
+            <motion.div
+              key="stake"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <StakeInterface 
+                stakeForm={stakeForm}
+                setStakeForm={setStakeForm}
+                onStake={handleStakeDeposit}
+                estimatedStADA={calculateEstimatedStADA}
+                stakingStats={stakingStats}
+                isStaking={isStaking}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'unstake' && (
+            <motion.div
+              key="unstake"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <UnstakeInterface 
+                withdrawForm={withdrawForm}
+                setWithdrawForm={setWithdrawForm}
+                onWithdraw={handleWithdrawalRequest}
+                estimatedADA={calculateEstimatedADA}
+                stakingStats={stakingStats}
+                userWithdrawals={userWithdrawals}
+                isWithdrawing={isWithdrawing}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'rewards' && (
+            <motion.div
+              key="rewards"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <RewardsInterface 
+                stakingState={stakingState}
+                analytics={analytics}
+                stakingStats={stakingStats}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'analytics' && (
+            <motion.div
+              key="analytics"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <StakingAnalyticsInterface 
+                analytics={analytics}
+                stakingState={stakingState}
+                monitor={monitor}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+}
+
+// Placeholder components for different interfaces
+function StakeInterface({ stakeForm, setStakeForm, onStake, estimatedStADA, stakingStats, isStaking, isLoading }: any) {
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+      {/* Stake Form */}
+      <div className="terminal-card p-6">
+        <h2 className="text-xl font-bold mb-6 text-glow">STAKE_ADA.exe</h2>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-bold mb-2">ADA Amount</label>
+            <input
+              type="number"
+              value={stakeForm.amount}
+              onChange={(e) => setStakeForm({ ...stakeForm, amount: e.target.value })}
+              placeholder="Enter ADA amount"
+              className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-bold mb-2">Min stADA Output (Optional)</label>
+            <input
+              type="number"
+              value={stakeForm.minStADAOut}
+              onChange={(e) => setStakeForm({ ...stakeForm, minStADAOut: e.target.value })}
+              placeholder="Minimum stADA to receive"
+              className="w-full p-3 bg-terminal-gray border border-terminal-green/30 rounded text-terminal-green placeholder-terminal-green/50 focus:border-terminal-green focus:outline-none"
+            />
+          </div>
+
+          {estimatedStADA > 0 && (
+            <div className="p-3 bg-terminal-green/10 border border-terminal-green/30 rounded">
+              <div className="text-sm text-terminal-green/70">Estimated stADA Output:</div>
+              <div className="text-lg font-bold text-terminal-amber">
+                {estimatedStADA.toFixed(6)} stADA
+              </div>
+            </div>
+          )}
+
+          <button
+            onClick={onStake}
+            disabled={isStaking || isLoading || !stakeForm.amount}
+            className="w-full py-3 px-6 bg-terminal-green text-terminal-black font-bold rounded hover:bg-terminal-green/80 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-300"
+          >
+            {isStaking ? 'STAKING...' : 'STAKE ADA'}
+          </button>
+        </div>
+      </div>
+
+      {/* Staking Info */}
+      <div className="terminal-card p-6">
+        <h2 className="text-xl font-bold mb-6 text-glow">STAKING_INFO.dat</h2>
+        
+        {stakingStats ? (
+          <div className="space-y-4">
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">Current APY:</span>
+              <span className="font-bold text-terminal-amber">{stakingStats.apy.toFixed(2)}%</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">Exchange Rate:</span>
+              <span className="font-bold">{stakingStats.exchangeRate.toFixed(4)} ADA/stADA</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">Total Stakers:</span>
+              <span className="font-bold">{stakingStats.totalStakers.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">Your stADA Balance:</span>
+              <span className="font-bold text-terminal-amber">{formatADA(stakingStats.userStADABalance)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">Your Staked Value:</span>
+              <span className="font-bold text-terminal-amber">{formatADA(stakingStats.userStakedValue)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-green/70">System Uptime:</span>
+              <span className="font-bold text-terminal-green">{stakingStats.uptime.toFixed(1)}%</span>
+            </div>
+          </div>
+        ) : (
+          <div className="text-center text-terminal-green/50">Loading staking information...</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Placeholder components
+function UnstakeInterface(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">UNSTAKE_INTERFACE.exe</h2><p className="text-terminal-green/70 mt-4">Unstaking interface coming soon...</p></div>;
+}
+
+function RewardsInterface(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">REWARDS_INTERFACE.exe</h2><p className="text-terminal-green/70 mt-4">Rewards interface coming soon...</p></div>;
+}
+
+function StakingAnalyticsInterface(props: any) {
+  return <div className="terminal-card p-6"><h2 className="text-xl font-bold text-glow">ANALYTICS_INTERFACE.exe</h2><p className="text-terminal-green/70 mt-4">Analytics interface coming soon...</p></div>;
+}

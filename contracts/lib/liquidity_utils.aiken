@@ -1,0 +1,362 @@
+use aiken/transaction.{ScriptContext, Input, Output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import shared types
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use puckswap/lib/value_utils.{get_ada_quantity, get_asset_quantity}
+
+// =============================================================================
+// LIQUIDITY UTILITIES
+// =============================================================================
+// 
+// Comprehensive utilities for liquidity provision calculations
+// - LP token minting calculations
+// - Liquidity ratio validation
+// - Balance checking utilities
+// - Proportional calculation helpers
+// =============================================================================
+
+// Liquidity calculation constants
+pub const MIN_INITIAL_ADA: Int = 10_000_000        // 10 ADA minimum for initial liquidity
+pub const MIN_INITIAL_TOKEN: Int = 1_000_000       // 1 token minimum for initial liquidity
+pub const MIN_SUBSEQUENT_ADA: Int = 1_000_000      // 1 ADA minimum for subsequent liquidity
+pub const MIN_SUBSEQUENT_TOKEN: Int = 1_000_000    // 1 token minimum for subsequent liquidity
+pub const MAX_RATIO_DEVIATION_BPS: Int = 500       // 5% maximum ratio deviation
+pub const MAX_SINGLE_PROVISION_BPS: Int = 5000     // 50% maximum single provision
+
+// Liquidity calculation result
+pub type LiquidityCalculationResult {
+  lp_tokens_to_mint: Int,
+  ada_ratio: Int,
+  token_ratio: Int,
+  effective_ratio: Int,
+  is_balanced: Bool,
+  ratio_deviation_bps: Int,
+}
+
+// Liquidity validation result
+pub type LiquidityValidationResult {
+  is_valid: Bool,
+  error_message: ByteArray,
+  suggested_ada_amount: Int,
+  suggested_token_amount: Int,
+}
+
+// =============================================================================
+// CORE LIQUIDITY CALCULATIONS
+// =============================================================================
+
+// Calculate LP tokens to mint for liquidity provision
+pub fn calculate_lp_tokens_to_mint(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> LiquidityCalculationResult {
+  if total_lp_supply == 0 {
+    // Initial liquidity provision - use geometric mean
+    let lp_tokens = math.sqrt(ada_amount * token_amount)
+    
+    LiquidityCalculationResult {
+      lp_tokens_to_mint: lp_tokens,
+      ada_ratio: 1000000,  // 100% (scaled by 1e6)
+      token_ratio: 1000000, // 100% (scaled by 1e6)
+      effective_ratio: 1000000,
+      is_balanced: True,
+      ratio_deviation_bps: 0,
+    }
+  } else {
+    // Subsequent liquidity provision - use proportional calculation
+    calculate_proportional_lp_tokens(
+      ada_reserve, token_reserve, total_lp_supply, ada_amount, token_amount
+    )
+  }
+}
+
+// Calculate proportional LP tokens for subsequent liquidity provision
+fn calculate_proportional_lp_tokens(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> LiquidityCalculationResult {
+  // Calculate ratios (scaled by 1e6 for precision)
+  let ada_ratio = ada_amount * 1000000 / ada_reserve
+  let token_ratio = token_amount * 1000000 / token_reserve
+
+  // Calculate ratio deviation in basis points
+  let ratio_diff = math.abs(ada_ratio - token_ratio)
+  let max_ratio = math.max(ada_ratio, token_ratio)
+  let ratio_deviation_bps = if max_ratio > 0 { ratio_diff * 10000 / max_ratio } else { 0 }
+
+  // Use minimum ratio to prevent manipulation and ensure balanced liquidity
+  let effective_ratio = math.min(ada_ratio, token_ratio)
+  let lp_tokens = total_lp_supply * effective_ratio / 1000000
+
+  // Check if liquidity is balanced (within acceptable deviation)
+  let is_balanced = ratio_deviation_bps <= MAX_RATIO_DEVIATION_BPS
+
+  LiquidityCalculationResult {
+    lp_tokens_to_mint: lp_tokens,
+    ada_ratio: ada_ratio,
+    token_ratio: token_ratio,
+    effective_ratio: effective_ratio,
+    is_balanced: is_balanced,
+    ratio_deviation_bps: ratio_deviation_bps,
+  }
+}
+
+// =============================================================================
+// LIQUIDITY VALIDATION
+// =============================================================================
+
+// Validate liquidity ratio balance
+pub fn validate_liquidity_ratio(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  max_deviation_bps: Int
+) -> LiquidityValidationResult {
+  if ada_reserve == 0 || token_reserve == 0 {
+    // Initial liquidity - always valid
+    return LiquidityValidationResult {
+      is_valid: True,
+      error_message: #"",
+      suggested_ada_amount: ada_amount,
+      suggested_token_amount: token_amount,
+    }
+  }
+
+  // Calculate current pool ratio
+  let pool_ratio = ada_reserve * 1000000 / token_reserve
+
+  // Calculate provided ratio
+  let provided_ratio = ada_amount * 1000000 / token_amount
+
+  // Calculate deviation
+  let ratio_diff = math.abs(pool_ratio - provided_ratio)
+  let deviation_bps = ratio_diff * 10000 / pool_ratio
+
+  if deviation_bps <= max_deviation_bps {
+    LiquidityValidationResult {
+      is_valid: True,
+      error_message: #"",
+      suggested_ada_amount: ada_amount,
+      suggested_token_amount: token_amount,
+    }
+  } else {
+    // Calculate suggested balanced amounts
+    let (suggested_ada, suggested_token) = calculate_balanced_amounts(
+      ada_reserve, token_reserve, ada_amount, token_amount
+    )
+
+    LiquidityValidationResult {
+      is_valid: False,
+      error_message: #"Liquidity ratio deviation exceeds maximum allowed",
+      suggested_ada_amount: suggested_ada,
+      suggested_token_amount: suggested_token,
+    }
+  }
+}
+
+// Calculate balanced liquidity amounts
+fn calculate_balanced_amounts(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> (Int, Int) {
+  // Calculate what the balanced amounts should be based on pool ratio
+  let pool_ratio = ada_reserve * 1000000 / token_reserve
+
+  // Option 1: Keep ADA amount, adjust token amount
+  let balanced_token_for_ada = ada_amount * 1000000 / pool_ratio
+
+  // Option 2: Keep token amount, adjust ADA amount
+  let balanced_ada_for_token = token_amount * pool_ratio / 1000000
+
+  // Choose the option that's closer to the original amounts
+  let ada_diff_1 = math.abs(ada_amount - ada_amount)  // 0
+  let token_diff_1 = math.abs(token_amount - balanced_token_for_ada)
+  let total_diff_1 = ada_diff_1 + token_diff_1
+
+  let ada_diff_2 = math.abs(ada_amount - balanced_ada_for_token)
+  let token_diff_2 = math.abs(token_amount - token_amount)  // 0
+  let total_diff_2 = ada_diff_2 + token_diff_2
+
+  if total_diff_1 <= total_diff_2 {
+    (ada_amount, balanced_token_for_ada)
+  } else {
+    (balanced_ada_for_token, token_amount)
+  }
+}
+
+// =============================================================================
+// LIQUIDITY AMOUNT VALIDATION
+// =============================================================================
+
+// Validate minimum liquidity amounts
+pub fn validate_minimum_amounts(
+  ada_amount: Int,
+  token_amount: Int,
+  is_initial: Bool
+) -> Bool {
+  if is_initial {
+    ada_amount >= MIN_INITIAL_ADA && token_amount >= MIN_INITIAL_TOKEN
+  } else {
+    ada_amount >= MIN_SUBSEQUENT_ADA && token_amount >= MIN_SUBSEQUENT_TOKEN
+  }
+}
+
+// Validate maximum liquidity amounts relative to pool size
+pub fn validate_maximum_amounts(
+  ada_amount: Int,
+  token_amount: Int,
+  ada_reserve: Int,
+  token_reserve: Int
+) -> Bool {
+  if ada_reserve == 0 || token_reserve == 0 {
+    // Initial liquidity - no maximum limit
+    True
+  } else {
+    let max_ada = ada_reserve * MAX_SINGLE_PROVISION_BPS / 10000
+    let max_token = token_reserve * MAX_SINGLE_PROVISION_BPS / 10000
+    
+    ada_amount <= max_ada && token_amount <= max_token
+  }
+}
+
+// =============================================================================
+// POOL STATE UTILITIES
+// =============================================================================
+
+// Calculate new pool state after liquidity provision
+pub fn calculate_new_pool_state(
+  current_state: PoolState,
+  ada_amount: Int,
+  token_amount: Int,
+  lp_tokens_to_mint: Int
+) -> PoolState {
+  PoolState {
+    ada_reserve: current_state.ada_reserve + ada_amount,
+    token_reserve: current_state.token_reserve + token_amount,
+    total_lp_supply: current_state.total_lp_supply + lp_tokens_to_mint,
+    last_interaction_slot: current_state.last_interaction_slot, // Will be updated by validator
+    pool_nft_name: current_state.pool_nft_name,
+  }
+}
+
+// Calculate liquidity provider's share percentage
+pub fn calculate_lp_share_percentage(
+  lp_tokens: Int,
+  total_lp_supply: Int
+) -> Int {
+  if total_lp_supply == 0 {
+    0
+  } else {
+    // Return percentage scaled by 1e6 (1000000 = 100%)
+    lp_tokens * 1000000 / total_lp_supply
+  }
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Check if liquidity provision would create a balanced pool
+pub fn is_balanced_liquidity(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  tolerance_bps: Int
+) -> Bool {
+  if ada_reserve == 0 || token_reserve == 0 {
+    // Initial liquidity is always considered balanced
+    True
+  } else {
+    let validation_result = validate_liquidity_ratio(
+      ada_reserve, token_reserve, ada_amount, token_amount, tolerance_bps
+    )
+    validation_result.is_valid
+  }
+}
+
+// Calculate optimal liquidity amounts for a given ADA amount
+pub fn calculate_optimal_token_amount(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int
+) -> Int {
+  if ada_reserve == 0 {
+    // For initial liquidity, no specific ratio required
+    0
+  } else {
+    // Calculate proportional token amount
+    ada_amount * token_reserve / ada_reserve
+  }
+}
+
+// Calculate optimal liquidity amounts for a given token amount
+pub fn calculate_optimal_ada_amount(
+  ada_reserve: Int,
+  token_reserve: Int,
+  token_amount: Int
+) -> Int {
+  if token_reserve == 0 {
+    // For initial liquidity, no specific ratio required
+    0
+  } else {
+    // Calculate proportional ADA amount
+    token_amount * ada_reserve / token_reserve
+  }
+}
+
+// Validate that liquidity provision doesn't exceed reasonable limits
+pub fn validate_reasonable_provision(
+  ada_amount: Int,
+  token_amount: Int,
+  pool_state: PoolState
+) -> Bool {
+  // Validate minimum amounts
+  let min_valid = validate_minimum_amounts(ada_amount, token_amount, pool_state.total_lp_supply == 0)
+  
+  // Validate maximum amounts
+  let max_valid = validate_maximum_amounts(
+    ada_amount, token_amount, pool_state.ada_reserve, pool_state.token_reserve
+  )
+  
+  min_valid && max_valid
+}
+
+// Calculate price impact of liquidity provision
+pub fn calculate_liquidity_price_impact(
+  ada_reserve: Int,
+  token_reserve: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> Int {
+  if ada_reserve == 0 || token_reserve == 0 {
+    // Initial liquidity has no price impact
+    0
+  } else {
+    // Calculate original price (ADA per token, scaled by 1e6)
+    let original_price = ada_reserve * 1000000 / token_reserve
+    
+    // Calculate new price after liquidity addition
+    let new_ada_reserve = ada_reserve + ada_amount
+    let new_token_reserve = token_reserve + token_amount
+    let new_price = new_ada_reserve * 1000000 / new_token_reserve
+    
+    // Calculate price impact in basis points
+    let price_diff = math.abs(new_price - original_price)
+    price_diff * 10000 / original_price
+  }
+}

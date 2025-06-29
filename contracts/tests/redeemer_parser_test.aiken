@@ -1,0 +1,318 @@
+use aiken/transaction.{ScriptContext, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{PolicyId, AssetName}
+use aiken/list
+use aiken/bytearray
+use aiken/cbor
+
+// Import our redeemer parser
+use puckswap/lib/redeemer_parser.{
+  PoolRedeemer, SwapRedeemer, LPRedeemer, FactoryRedeemer,
+  ParseResult, ParseError, Success, Error,
+  parse_pool_redeemer, parse_swap_redeemer, parse_lp_redeemer, parse_factory_redeemer,
+  serialize_pool_redeemer, serialize_swap_redeemer,
+  validate_redeemer_context, validate_swap_amounts, validate_liquidity_amounts,
+  is_success, unwrap, error_to_string
+}
+
+// =============================================================================
+// TEST DATA SETUP
+// =============================================================================
+
+// Mock address for testing
+fn mock_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+// Mock policy ID for testing
+fn mock_policy_id() -> PolicyId {
+  #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+}
+
+// Mock asset name for testing
+fn mock_asset_name() -> AssetName {
+  #"50554b4b59" // "PUKKY" in hex
+}
+
+// Mock output reference for testing
+fn mock_output_reference() -> OutputReference {
+  OutputReference {
+    transaction_id: #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321",
+    output_index: 0
+  }
+}
+
+// =============================================================================
+// POOL REDEEMER TESTS
+// =============================================================================
+
+test test_parse_swap_redeemer() {
+  // Create a swap redeemer
+  let swap_redeemer = PoolRedeemer::Swap {
+    input_amount: 1000000,
+    min_output: 950000,
+    deadline: 1234567890,
+    recipient: mock_address()
+  }
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(swap_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::Swap { input_amount, min_output, deadline, recipient } -> {
+      input_amount == 1000000 && 
+      min_output == 950000 && 
+      deadline == 1234567890 &&
+      recipient == mock_address()
+    }
+    _ -> False
+  }
+}
+
+test test_parse_add_liquidity_redeemer() {
+  // Create an add liquidity redeemer
+  let add_liquidity_redeemer = PoolRedeemer::AddLiquidity {
+    ada_amount: 10000000,
+    token_amount: 5000000,
+    min_lp_tokens: 7000000,
+    deadline: 1234567890
+  }
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(add_liquidity_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::AddLiquidity { ada_amount, token_amount, min_lp_tokens, deadline } -> {
+      ada_amount == 10000000 && 
+      token_amount == 5000000 && 
+      min_lp_tokens == 7000000 &&
+      deadline == 1234567890
+    }
+    _ -> False
+  }
+}
+
+test test_parse_remove_liquidity_redeemer() {
+  // Create a remove liquidity redeemer
+  let remove_liquidity_redeemer = PoolRedeemer::RemoveLiquidity {
+    lp_tokens: 5000000,
+    min_ada_out: 8000000,
+    min_token_out: 4000000,
+    deadline: 1234567890
+  }
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(remove_liquidity_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, deadline } -> {
+      lp_tokens == 5000000 && 
+      min_ada_out == 8000000 && 
+      min_token_out == 4000000 &&
+      deadline == 1234567890
+    }
+    _ -> False
+  }
+}
+
+test test_parse_create_pool_redeemer() {
+  // Create a create pool redeemer
+  let create_pool_redeemer = PoolRedeemer::CreatePool {
+    initial_ada: 100000000,
+    initial_token: 50000000,
+    fee_bps: 300
+  }
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(create_pool_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::CreatePool { initial_ada, initial_token, fee_bps } -> {
+      initial_ada == 100000000 && 
+      initial_token == 50000000 && 
+      fee_bps == 300
+    }
+    _ -> False
+  }
+}
+
+test test_parse_emergency_pause_redeemer() {
+  // Create an emergency pause redeemer
+  let emergency_pause_redeemer = PoolRedeemer::EmergencyPause
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(emergency_pause_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::EmergencyPause -> True
+    _ -> False
+  }
+}
+
+test test_parse_emergency_unpause_redeemer() {
+  // Create an emergency unpause redeemer
+  let emergency_unpause_redeemer = PoolRedeemer::EmergencyUnpause
+  
+  // Serialize it
+  let serialized = serialize_pool_redeemer(emergency_unpause_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_pool_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  when parsed_redeemer is {
+    PoolRedeemer::EmergencyUnpause -> True
+    _ -> False
+  }
+}
+
+// =============================================================================
+// SWAP REDEEMER TESTS
+// =============================================================================
+
+test test_parse_enhanced_swap_redeemer() {
+  // Create an enhanced swap redeemer
+  let swap_redeemer = SwapRedeemer {
+    swap_in_token: True,
+    amount_in: 2000000,
+    min_out: 1900000,
+    deadline_slot: 1234567890,
+    user_address: mock_address()
+  }
+  
+  // Serialize it
+  let serialized = serialize_swap_redeemer(swap_redeemer)
+  
+  // Parse it back
+  let parsed_result = parse_swap_redeemer(serialized)
+  
+  // Verify successful parsing
+  expect is_success(parsed_result)
+  let parsed_redeemer = unwrap(parsed_result)
+  
+  // Verify the parsed data matches original
+  parsed_redeemer.swap_in_token == True &&
+  parsed_redeemer.amount_in == 2000000 &&
+  parsed_redeemer.min_out == 1900000 &&
+  parsed_redeemer.deadline_slot == 1234567890 &&
+  parsed_redeemer.user_address == mock_address()
+}
+
+// =============================================================================
+// VALIDATION TESTS
+// =============================================================================
+
+test test_validate_swap_amounts() {
+  // Test valid amounts
+  let valid_result = validate_swap_amounts(1000000, 950000, 1000)
+  expect is_success(valid_result)
+  
+  // Test invalid amounts (negative input)
+  let invalid_result = validate_swap_amounts(-1000000, 950000, 1000)
+  expect !is_success(invalid_result)
+  
+  // Test invalid amounts (negative min_out)
+  let invalid_result2 = validate_swap_amounts(1000000, -950000, 1000)
+  expect !is_success(invalid_result2)
+  
+  True
+}
+
+test test_validate_liquidity_amounts() {
+  // Test valid amounts
+  let valid_result = validate_liquidity_amounts(10000000, 5000000, 7000000)
+  expect is_success(valid_result)
+  
+  // Test invalid amounts (zero ADA)
+  let invalid_result = validate_liquidity_amounts(0, 5000000, 7000000)
+  expect !is_success(invalid_result)
+  
+  // Test invalid amounts (zero token)
+  let invalid_result2 = validate_liquidity_amounts(10000000, 0, 7000000)
+  expect !is_success(invalid_result2)
+  
+  True
+}
+
+// =============================================================================
+// ERROR HANDLING TESTS
+// =============================================================================
+
+test test_error_handling() {
+  // Test parsing invalid constructor
+  let invalid_data = Constr(99, [])
+  let error_result = parse_pool_redeemer(invalid_data)
+  
+  expect !is_success(error_result)
+  
+  // Test error message generation
+  when error_result is {
+    Error(error) -> {
+      let error_msg = error_to_string(error)
+      bytearray.length(error_msg) > 0
+    }
+    _ -> False
+  }
+}
+
+test test_invalid_field_count() {
+  // Test parsing with wrong field count
+  let invalid_data = Constr(0, [1000000]) // Swap needs 4 fields, only providing 1
+  let error_result = parse_pool_redeemer(invalid_data)
+  
+  expect !is_success(error_result)
+  
+  when error_result is {
+    Error(ParseError::InvalidFieldCount { expected, found }) -> {
+      expected == 4 && found == 1
+    }
+    _ -> False
+  }
+}

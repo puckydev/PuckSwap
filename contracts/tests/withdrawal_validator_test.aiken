@@ -1,0 +1,433 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, from_asset}
+use aiken/list
+use aiken/dict
+
+// Import the withdrawal validator
+use puckswap/validators/withdrawal_validator.{PoolDatum, WithdrawalRedeemer, withdrawal_validator}
+
+// =============================================================================
+// WITHDRAWAL VALIDATOR TESTS
+// =============================================================================
+
+// Test constants
+const test_ada_reserve: Int = 1000_000_000  // 1000 ADA
+const test_token_reserve: Int = 500_000_000  // 500 tokens
+const test_fee_basis_points: Int = 30  // 0.3%
+const test_lp_supply: Int = 707_106_781  // sqrt(1000 * 500) * 1000
+
+// Mock data helpers
+fn mock_policy_id() -> PolicyId {
+  #"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+}
+
+fn mock_lp_policy_id() -> PolicyId {
+  #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba09"
+}
+
+fn mock_asset_name() -> AssetName {
+  #"50554b4b59"  // "PUKKY" in hex
+}
+
+fn mock_lp_asset_name() -> AssetName {
+  #"4c505f50554b4b59"  // "LP_PUKKY" in hex
+}
+
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"user_pkh_123456789"),
+    stake_credential: None,
+  }
+}
+
+fn create_test_pool_datum() -> PoolDatum {
+  PoolDatum {
+    ada_reserve: test_ada_reserve,
+    token_reserve: test_token_reserve,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+}
+
+fn create_test_withdrawal_redeemer(lp_to_burn: Int) -> WithdrawalRedeemer {
+  WithdrawalRedeemer {
+    lp_tokens_to_burn: lp_to_burn,
+    min_ada_out: 0,  // No slippage protection for basic test
+    min_token_out: 0,
+    user_address: mock_user_address(),
+  }
+}
+
+fn create_pool_value(ada_amount: Int, token_amount: Int, lp_amount: Int) -> Value {
+  from_lovelace(ada_amount)
+    |> value.add(mock_policy_id(), mock_asset_name(), token_amount)
+    |> value.add(mock_lp_policy_id(), mock_lp_asset_name(), lp_amount)
+}
+
+fn create_user_output_value(ada_amount: Int, token_amount: Int) -> Value {
+  from_lovelace(ada_amount)
+    |> value.add(mock_policy_id(), mock_asset_name(), token_amount)
+}
+
+fn create_mock_input(value: Value, datum: PoolDatum) -> Input {
+  Input {
+    output_reference: OutputReference {
+      transaction_id: #"tx_id_123",
+      output_index: 0,
+    },
+    output: Output {
+      address: mock_user_address(),  // Pool address would be different in practice
+      value: value,
+      datum: Some(datum),
+      reference_script: None,
+    },
+  }
+}
+
+fn create_mock_output(value: Value, datum: PoolDatum) -> Output {
+  Output {
+    address: mock_user_address(),  // Pool address would be different in practice
+    value: value,
+    datum: Some(datum),
+    reference_script: None,
+  }
+}
+
+fn create_mock_user_output(value: Value) -> Output {
+  Output {
+    address: mock_user_address(),
+    value: value,
+    datum: None,
+    reference_script: None,
+  }
+}
+
+fn create_mock_context(
+  inputs: List<Input>,
+  outputs: List<Output>,
+  mint: Value,
+  signatories: List<ByteArray>
+) -> ScriptContext {
+  ScriptContext {
+    transaction: Transaction {
+      inputs: inputs,
+      reference_inputs: [],
+      outputs: outputs,
+      fee: from_lovelace(2_000_000),  // 2 ADA fee
+      mint: mint,
+      certificates: [],
+      withdrawals: dict.new(),
+      validity_range: Interval {
+        lower_bound: IntervalBound {
+          bound_type: Finite(1000),
+          is_inclusive: True,
+        },
+        upper_bound: IntervalBound {
+          bound_type: Finite(2000),
+          is_inclusive: True,
+        },
+      },
+      extra_signatories: signatories,
+      redeemers: dict.new(),
+      datums: dict.new(),
+      id: #"tx_id_123",
+    },
+    purpose: Spend(OutputReference {
+      transaction_id: #"tx_id_123",
+      output_index: 0,
+    }),
+  }
+}
+
+// =============================================================================
+// TEST CASES
+// =============================================================================
+
+test test_successful_withdrawal() {
+  // Test successful 10% withdrawal
+  let lp_to_burn = test_lp_supply / 10  // 10% withdrawal
+  let expected_ada_out = test_ada_reserve / 10  // 100 ADA
+  let expected_token_out = test_token_reserve / 10  // 50 tokens
+  
+  let initial_datum = create_test_pool_datum()
+  let redeemer = create_test_withdrawal_redeemer(lp_to_burn)
+  
+  // Create updated datum with reduced reserves
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+  
+  // Create pool input and output
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+  
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  
+  // Create user output
+  let user_output_value = create_user_output_value(expected_ada_out, expected_token_out)
+  let user_output = create_mock_user_output(user_output_value)
+  
+  // Create mint value (negative for burning)
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+  
+  // Create context with user signature
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    mint_value,
+    [#"user_pkh_123456789"]
+  )
+  
+  // Test the validator
+  withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_with_slippage_protection() {
+  // Test withdrawal with slippage protection
+  let lp_to_burn = test_lp_supply / 20  // 5% withdrawal
+  let expected_ada_out = test_ada_reserve / 20  // 50 ADA
+  let expected_token_out = test_token_reserve / 20  // 25 tokens
+  
+  let initial_datum = create_test_pool_datum()
+  let redeemer = WithdrawalRedeemer {
+    lp_tokens_to_burn: lp_to_burn,
+    min_ada_out: expected_ada_out - 1_000_000,  // Allow 1 ADA slippage
+    min_token_out: expected_token_out - 1_000_000,  // Allow 1 token slippage
+    user_address: mock_user_address(),
+  }
+  
+  // Create updated datum
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+  
+  // Create values and context (similar to previous test)
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+  
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  let user_output = create_mock_user_output(create_user_output_value(expected_ada_out, expected_token_out))
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+  
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    mint_value,
+    [#"user_pkh_123456789"]
+  )
+  
+  // Test the validator
+  withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_fails_without_signature() {
+  // Test that withdrawal fails without user signature
+  let lp_to_burn = test_lp_supply / 10
+  let expected_ada_out = test_ada_reserve / 10
+  let expected_token_out = test_token_reserve / 10
+  
+  let initial_datum = create_test_pool_datum()
+  let redeemer = create_test_withdrawal_redeemer(lp_to_burn)
+  
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+  
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+  
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  let user_output = create_mock_user_output(create_user_output_value(expected_ada_out, expected_token_out))
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+  
+  // Create context WITHOUT user signature
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    mint_value,
+    []  // No signatories
+  )
+  
+  // Test should fail
+  !withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_fails_with_insufficient_lp_tokens() {
+  // Test that withdrawal fails when trying to burn more LP tokens than exist
+  let lp_to_burn = test_lp_supply + 1_000_000  // More than total supply
+
+  let initial_datum = create_test_pool_datum()
+  let redeemer = create_test_withdrawal_redeemer(lp_to_burn)
+
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_input_value, initial_datum)  // Dummy output
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output],
+    mint_value,
+    [#"user_pkh_123456789"]
+  )
+
+  // Test should fail
+  !withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_fails_with_pool_draining() {
+  // Test that withdrawal fails when it would drain the pool below minimum
+  let lp_to_burn = test_lp_supply * 95 / 100  // 95% withdrawal (too much)
+
+  let initial_datum = create_test_pool_datum()
+  let redeemer = create_test_withdrawal_redeemer(lp_to_burn)
+
+  let expected_ada_out = test_ada_reserve * 95 / 100
+  let expected_token_out = test_token_reserve * 95 / 100
+
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  let user_output = create_mock_user_output(create_user_output_value(expected_ada_out, expected_token_out))
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    mint_value,
+    [#"user_pkh_123456789"]
+  )
+
+  // Test should fail due to pool draining protection
+  !withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_fails_with_slippage_violation() {
+  // Test that withdrawal fails when output is below minimum (slippage protection)
+  let lp_to_burn = test_lp_supply / 10  // 10% withdrawal
+  let expected_ada_out = test_ada_reserve / 10
+  let expected_token_out = test_token_reserve / 10
+
+  let initial_datum = create_test_pool_datum()
+  let redeemer = WithdrawalRedeemer {
+    lp_tokens_to_burn: lp_to_burn,
+    min_ada_out: expected_ada_out + 10_000_000,  // Require 10 ADA more than possible
+    min_token_out: expected_token_out,
+    user_address: mock_user_address(),
+  }
+
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  let user_output = create_mock_user_output(create_user_output_value(expected_ada_out, expected_token_out))
+  let mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -lp_to_burn)
+
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    mint_value,
+    [#"user_pkh_123456789"]
+  )
+
+  // Test should fail due to slippage protection
+  !withdrawal_validator(initial_datum, redeemer, ctx)
+}
+
+test test_withdrawal_fails_with_incorrect_lp_burning() {
+  // Test that withdrawal fails when LP token burning amount is incorrect
+  let lp_to_burn = test_lp_supply / 10
+  let expected_ada_out = test_ada_reserve / 10
+  let expected_token_out = test_token_reserve / 10
+
+  let initial_datum = create_test_pool_datum()
+  let redeemer = create_test_withdrawal_redeemer(lp_to_burn)
+
+  let updated_datum = PoolDatum {
+    ada_reserve: test_ada_reserve - expected_ada_out,
+    token_reserve: test_token_reserve - expected_token_out,
+    fee_basis_points: test_fee_basis_points,
+    lp_token_policy: mock_lp_policy_id(),
+    lp_token_name: mock_lp_asset_name(),
+  }
+
+  let pool_input_value = create_pool_value(test_ada_reserve, test_token_reserve, test_lp_supply)
+  let pool_output_value = create_pool_value(
+    test_ada_reserve - expected_ada_out,
+    test_token_reserve - expected_token_out,
+    test_lp_supply - lp_to_burn
+  )
+
+  let pool_input = create_mock_input(pool_input_value, initial_datum)
+  let pool_output = create_mock_output(pool_output_value, updated_datum)
+  let user_output = create_mock_user_output(create_user_output_value(expected_ada_out, expected_token_out))
+
+  // Create incorrect mint value (burning wrong amount)
+  let incorrect_mint_value = from_asset(mock_lp_policy_id(), mock_lp_asset_name(), -(lp_to_burn + 1000))
+
+  let ctx = create_mock_context(
+    [pool_input],
+    [pool_output, user_output],
+    incorrect_mint_value,
+    [#"user_pkh_123456789"]
+  )
+
+  // Test should fail due to incorrect LP burning amount
+  !withdrawal_validator(initial_datum, redeemer, ctx)
+}

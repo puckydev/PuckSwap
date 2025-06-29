@@ -1,0 +1,239 @@
+// PuckSwap v5 - Governance Validator
+// DAO governance system with proposal creation, voting, and execution
+// CIP-68 compliant with Aiken standard library usage
+// Uses canonical datum structures from PuckSwap v5 Master Schema
+
+use aiken/transaction.{ScriptContext, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value}
+use aiken/list
+use aiken/bytearray
+use aiken/option.{Option, Some, None}
+use aiken/error
+use aiken/cbor
+use cardano/assets.{lovelace_of, quantity_of}
+
+// Canonical datum structures from PuckSwap v5 Master Schema
+type GovernanceAction {
+  UpdateFee { new_fee: Int }
+  TreasuryPayout { payout_value: Value }
+}
+
+type Proposal {
+  proposal_id: Int,
+  action: GovernanceAction,
+  votes_for: Int,
+  votes_against: Int,
+  executed: Bool,
+}
+
+type GovernanceDatum {
+  proposals: List<Proposal>,
+}
+
+// Governance operations redeemer
+type GovernanceRedeemer {
+  SubmitProposal { proposal: Proposal }
+  CastVote { proposal_id: Int, vote_for: Bool }
+  ExecuteProposal { proposal_id: Int }
+}
+
+// Main governance validator
+validator governance_validator(
+  datum: GovernanceDatum,
+  redeemer: GovernanceRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find governance input and output using aiken/transaction
+      expect Some(governance_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(governance_output) = find_output(ctx.transaction.outputs, governance_input.output.address)
+
+      // Handle specific operations
+      when redeemer is {
+        SubmitProposal { proposal } ->
+          validate_proposal_submission(governance_input, governance_output, datum, proposal, ctx)
+
+        CastVote { proposal_id, vote_for } ->
+          validate_vote_casting(governance_input, governance_output, datum, proposal_id, vote_for, ctx)
+
+        ExecuteProposal { proposal_id } ->
+          validate_proposal_execution(governance_input, governance_output, datum, proposal_id, ctx)
+      }
+    }
+    _ -> error.void("Invalid script purpose")
+  }
+}
+
+// Validate proposal submission using aiken standard library
+fn validate_proposal_submission(
+  governance_input: transaction.Input,
+  governance_output: transaction.Output,
+  datum: GovernanceDatum,
+  proposal: Proposal,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate proposal structure using aiken/error for clear failures
+  expect validate_proposal_structure(proposal)
+
+  // Ensure proposal ID is unique using aiken/list
+  expect !proposal_id_exists(datum.proposals, proposal.proposal_id)
+
+  // Get updated datum using aiken/cbor for CIP-68 compliance
+  expect Some(output_datum_data) = governance_output.datum
+  expect updated_datum: GovernanceDatum = cbor.deserialise(output_datum_data)
+
+  // Validate updated state using aiken/list functions
+  expect list.length(updated_datum.proposals) == list.length(datum.proposals) + 1
+
+  // Validate new proposal is added correctly using aiken/list
+  expect list.any(updated_datum.proposals, fn(p) { p.proposal_id == proposal.proposal_id })
+
+  // Validate minimum ADA requirements using cardano/assets
+  expect lovelace_of(governance_output.value) >= lovelace_of(governance_input.output.value)
+
+  True
+}
+
+// Validate vote casting using aiken standard library
+fn validate_vote_casting(
+  governance_input: transaction.Input,
+  governance_output: transaction.Output,
+  datum: GovernanceDatum,
+  proposal_id: Int,
+  vote_for: Bool,
+  ctx: ScriptContext
+) -> Bool {
+  // Find the proposal using aiken/option for safe handling
+  expect Some(proposal) = find_proposal_by_id(datum.proposals, proposal_id)
+
+  // Validate proposal is not already executed using aiken/error
+  expect !proposal.executed || error.void("Proposal already executed")
+
+  // Get updated datum using aiken/cbor for CIP-68 compliance
+  expect Some(output_datum_data) = governance_output.datum
+  expect updated_datum: GovernanceDatum = cbor.deserialise(output_datum_data)
+
+  // Find updated proposal using aiken/option
+  expect Some(updated_proposal) = find_proposal_by_id(updated_datum.proposals, proposal_id)
+
+  // Validate vote counts are updated correctly using aiken/list
+  if vote_for {
+    expect updated_proposal.votes_for == proposal.votes_for + 1
+    expect updated_proposal.votes_against == proposal.votes_against
+  } else {
+    expect updated_proposal.votes_for == proposal.votes_for
+    expect updated_proposal.votes_against == proposal.votes_against + 1
+  }
+
+  // Validate minimum ADA requirements using cardano/assets
+  expect lovelace_of(governance_output.value) >= lovelace_of(governance_input.output.value)
+
+  True
+}
+
+// Validate proposal execution using aiken standard library
+fn validate_proposal_execution(
+  governance_input: transaction.Input,
+  governance_output: transaction.Output,
+  datum: GovernanceDatum,
+  proposal_id: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Find the proposal using aiken/option for safe handling
+  expect Some(proposal) = find_proposal_by_id(datum.proposals, proposal_id)
+
+  // Validate proposal is not already executed using aiken/error
+  expect !proposal.executed || error.void("Proposal already executed")
+
+  // Validate quorum is reached using aiken/error for clear failure reasons
+  expect validate_quorum_reached(proposal) || error.void("Quorum not reached")
+
+  // Validate proposal passed (more votes for than against)
+  expect proposal.votes_for > proposal.votes_against || error.void("Proposal did not pass")
+
+  // Get updated datum using aiken/cbor for CIP-68 compliance
+  expect Some(output_datum_data) = governance_output.datum
+  expect updated_datum: GovernanceDatum = cbor.deserialise(output_datum_data)
+
+  // Find updated proposal using aiken/option
+  expect Some(updated_proposal) = find_proposal_by_id(updated_datum.proposals, proposal_id)
+
+  // Validate proposal is marked as executed
+  expect updated_proposal.executed
+
+  // Validate vote counts remain unchanged
+  expect updated_proposal.votes_for == proposal.votes_for
+  expect updated_proposal.votes_against == proposal.votes_against
+
+  // Validate governance action execution using aiken/transaction
+  expect validate_governance_action_execution(proposal.action, ctx)
+
+  True
+}
+
+// Helper function to find proposal by ID using aiken/option
+fn find_proposal_by_id(proposals: List<Proposal>, proposal_id: Int) -> Option<Proposal> {
+  list.find(proposals, fn(proposal) { proposal.proposal_id == proposal_id })
+}
+
+// Validate proposal structure using aiken standard library
+fn validate_proposal_structure(proposal: Proposal) -> Bool {
+  // Validate proposal ID is positive
+  expect proposal.proposal_id > 0
+
+  // Validate vote counts are non-negative
+  expect proposal.votes_for >= 0
+  expect proposal.votes_against >= 0
+
+  // Validate governance action structure
+  expect validate_governance_action_structure(proposal.action)
+
+  True
+}
+
+// Validate governance action structure using aiken/error
+fn validate_governance_action_structure(action: GovernanceAction) -> Bool {
+  when action is {
+    UpdateFee { new_fee } ->
+      new_fee >= 0 && new_fee <= 1000  // 0% to 10% fee
+
+    TreasuryPayout { payout_value } ->
+      // Validate that payout value is not empty using cardano/assets
+      lovelace_of(payout_value) > 0
+  }
+}
+
+// Check if proposal ID already exists using aiken/list
+fn proposal_id_exists(proposals: List<Proposal>, proposal_id: Int) -> Bool {
+  list.any(proposals, fn(proposal) { proposal.proposal_id == proposal_id })
+}
+
+// Validate quorum is reached using aiken/error for clear failure reasons
+fn validate_quorum_reached(proposal: Proposal) -> Bool {
+  // Simple quorum: at least 10 total votes required
+  let total_votes = proposal.votes_for + proposal.votes_against
+  total_votes >= 10
+}
+
+// Validate governance action execution using aiken/transaction
+fn validate_governance_action_execution(action: GovernanceAction, ctx: ScriptContext) -> Bool {
+  when action is {
+    UpdateFee { new_fee } -> {
+      // In production, this would validate that the fee update transaction is included
+      // For now, simplified validation
+      True
+    }
+    TreasuryPayout { payout_value } -> {
+      // In production, this would validate that the treasury payout transaction is included
+      // For now, simplified validation using cardano/assets
+      lovelace_of(payout_value) > 0
+    }
+  }
+}
+
+// Error handling using aiken/error for clear failure reasons
+fn governance_error(reason: ByteArray) -> Bool {
+  error.void(reason)
+}

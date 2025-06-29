@@ -1,0 +1,351 @@
+// PuckSwap Core LP Minting Policy - Production Ready
+// Controls LP token minting/burning during liquidity operations
+// Full CIP-68 compliance with strict validator coordination
+
+use aiken/transaction.{ScriptContext, Mint, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, from_minted_value}
+use cardano/assets
+use aiken/option.{Option, Some, None}
+use aiken/error
+use aiken/list
+use aiken/math
+use aiken/cbor
+
+// Import CIP-68 types and utilities
+use lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+
+// =============================================================================
+// CORE LP MINTING POLICY - PRODUCTION READY
+// =============================================================================
+// 
+// Features:
+// - Strict coordination with liquidity validators
+// - LP token minting during liquidity provision
+// - LP token burning during liquidity withdrawal
+// - Prevents unauthorized minting/burning
+// - CIP-68 compliant token metadata
+// =============================================================================
+
+// Core LP minting redeemer
+pub type CoreLPMintingRedeemer {
+  operation_type: LPOperationType,
+  pool_utxo_ref: OutputReference,
+  validator_hash: ByteArray,
+  user_address: Address,
+}
+
+// LP operation types
+pub type LPOperationType {
+  MintLP {
+    ada_amount: Int,
+    token_amount: Int,
+    lp_tokens_to_mint: Int,
+    is_initial_liquidity: Bool,
+  }
+  BurnLP {
+    lp_tokens_to_burn: Int,
+    ada_amount_out: Int,
+    token_amount_out: Int,
+  }
+}
+
+// Main LP minting policy
+minting_policy core_lp_minting_policy(
+  authorized_validators: List<ByteArray>,
+  ctx: ScriptContext,
+  redeemer: CoreLPMintingRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Validate validator hash is authorized
+      expect validate_authorized_validator(redeemer.validator_hash, authorized_validators)
+
+      // Find pool UTxO being spent
+      expect Some(pool_input) = find_pool_input(redeemer.pool_utxo_ref, ctx)
+      expect Some(pool_output) = find_pool_output(pool_input.output.address, ctx)
+
+      // Extract pool datum
+      expect Some(pool_datum_data) = pool_input.output.datum
+      expect pool_datum: PoolCIP68Datum = pool_datum_data
+
+      // Validate LP token policy matches this policy
+      expect pool_datum.pool_config.lp_token_policy == policy_id
+
+      // Validate validator execution
+      expect validate_validator_execution(redeemer.validator_hash, redeemer.pool_utxo_ref, ctx)
+
+      // Handle specific operation types
+      when redeemer.operation_type is {
+        MintLP { ada_amount, token_amount, lp_tokens_to_mint, is_initial_liquidity } ->
+          validate_lp_mint_operation(
+            policy_id, pool_input, pool_output, pool_datum,
+            ada_amount, token_amount, lp_tokens_to_mint, is_initial_liquidity,
+            redeemer, ctx
+          )
+
+        BurnLP { lp_tokens_to_burn, ada_amount_out, token_amount_out } ->
+          validate_lp_burn_operation(
+            policy_id, pool_input, pool_output, pool_datum,
+            lp_tokens_to_burn, ada_amount_out, token_amount_out,
+            redeemer, ctx
+          )
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate LP token minting operation
+fn validate_lp_mint_operation(
+  policy_id: PolicyId,
+  pool_input: Input,
+  pool_output: Output,
+  pool_datum: PoolCIP68Datum,
+  ada_amount: Int,
+  token_amount: Int,
+  lp_tokens_to_mint: Int,
+  is_initial_liquidity: Bool,
+  redeemer: CoreLPMintingRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate amounts are positive
+  expect ada_amount > 0
+  expect token_amount > 0
+  expect lp_tokens_to_mint > 0
+
+  // Get minted value
+  let minted_value = ctx.transaction.mint
+  let minted_lp_tokens = quantity_of(minted_value, policy_id, pool_datum.pool_config.lp_token_name)
+
+  // Validate correct amount is being minted
+  expect minted_lp_tokens == lp_tokens_to_mint
+
+  // Validate pool state changes correctly
+  expect validate_pool_state_for_minting(pool_input, pool_output, pool_datum, ada_amount, token_amount, lp_tokens_to_mint, is_initial_liquidity)
+
+  // Validate user provides correct input amounts
+  expect validate_user_provides_liquidity(redeemer.user_address, ada_amount, token_amount, pool_datum.pool_config, ctx)
+
+  True
+}
+
+// Validate LP token burning operation
+fn validate_lp_burn_operation(
+  policy_id: PolicyId,
+  pool_input: Input,
+  pool_output: Output,
+  pool_datum: PoolCIP68Datum,
+  lp_tokens_to_burn: Int,
+  ada_amount_out: Int,
+  token_amount_out: Int,
+  redeemer: CoreLPMintingRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate amounts are positive
+  expect lp_tokens_to_burn > 0
+  expect ada_amount_out > 0
+  expect token_amount_out > 0
+
+  // Get minted value (negative for burning)
+  let minted_value = ctx.transaction.mint
+  let burned_lp_tokens = quantity_of(minted_value, policy_id, pool_datum.pool_config.lp_token_name)
+
+  // Validate correct amount is being burned (negative minting)
+  expect burned_lp_tokens == -lp_tokens_to_burn
+
+  // Validate pool state changes correctly
+  expect validate_pool_state_for_burning(pool_input, pool_output, pool_datum, lp_tokens_to_burn, ada_amount_out, token_amount_out)
+
+  // Validate user provides LP tokens to burn
+  expect validate_user_provides_lp_tokens(redeemer.user_address, lp_tokens_to_burn, pool_datum.pool_config, ctx)
+
+  // Validate user receives correct output amounts
+  expect validate_user_receives_withdrawal(redeemer.user_address, ada_amount_out, token_amount_out, pool_datum.pool_config, ctx)
+
+  True
+}
+
+// Validate authorized validator
+fn validate_authorized_validator(validator_hash: ByteArray, authorized_validators: List<ByteArray>) -> Bool {
+  list.any(authorized_validators, fn(hash) { hash == validator_hash })
+}
+
+// Find pool input UTxO
+fn find_pool_input(pool_utxo_ref: OutputReference, ctx: ScriptContext) -> Option<Input> {
+  list.find(ctx.transaction.inputs, fn(input) { input.output_reference == pool_utxo_ref })
+}
+
+// Find pool output UTxO
+fn find_pool_output(pool_address: Address, ctx: ScriptContext) -> Option<Output> {
+  list.find(ctx.transaction.outputs, fn(output) { output.address == pool_address })
+}
+
+// Validate validator execution
+fn validate_validator_execution(validator_hash: ByteArray, pool_utxo_ref: OutputReference, ctx: ScriptContext) -> Bool {
+  // Check that the specified validator is actually being executed
+  list.any(
+    ctx.transaction.inputs,
+    fn(input) {
+      input.output_reference == pool_utxo_ref &&
+      when input.output.address.payment_credential is {
+        ScriptCredential(hash) -> hash == validator_hash
+        _ -> False
+      }
+    }
+  )
+}
+
+// Validate pool state changes for minting
+fn validate_pool_state_for_minting(
+  pool_input: Input,
+  pool_output: Output,
+  pool_datum: PoolCIP68Datum,
+  ada_amount: Int,
+  token_amount: Int,
+  lp_tokens_to_mint: Int,
+  is_initial_liquidity: Bool
+) -> Bool {
+  // Extract output datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect output_datum: PoolCIP68Datum = output_datum_data
+
+  let input_state = pool_datum.pool_state
+  let output_state = output_datum.pool_state
+
+  if is_initial_liquidity {
+    // Initial liquidity validation
+    expect input_state.ada_reserve == 0
+    expect input_state.token_reserve == 0
+    expect input_state.total_lp_supply == 0
+    
+    expect output_state.ada_reserve == ada_amount
+    expect output_state.token_reserve == token_amount
+    expect output_state.total_lp_supply == lp_tokens_to_mint
+  } else {
+    // Subsequent liquidity validation
+    expect output_state.ada_reserve == input_state.ada_reserve + ada_amount
+    expect output_state.token_reserve == input_state.token_reserve + token_amount
+    expect output_state.total_lp_supply == input_state.total_lp_supply + lp_tokens_to_mint
+  }
+
+  True
+}
+
+// Validate pool state changes for burning
+fn validate_pool_state_for_burning(
+  pool_input: Input,
+  pool_output: Output,
+  pool_datum: PoolCIP68Datum,
+  lp_tokens_to_burn: Int,
+  ada_amount_out: Int,
+  token_amount_out: Int
+) -> Bool {
+  // Extract output datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect output_datum: PoolCIP68Datum = output_datum_data
+
+  let input_state = pool_datum.pool_state
+  let output_state = output_datum.pool_state
+
+  // Validate pool state decreases correctly
+  expect output_state.ada_reserve == input_state.ada_reserve - ada_amount_out
+  expect output_state.token_reserve == input_state.token_reserve - token_amount_out
+  expect output_state.total_lp_supply == input_state.total_lp_supply - lp_tokens_to_burn
+
+  True
+}
+
+// Validate user provides liquidity
+fn validate_user_provides_liquidity(
+  user_address: Address,
+  ada_amount: Int,
+  token_amount: Int,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find user inputs
+  let user_inputs = list.filter(
+    ctx.transaction.inputs,
+    fn(input) { input.output.address == user_address }
+  )
+
+  // Calculate total user input amounts
+  let total_ada_input = list.foldr(
+    user_inputs,
+    0,
+    fn(input, acc) { acc + quantity_of(input.output.value, ada_policy_id(), ada_asset_name()) }
+  )
+
+  let total_token_input = list.foldr(
+    user_inputs,
+    0,
+    fn(input, acc) { acc + quantity_of(input.output.value, pool_config.token_policy, pool_config.token_name) }
+  )
+
+  // Validate user provides sufficient amounts
+  expect total_ada_input >= ada_amount
+  expect total_token_input >= token_amount
+
+  True
+}
+
+// Validate user provides LP tokens to burn
+fn validate_user_provides_lp_tokens(
+  user_address: Address,
+  lp_tokens_to_burn: Int,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find user inputs
+  let user_inputs = list.filter(
+    ctx.transaction.inputs,
+    fn(input) { input.output.address == user_address }
+  )
+
+  // Calculate total user LP token input
+  let total_lp_input = list.foldr(
+    user_inputs,
+    0,
+    fn(input, acc) { acc + quantity_of(input.output.value, pool_config.lp_token_policy, pool_config.lp_token_name) }
+  )
+
+  // Validate user provides sufficient LP tokens
+  expect total_lp_input >= lp_tokens_to_burn
+
+  True
+}
+
+// Validate user receives withdrawal
+fn validate_user_receives_withdrawal(
+  user_address: Address,
+  ada_amount_out: Int,
+  token_amount_out: Int,
+  pool_config: PoolConfig,
+  ctx: ScriptContext
+) -> Bool {
+  // Find user outputs
+  let user_outputs = list.filter(
+    ctx.transaction.outputs,
+    fn(output) { output.address == user_address }
+  )
+
+  // Calculate total user output amounts
+  let total_ada_output = list.foldr(
+    user_outputs,
+    0,
+    fn(output, acc) { acc + quantity_of(output.value, ada_policy_id(), ada_asset_name()) }
+  )
+
+  let total_token_output = list.foldr(
+    user_outputs,
+    0,
+    fn(output, acc) { acc + quantity_of(output.value, pool_config.token_policy, pool_config.token_name) }
+  )
+
+  // Validate user receives at least the expected amounts
+  expect total_ada_output >= ada_amount_out
+  expect total_token_output >= token_amount_out
+
+  True
+}

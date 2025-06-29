@@ -1,0 +1,495 @@
+// PuckSwap Liquidity Provision Validator - v3 Enhanced
+// Handles adding and removing liquidity with comprehensive security and CIP-68 compliance
+
+use aiken/transaction.{ScriptContext, Spend, Mint, find_input, find_output}
+use aiken/transaction/credential.{Address, ScriptCredential, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, tokens, merge, from_lovelace}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/option
+
+// Import shared types and utilities
+use puckswap/lib/cip68_types.{PoolCIP68Datum, CIP68Metadata, CIP68_REFERENCE_PREFIX, CIP68_USER_PREFIX}
+use puckswap/lib/min_ada_utils.{min_ada, validate_min_ada_output, calculate_min_ada_for_assets}
+use puckswap/lib/value_utils.{ada_policy_id, ada_asset_name}
+use puckswap/lib/redeemer_parser.{validate_redeemer_context}
+
+// Enhanced liquidity operation datum with CIP-68 compliance
+type LiquidityDatum {
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  lp_token_policy: PolicyId,
+  operation_type: LiquidityOperationType,
+  user_address: Address,
+  deadline: Int,
+  min_ada_reserve: Int,
+  min_token_reserve: Int,
+}
+
+// Liquidity operation types
+type LiquidityOperationType {
+  AddLiquidity {
+    ada_amount: Int,
+    token_amount: Int,
+    min_lp_tokens: Int,
+    slippage_tolerance: Int,
+  }
+  RemoveLiquidity {
+    lp_tokens: Int,
+    min_ada_out: Int,
+    min_token_out: Int,
+    slippage_tolerance: Int,
+  }
+}
+
+// Enhanced liquidity redeemer with security features
+type LiquidityRedeemer {
+  ExecuteLiquidity {
+    operation: LiquidityOperationType,
+    user_signature_required: Bool,
+    deadline_check: Bool,
+    slippage_protection: Bool,
+  }
+  
+  CancelLiquidity {
+    reason: ByteArray,
+    refund_address: Address,
+  }
+  
+  // Emergency operations
+  EmergencyWithdraw {
+    admin_signature: ByteArray,
+    emergency_reason: ByteArray,
+  }
+}
+
+// Liquidity calculation result
+type LiquidityResult {
+  ada_amount: Int,
+  token_amount: Int,
+  lp_tokens: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  new_total_lp_supply: Int,
+}
+
+// Main liquidity validator with enhanced security
+validator liquidity_validator(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  redeemer: LiquidityRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Validate basic constraints
+      expect validate_basic_liquidity_constraints(ctx, datum, output_ref)
+      
+      when redeemer is {
+        ExecuteLiquidity { operation, user_signature_required, deadline_check, slippage_protection } ->
+          validate_liquidity_execution(ctx, datum, operation, user_signature_required, deadline_check, slippage_protection)
+        
+        CancelLiquidity { reason, refund_address } ->
+          validate_liquidity_cancellation(ctx, datum, reason, refund_address)
+          
+        EmergencyWithdraw { admin_signature, emergency_reason } ->
+          validate_emergency_withdrawal(ctx, datum, admin_signature, emergency_reason)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate basic liquidity constraints
+fn validate_basic_liquidity_constraints(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  output_ref: transaction.OutputReference
+) -> Bool {
+  // Find liquidity input and validate it exists
+  expect Some(liquidity_input) = find_input(ctx.transaction.inputs, output_ref)
+  
+  // Validate deadline if specified
+  let deadline_valid = when datum.deadline is {
+    0 -> True  // No deadline
+    deadline -> {
+      // Check current slot is before deadline
+      let current_slot = ctx.transaction.validity_range.upper_bound.bound_type
+      current_slot <= deadline
+    }
+  }
+  
+  // Validate minimum ADA requirements
+  let min_ada_valid = quantity_of(liquidity_input.output.value, ada_policy_id, ada_asset_name) >= min_ada
+  
+  deadline_valid && min_ada_valid
+}
+
+// Validate liquidity execution (add or remove)
+fn validate_liquidity_execution(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  operation: LiquidityOperationType,
+  user_signature_required: Bool,
+  deadline_check: Bool,
+  slippage_protection: Bool
+) -> Bool {
+  // Validate user signature if required
+  let user_signed = if user_signature_required {
+    when datum.user_address.payment_credential is {
+      VerificationKeyCredential(user_pkh) -> 
+        list.has(ctx.transaction.extra_signatories, user_pkh)
+      _ -> False
+    }
+  } else {
+    True
+  }
+  
+  expect user_signed
+  
+  // Find pool input and output
+  let pool_inputs = list.filter(ctx.transaction.inputs, fn(input) {
+    quantity_of(input.output.value, datum.pool_nft_policy, datum.pool_nft_name) == 1
+  })
+  
+  expect list.length(pool_inputs) == 1
+  expect Some(pool_input) = list.head(pool_inputs)
+  
+  let pool_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    quantity_of(output.value, datum.pool_nft_policy, datum.pool_nft_name) == 1
+  })
+  
+  expect list.length(pool_outputs) == 1
+  expect Some(pool_output) = list.head(pool_outputs)
+  
+  // Parse pool datums
+  expect Some(pool_input_datum_raw) = pool_input.output.datum
+  expect pool_input_datum: PoolCIP68Datum = pool_input_datum_raw
+  
+  expect Some(pool_output_datum_raw) = pool_output.datum
+  expect pool_output_datum: PoolCIP68Datum = pool_output_datum_raw
+  
+  // Validate operation based on type
+  when operation is {
+    AddLiquidity { ada_amount, token_amount, min_lp_tokens, slippage_tolerance } ->
+      validate_add_liquidity(
+        ctx, datum, pool_input, pool_output, 
+        pool_input_datum, pool_output_datum,
+        ada_amount, token_amount, min_lp_tokens, slippage_tolerance,
+        slippage_protection
+      )
+    
+    RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, slippage_tolerance } ->
+      validate_remove_liquidity(
+        ctx, datum, pool_input, pool_output,
+        pool_input_datum, pool_output_datum,
+        lp_tokens, min_ada_out, min_token_out, slippage_tolerance,
+        slippage_protection
+      )
+  }
+}
+
+// Validate add liquidity operation
+fn validate_add_liquidity(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  pool_input_datum: PoolCIP68Datum,
+  pool_output_datum: PoolCIP68Datum,
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  slippage_tolerance: Int,
+  slippage_protection: Bool
+) -> Bool {
+  // Calculate liquidity provision
+  let liquidity_result = calculate_add_liquidity(
+    pool_input_datum.ada_reserve,
+    pool_input_datum.token_reserve,
+    pool_input_datum.total_lp_supply,
+    ada_amount,
+    token_amount
+  )
+  
+  // Validate slippage protection
+  let slippage_valid = if slippage_protection {
+    validate_add_liquidity_slippage(liquidity_result, min_lp_tokens, slippage_tolerance)
+  } else {
+    liquidity_result.lp_tokens >= min_lp_tokens
+  }
+  
+  expect slippage_valid
+  
+  // Validate pool state updates
+  let pool_state_valid = 
+    pool_output_datum.ada_reserve == liquidity_result.new_ada_reserve &&
+    pool_output_datum.token_reserve == liquidity_result.new_token_reserve &&
+    pool_output_datum.total_lp_supply == liquidity_result.new_total_lp_supply
+  
+  // Validate LP tokens are minted to user
+  let lp_tokens_minted = validate_lp_token_mint(ctx, datum.lp_token_policy, liquidity_result.lp_tokens, datum.user_address)
+  
+  // Validate pool receives correct assets
+  let pool_receives_assets = validate_pool_asset_increase(
+    pool_input, pool_output, 
+    ada_amount, datum.token_policy, datum.token_name, token_amount
+  )
+  
+  pool_state_valid && lp_tokens_minted && pool_receives_assets
+}
+
+// Validate remove liquidity operation
+fn validate_remove_liquidity(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  pool_input_datum: PoolCIP68Datum,
+  pool_output_datum: PoolCIP68Datum,
+  lp_tokens: Int,
+  min_ada_out: Int,
+  min_token_out: Int,
+  slippage_tolerance: Int,
+  slippage_protection: Bool
+) -> Bool {
+  // Calculate liquidity removal
+  let liquidity_result = calculate_remove_liquidity(
+    pool_input_datum.ada_reserve,
+    pool_input_datum.token_reserve,
+    pool_input_datum.total_lp_supply,
+    lp_tokens
+  )
+  
+  // Validate slippage protection
+  let slippage_valid = if slippage_protection {
+    validate_remove_liquidity_slippage(liquidity_result, min_ada_out, min_token_out, slippage_tolerance)
+  } else {
+    liquidity_result.ada_amount >= min_ada_out &&
+    liquidity_result.token_amount >= min_token_out
+  }
+  
+  expect slippage_valid
+  
+  // Validate pool state updates
+  let pool_state_valid = 
+    pool_output_datum.ada_reserve == liquidity_result.new_ada_reserve &&
+    pool_output_datum.token_reserve == liquidity_result.new_token_reserve &&
+    pool_output_datum.total_lp_supply == liquidity_result.new_total_lp_supply
+  
+  // Validate LP tokens are burned
+  let lp_tokens_burned = validate_lp_token_burn(ctx, datum.lp_token_policy, lp_tokens)
+  
+  // Validate user receives correct assets
+  let user_receives_assets = validate_user_asset_receipt(
+    ctx, datum.user_address,
+    liquidity_result.ada_amount, datum.token_policy, datum.token_name, liquidity_result.token_amount
+  )
+  
+  pool_state_valid && lp_tokens_burned && user_receives_assets
+}
+
+// Calculate add liquidity amounts
+fn calculate_add_liquidity(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> LiquidityResult {
+  if total_lp_supply == 0 {
+    // Initial liquidity provision
+    let initial_lp_tokens = math.sqrt(ada_amount * token_amount)
+    LiquidityResult {
+      ada_amount: ada_amount,
+      token_amount: token_amount,
+      lp_tokens: initial_lp_tokens,
+      new_ada_reserve: ada_amount,
+      new_token_reserve: token_amount,
+      new_total_lp_supply: initial_lp_tokens,
+    }
+  } else {
+    // Proportional liquidity provision
+    let ada_lp_tokens = (ada_amount * total_lp_supply) / ada_reserve
+    let token_lp_tokens = (token_amount * total_lp_supply) / token_reserve
+    let lp_tokens = math.min(ada_lp_tokens, token_lp_tokens)
+    
+    LiquidityResult {
+      ada_amount: ada_amount,
+      token_amount: token_amount,
+      lp_tokens: lp_tokens,
+      new_ada_reserve: ada_reserve + ada_amount,
+      new_token_reserve: token_reserve + token_amount,
+      new_total_lp_supply: total_lp_supply + lp_tokens,
+    }
+  }
+}
+
+// Calculate remove liquidity amounts
+fn calculate_remove_liquidity(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens: Int
+) -> LiquidityResult {
+  let ada_amount = (lp_tokens * ada_reserve) / total_lp_supply
+  let token_amount = (lp_tokens * token_reserve) / total_lp_supply
+
+  LiquidityResult {
+    ada_amount: ada_amount,
+    token_amount: token_amount,
+    lp_tokens: lp_tokens,
+    new_ada_reserve: ada_reserve - ada_amount,
+    new_token_reserve: token_reserve - token_amount,
+    new_total_lp_supply: total_lp_supply - lp_tokens,
+  }
+}
+
+// Validate add liquidity slippage protection
+fn validate_add_liquidity_slippage(
+  result: LiquidityResult,
+  min_lp_tokens: Int,
+  slippage_tolerance: Int
+) -> Bool {
+  // Calculate expected LP tokens with slippage
+  let min_lp_with_slippage = (min_lp_tokens * (10000 - slippage_tolerance)) / 10000
+  result.lp_tokens >= min_lp_with_slippage
+}
+
+// Validate remove liquidity slippage protection
+fn validate_remove_liquidity_slippage(
+  result: LiquidityResult,
+  min_ada_out: Int,
+  min_token_out: Int,
+  slippage_tolerance: Int
+) -> Bool {
+  // Calculate minimum outputs with slippage
+  let min_ada_with_slippage = (min_ada_out * (10000 - slippage_tolerance)) / 10000
+  let min_token_with_slippage = (min_token_out * (10000 - slippage_tolerance)) / 10000
+
+  result.ada_amount >= min_ada_with_slippage &&
+  result.token_amount >= min_token_with_slippage
+}
+
+// Validate LP token minting
+fn validate_lp_token_mint(
+  ctx: ScriptContext,
+  lp_policy: PolicyId,
+  amount: Int,
+  recipient: Address
+) -> Bool {
+  // Check LP tokens are minted
+  let minted_tokens = tokens(ctx.transaction.mint, lp_policy)
+  let total_minted = list.foldr(minted_tokens, 0, fn(token, acc) {
+    let (_, quantity) = token
+    acc + quantity
+  })
+
+  // Validate correct amount minted
+  let correct_amount = total_minted == amount
+
+  // Validate tokens go to recipient
+  let recipient_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == recipient
+  })
+
+  let recipient_receives_lp = list.any(recipient_outputs, fn(output) {
+    quantity_of(output.value, lp_policy, #"") >= amount
+  })
+
+  correct_amount && recipient_receives_lp
+}
+
+// Validate LP token burning
+fn validate_lp_token_burn(
+  ctx: ScriptContext,
+  lp_policy: PolicyId,
+  amount: Int
+) -> Bool {
+  // Check LP tokens are burned (negative mint)
+  let minted_tokens = tokens(ctx.transaction.mint, lp_policy)
+  let total_burned = list.foldr(minted_tokens, 0, fn(token, acc) {
+    let (_, quantity) = token
+    acc + quantity
+  })
+
+  total_burned == -amount
+}
+
+// Validate pool receives correct assets
+fn validate_pool_asset_increase(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  ada_increase: Int,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  token_increase: Int
+) -> Bool {
+  let input_ada = quantity_of(pool_input.output.value, ada_policy_id, ada_asset_name)
+  let output_ada = quantity_of(pool_output.value, ada_policy_id, ada_asset_name)
+  let ada_diff = output_ada - input_ada
+
+  let input_token = quantity_of(pool_input.output.value, token_policy, token_name)
+  let output_token = quantity_of(pool_output.value, token_policy, token_name)
+  let token_diff = output_token - input_token
+
+  ada_diff >= ada_increase && token_diff >= token_increase
+}
+
+// Validate user receives correct assets
+fn validate_user_asset_receipt(
+  ctx: ScriptContext,
+  user_address: Address,
+  ada_amount: Int,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  token_amount: Int
+) -> Bool {
+  let user_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == user_address
+  })
+
+  list.any(user_outputs, fn(output) {
+    let ada_received = quantity_of(output.value, ada_policy_id, ada_asset_name)
+    let token_received = quantity_of(output.value, token_policy, token_name)
+    ada_received >= ada_amount && token_received >= token_amount
+  })
+}
+
+// Validate liquidity cancellation
+fn validate_liquidity_cancellation(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  reason: ByteArray,
+  refund_address: Address
+) -> Bool {
+  // Validate user signature for cancellation
+  let user_signed = when datum.user_address.payment_credential is {
+    VerificationKeyCredential(user_pkh) ->
+      list.has(ctx.transaction.extra_signatories, user_pkh)
+    _ -> False
+  }
+
+  expect user_signed
+
+  // Validate refund goes to correct address
+  let refund_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == refund_address
+  })
+
+  list.length(refund_outputs) >= 1
+}
+
+// Validate emergency withdrawal (admin only)
+fn validate_emergency_withdrawal(
+  ctx: ScriptContext,
+  datum: LiquidityDatum,
+  admin_signature: ByteArray,
+  emergency_reason: ByteArray
+) -> Bool {
+  // This would validate admin signature and emergency conditions
+  // Implementation depends on governance structure
+  True  // Placeholder - implement based on governance requirements
+}

@@ -1,0 +1,29 @@
+{
+  "network": "preprod",
+  "endpoint": "https://api.context7.io/preprod",
+  "apiKey": "test_key",
+  "contracts": {
+    "validators": [
+      "addr_test1wq2h74nkmwd0pu5e0xytu6695p62xf8xagq6zc6rpy6ftgqy93gtr",
+      "addr_test1wquuqqd9dlsy5l6dxhq8f3urrng0pea37c9ws8fxlzvegqs8p87l4",
+      "addr_test1wz40wpmp2f6s92dpk80rmceryal2stws5em76k7fgxvm43qtdgz00",
+      "addr_test1wqqymmd8h2sshq42npx62579slyaglmrtw20mex86a559jc2xghhv",
+      "addr_test1wpjtepk6gptg6a7w8qpq89dp2rvmjjqv52ezxmnv2wr9nagan5xqk",
+      "addr_test1wqaunl2zy0luwtq0w3gvj4zw6sv86j36fnufvl09rxexasqdraqns",
+      "addr_test1wqrmczgy3s4eztn3s5k6lr7wzx6q2xrr8ufft5h594xrkesdrt4ay"
+    ],
+    "policies": [
+      "ad524e5497fdf1f924de936f9f7ec31d460c02267e8acce544a5a09e",
+      "eb031002fa1dbc400bbb5314a63741c8bf8524106fe7b50cafbcc113"
+    ]
+  },
+  "monitoring": {
+    "poolAddresses": [
+      "addr_test1wq2h74nkmwd0pu5e0xytu6695p62xf8xagq6zc6rpy6ftgqy93gtr"
+    ],
+    "governanceAddress": "addr_test1wqqymmd8h2sshq42npx62579slyaglmrtw20mex86a559jc2xghhv",
+    "stakingAddress": "addr_test1wpjtepk6gptg6a7w8qpq89dp2rvmjjqv52ezxmnv2wr9nagan5xqk",
+    "registryAddress": "addr_test1wqaunl2zy0luwtq0w3gvj4zw6sv86j36fnufvl09rxexasqdraqns",
+    "crossChainAddress": "addr_test1wqrmczgy3s4eztn3s5k6lr7wzx6q2xrr8ufft5h594xrkesdrt4ay"
+  }
+}

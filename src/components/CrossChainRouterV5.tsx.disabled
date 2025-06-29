@@ -1,0 +1,615 @@
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { PuckSwapCrossChainRouter } from '../lucid/crosschain';
+import { formatNumber, formatADA } from '../lib/format-utils';
+
+interface RouterData {
+  totalVolume: bigint;
+  lastProcessedNonce: bigint;
+  supportedChains: string[];
+  trustedBridges: TrustedBridge[];
+  bridgeFeeBps: number;
+  protocolFeeBps: number;
+  outboundMessages: OutboundMessage[];
+  inboundMessages: InboundMessage[];
+  totalOutboundMessages: bigint;
+  totalInboundMessages: bigint;
+}
+
+interface TrustedBridge {
+  id: string;
+  name: string;
+  supportedChains: string[];
+  publicKey: string;
+  active: boolean;
+}
+
+interface OutboundMessage {
+  messageId: string;
+  sourceChain: string;
+  destinationChain: string;
+  sender: string;
+  recipient: string;
+  tokenPolicy?: string;
+  tokenName?: string;
+  amount: bigint;
+  bridgeId: string;
+  createdSlot: number;
+  deadline: number;
+  status: 'Pending' | 'Completed' | 'Failed' | 'Cancelled';
+  fees: bigint;
+}
+
+interface InboundMessage {
+  messageId: string;
+  sourceChain: string;
+  destinationChain: string;
+  sender: string;
+  recipient: string;
+  tokenPolicy?: string;
+  tokenName?: string;
+  amount: bigint;
+  bridgeId: string;
+  createdSlot: number;
+  status: 'Pending' | 'Completed' | 'Failed';
+  completedSlot?: number;
+}
+
+interface TransferQuote {
+  amount: bigint;
+  bridgeFee: bigint;
+  protocolFee: bigint;
+  totalFee: bigint;
+  netAmount: bigint;
+  estimatedTime: string;
+}
+
+export default function CrossChainRouterV5() {
+  const [routerData, setRouterData] = useState<RouterData | null>(null);
+  const [selectedChain, setSelectedChain] = useState<string>('');
+  const [selectedBridge, setSelectedBridge] = useState<string>('');
+  const [recipientAddress, setRecipientAddress] = useState<string>('');
+  const [transferAmount, setTransferAmount] = useState<string>('');
+  const [selectedToken, setSelectedToken] = useState<'ADA' | 'PUCKY'>('ADA');
+  const [quote, setQuote] = useState<TransferQuote | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [walletConnected, setWalletConnected] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<string>('');
+  const [userBalances, setUserBalances] = useState<{ ada: bigint; pucky: bigint }>({ ada: 0n, pucky: 0n });
+  const [txHash, setTxHash] = useState<string>('');
+  const [error, setError] = useState<string>('');
+  const [routerBuilder, setRouterBuilder] = useState<PuckSwapCrossChainRouter | null>(null);
+  const [userTransfers, setUserTransfers] = useState<OutboundMessage[]>([]);
+  const [isDemoMode] = useState(process.env.NEXT_PUBLIC_DEMO_MODE === 'true');
+
+  // Mock router data for demo
+  const mockRouterData: RouterData = {
+    totalVolume: 25000000000000n, // 25M ADA equivalent
+    lastProcessedNonce: 12345n,
+    supportedChains: ['Ethereum', 'Binance Smart Chain', 'Polygon', 'Avalanche'],
+    trustedBridges: [
+      {
+        id: 'bridge_001',
+        name: 'Milkomeda Bridge',
+        supportedChains: ['Ethereum', 'Binance Smart Chain'],
+        publicKey: 'bridge_public_key_001',
+        active: true
+      },
+      {
+        id: 'bridge_002',
+        name: 'Wanchain Bridge',
+        supportedChains: ['Polygon', 'Avalanche'],
+        publicKey: 'bridge_public_key_002',
+        active: true
+      }
+    ],
+    bridgeFeeBps: 30, // 0.3%
+    protocolFeeBps: 10, // 0.1%
+    outboundMessages: [
+      {
+        messageId: 'msg_001',
+        sourceChain: 'Cardano',
+        destinationChain: 'Ethereum',
+        sender: 'addr_test1...demo_address',
+        recipient: '0x742d35Cc6634C0532925a3b8D',
+        amount: 1000000000n, // 1000 ADA
+        bridgeId: 'bridge_001',
+        createdSlot: Date.now() - 3600000, // 1 hour ago
+        deadline: Date.now() + 82800000, // 23 hours from now
+        status: 'Pending',
+        fees: 4000000n // 4 ADA
+      }
+    ],
+    inboundMessages: [],
+    totalOutboundMessages: 156n,
+    totalInboundMessages: 142n
+  };
+
+  useEffect(() => {
+    if (isDemoMode) {
+      setRouterData(mockRouterData);
+      setUserBalances({ ada: 50000000000n, pucky: 100000000000n }); // 50K ADA, 100K PUCKY for demo
+      setUserTransfers(mockRouterData.outboundMessages);
+    } else {
+      loadRouterData();
+    }
+  }, [isDemoMode]);
+
+  useEffect(() => {
+    if (transferAmount && selectedChain && selectedBridge && routerData) {
+      calculateQuote();
+    } else {
+      setQuote(null);
+    }
+  }, [transferAmount, selectedChain, selectedBridge, selectedToken, routerData]);
+
+  const loadRouterData = async () => {
+    try {
+      setIsLoading(true);
+      // TODO: Implement Context7 router data fetching
+      setRouterData(mockRouterData);
+      
+      if (walletConnected && routerBuilder) {
+        // Load user balances and transfers
+        setUserBalances({ ada: 50000000000n, pucky: 100000000000n });
+        setUserTransfers(mockRouterData.outboundMessages);
+      }
+    } catch (err) {
+      setError('Failed to load router data');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const calculateQuote = () => {
+    if (!routerData || !transferAmount) return;
+
+    try {
+      const amount = BigInt(Math.floor(parseFloat(transferAmount) * 1_000_000));
+      if (amount <= 0n) return;
+
+      const bridgeFee = (amount * BigInt(routerData.bridgeFeeBps)) / 10000n;
+      const protocolFee = (amount * BigInt(routerData.protocolFeeBps)) / 10000n;
+      const totalFee = bridgeFee + protocolFee;
+      const netAmount = amount - totalFee;
+
+      // Estimate transfer time based on destination chain
+      let estimatedTime = '15-30 minutes';
+      switch (selectedChain) {
+        case 'Ethereum':
+          estimatedTime = '15-30 minutes';
+          break;
+        case 'Binance Smart Chain':
+          estimatedTime = '5-15 minutes';
+          break;
+        case 'Polygon':
+          estimatedTime = '2-10 minutes';
+          break;
+        case 'Avalanche':
+          estimatedTime = '5-15 minutes';
+          break;
+      }
+
+      setQuote({
+        amount,
+        bridgeFee,
+        protocolFee,
+        totalFee,
+        netAmount,
+        estimatedTime
+      });
+    } catch (err) {
+      console.error('Quote calculation error:', err);
+      setQuote(null);
+    }
+  };
+
+  const connectWallet = async () => {
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (isDemoMode) {
+        setWalletConnected(true);
+        setWalletAddress('addr_test1...demo_address');
+        toast.success('Demo wallet connected!');
+      } else {
+        const builder = await PuckSwapCrossChainRouter.create(
+          process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY || '',
+          "Preprod",
+          {
+            routerValidator: process.env.NEXT_PUBLIC_ROUTER_VALIDATOR_CBOR || 'mock_cbor',
+            packetValidator: process.env.NEXT_PUBLIC_PACKET_VALIDATOR_CBOR || 'mock_cbor'
+          },
+          process.env.NEXT_PUBLIC_ROUTER_ADDRESS || 'addr_test1...'
+        );
+        
+        setRouterBuilder(builder);
+        setWalletConnected(true);
+        setWalletAddress('addr_test1...real_address');
+        toast.success('Wallet connected successfully!');
+      }
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to connect wallet';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const initiateTransfer = async () => {
+    if (!quote || !routerData || !walletConnected || !recipientAddress) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (isDemoMode) {
+        // Demo mode simulation
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const mockTxHash = `demo_bridge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        setTxHash(mockTxHash);
+        toast.success('Demo cross-chain transfer initiated!', { icon: '🌉' });
+      } else if (routerBuilder) {
+        const result = await routerBuilder.initiateTransfer({
+          destinationChain: selectedChain,
+          recipient: recipientAddress,
+          tokenPolicy: selectedToken === 'PUCKY' ? 'pucky_policy_id' : undefined,
+          tokenName: selectedToken === 'PUCKY' ? 'PUCKY' : undefined,
+          amount: quote.amount,
+          bridgeId: selectedBridge,
+          userAddress: walletAddress
+        });
+        
+        setTxHash(result.txHash);
+        toast.success(`Cross-chain transfer initiated! TX: ${result.txHash.slice(0, 8)}...`, { icon: '✅' });
+        
+        // Refresh router data
+        setTimeout(() => loadRouterData(), 5000);
+      }
+      
+      // Clear inputs
+      setTransferAmount('');
+      setRecipientAddress('');
+      setQuote(null);
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Transfer initiation failed';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const setMaxAmount = () => {
+    const balance = selectedToken === 'ADA' ? userBalances.ada : userBalances.pucky;
+    if (balance > 0n) {
+      setTransferAmount((Number(balance) / 1_000_000).toString());
+    }
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'Pending': return 'text-terminal-amber';
+      case 'Completed': return 'text-terminal-green';
+      case 'Failed': return 'text-terminal-red';
+      case 'Cancelled': return 'text-gray-400';
+      default: return 'text-terminal-green';
+    }
+  };
+
+  const clearTransaction = () => {
+    setTxHash('');
+    setError('');
+  };
+
+  if (!routerData) {
+    return (
+      <div className="terminal-card p-6 max-w-2xl mx-auto">
+        <div className="text-center text-terminal-green font-mono">
+          {isLoading ? 'Loading router data...' : 'Router data unavailable'}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="terminal-card p-6 max-w-2xl mx-auto">
+      {/* Header */}
+      <div className="terminal-header mb-6">
+        <h2 className="text-xl font-bold text-terminal-green font-mono">
+          &gt; PUCKSWAP_CROSSCHAIN_ROUTER_v5.0
+        </h2>
+        <div className="text-sm text-terminal-amber font-mono mt-2">
+          Total Volume: {formatADA(routerData.totalVolume)} | 
+          Nonce: {routerData.lastProcessedNonce.toString()} | 
+          Bridges: {routerData.trustedBridges.filter(b => b.active).length} Active
+        </div>
+        {isDemoMode && (
+          <div className="text-xs text-terminal-red font-mono mt-1">
+            [DEMO MODE - No real transactions]
+          </div>
+        )}
+      </div>
+
+      {/* Router Stats */}
+      <div className="grid grid-cols-3 gap-4 mb-6 text-sm font-mono">
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Outbound Messages:</div>
+          <div className="text-terminal-green">{routerData.totalOutboundMessages.toString()}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Inbound Messages:</div>
+          <div className="text-terminal-green">{routerData.totalInboundMessages.toString()}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Bridge Fee:</div>
+          <div className="text-terminal-green">{routerData.bridgeFeeBps / 100}%</div>
+        </div>
+      </div>
+
+      {/* User Balances */}
+      <div className="grid grid-cols-2 gap-4 mb-6 text-sm font-mono">
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Your ADA Balance:</div>
+          <div className="text-terminal-green">{formatADA(userBalances.ada)}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Your PUCKY Balance:</div>
+          <div className="text-terminal-green">{formatNumber(Number(userBalances.pucky) / 1_000_000, 0)} PUCKY</div>
+        </div>
+      </div>
+
+      {/* Wallet Connection */}
+      {!walletConnected ? (
+        <motion.button
+          onClick={connectWallet}
+          disabled={isLoading}
+          className="w-full terminal-button mb-6"
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >
+          {isLoading ? 'Connecting...' : 'Connect Wallet'}
+        </motion.button>
+      ) : (
+        <div className="mb-6 p-3 terminal-border">
+          <div className="text-terminal-green font-mono text-sm">
+            ✅ Wallet Connected: {walletAddress.slice(0, 12)}...{walletAddress.slice(-8)}
+          </div>
+        </div>
+      )}
+
+      {/* Transfer Interface */}
+      <div className="space-y-4">
+        {/* Token Selection */}
+        <div className="terminal-border p-4">
+          <div className="text-terminal-amber font-mono text-sm mb-2">Select Token:</div>
+          <div className="flex space-x-2">
+            <button
+              onClick={() => setSelectedToken('ADA')}
+              className={`flex-1 py-2 px-4 font-mono text-sm ${
+                selectedToken === 'ADA'
+                  ? 'bg-terminal-green text-black'
+                  : 'text-terminal-green border border-terminal-green'
+              }`}
+            >
+              ADA
+            </button>
+            <div className="flex-1 py-2 px-4 font-mono text-sm text-terminal-green/50 border border-terminal-green/30">
+              Dynamic tokens coming soon...
+            </div>
+          </div>
+        </div>
+
+        {/* Destination Chain */}
+        <div className="terminal-border p-4">
+          <label className="text-terminal-amber font-mono text-sm">Destination Chain:</label>
+          <select
+            value={selectedChain}
+            onChange={(e) => setSelectedChain(e.target.value)}
+            className="w-full mt-2 p-2 bg-black border border-terminal-green text-terminal-green font-mono"
+          >
+            <option value="">Select chain...</option>
+            {routerData.supportedChains.map((chain) => (
+              <option key={chain} value={chain}>{chain}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Bridge Selection */}
+        {selectedChain && (
+          <div className="terminal-border p-4">
+            <label className="text-terminal-amber font-mono text-sm">Select Bridge:</label>
+            <select
+              value={selectedBridge}
+              onChange={(e) => setSelectedBridge(e.target.value)}
+              className="w-full mt-2 p-2 bg-black border border-terminal-green text-terminal-green font-mono"
+            >
+              <option value="">Select bridge...</option>
+              {routerData.trustedBridges
+                .filter(bridge => bridge.active && bridge.supportedChains.includes(selectedChain))
+                .map((bridge) => (
+                  <option key={bridge.id} value={bridge.id}>{bridge.name}</option>
+                ))}
+            </select>
+          </div>
+        )}
+
+        {/* Recipient Address */}
+        <div className="terminal-border p-4">
+          <label className="text-terminal-amber font-mono text-sm">Recipient Address:</label>
+          <input
+            type="text"
+            value={recipientAddress}
+            onChange={(e) => setRecipientAddress(e.target.value)}
+            placeholder={selectedChain === 'Ethereum' ? '0x...' : 'Recipient address...'}
+            className="w-full mt-2 p-2 bg-transparent border border-terminal-green text-terminal-green font-mono"
+          />
+        </div>
+
+        {/* Transfer Amount */}
+        <div className="terminal-border p-4">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-terminal-amber font-mono text-sm">Amount to Transfer:</span>
+            <button
+              onClick={setMaxAmount}
+              className="text-terminal-green font-mono text-xs hover:text-green-400"
+            >
+              MAX
+            </button>
+          </div>
+          <input
+            type="number"
+            value={transferAmount}
+            onChange={(e) => setTransferAmount(e.target.value)}
+            placeholder="0.000000"
+            className="w-full bg-transparent text-terminal-green font-mono text-lg border-none outline-none"
+            step="0.000001"
+            min="0"
+          />
+        </div>
+
+        {/* Quote Details */}
+        {quote && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="terminal-border p-4 space-y-2 text-sm font-mono"
+          >
+            <div className="text-terminal-amber mb-2">Transfer Quote:</div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Amount:</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.amount) / 1_000_000, 6)} {selectedToken}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Bridge Fee:</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.bridgeFee) / 1_000_000, 6)} {selectedToken}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Protocol Fee:</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.protocolFee) / 1_000_000, 6)} {selectedToken}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">You Will Receive:</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.netAmount) / 1_000_000, 6)} {selectedToken}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Estimated Time:</span>
+              <span className="text-terminal-green">{quote.estimatedTime}</span>
+            </div>
+          </motion.div>
+        )}
+
+        {/* Execute Transfer Button */}
+        <motion.button
+          onClick={initiateTransfer}
+          disabled={!walletConnected || !quote || !recipientAddress || isLoading}
+          className="w-full terminal-button py-3"
+          whileHover={{ scale: walletConnected && quote && recipientAddress && !isLoading ? 1.02 : 1 }}
+          whileTap={{ scale: walletConnected && quote && recipientAddress && !isLoading ? 0.98 : 1 }}
+        >
+          {isLoading ? 'Processing...' : 
+           !walletConnected ? 'Connect Wallet' :
+           !selectedChain ? 'Select Destination Chain' :
+           !selectedBridge ? 'Select Bridge' :
+           !recipientAddress ? 'Enter Recipient Address' :
+           !quote ? 'Enter Amount' :
+           'Initiate Cross-Chain Transfer'}
+        </motion.button>
+      </div>
+
+      {/* User Transfers */}
+      {userTransfers.length > 0 && (
+        <div className="mt-6">
+          <h3 className="text-terminal-amber font-mono text-lg mb-4">Your Recent Transfers</h3>
+          <div className="space-y-3">
+            {userTransfers.map((transfer) => (
+              <div key={transfer.messageId} className="terminal-border p-4">
+                <div className="flex justify-between items-center mb-2">
+                  <div className="text-terminal-green font-mono text-sm">
+                    {formatNumber(Number(transfer.amount) / 1_000_000, 2)} {transfer.tokenName || 'ADA'} → {transfer.destinationChain}
+                  </div>
+                  <div className={`font-mono text-sm ${getStatusColor(transfer.status)}`}>
+                    {transfer.status}
+                  </div>
+                </div>
+                <div className="text-terminal-amber font-mono text-xs">
+                  To: {transfer.recipient.slice(0, 12)}...{transfer.recipient.slice(-8)}
+                </div>
+                <div className="text-terminal-amber font-mono text-xs">
+                  Bridge: {routerData.trustedBridges.find(b => b.id === transfer.bridgeId)?.name || transfer.bridgeId}
+                </div>
+                <div className="text-terminal-amber font-mono text-xs">
+                  Created: {new Date(transfer.createdSlot).toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Transaction Result */}
+      <AnimatePresence>
+        {txHash && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <div className="text-terminal-green font-mono text-sm">✅ Cross-Chain Transfer Initiated</div>
+                <div className="text-terminal-amber font-mono text-xs mt-1">
+                  TX: {txHash.slice(0, 16)}...{txHash.slice(-8)}
+                </div>
+              </div>
+              <button
+                onClick={clearTransaction}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Error Display */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border border-terminal-red p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div className="text-terminal-red font-mono text-sm">❌ {error}</div>
+              <button
+                onClick={() => setError('')}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

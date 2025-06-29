@@ -1,0 +1,46 @@
+{
+  "network": "preprod",
+  "deployedAt": "2025-06-26T13:09:00.712Z",
+  "validators": {
+    "swap": "addr_test1wq2h74nkmwd0pu5e0xytu6695p62xf8xagq6zc6rpy6ftgqy93gtr",
+    "liquidityProvision": "addr_test1wquuqqd9dlsy5l6dxhq8f3urrng0pea37c9ws8fxlzvegqs8p87l4",
+    "withdrawal": "",
+    "governance": "",
+    "staking": "",
+    "registry": "",
+    "crossChainRouter": ""
+  },
+  "policies": {
+    "lpMinting": "",
+    "pADAMinting": ""
+  },
+  "addresses": {
+    "swap_validator": "addr_test1wq2h74nkmwd0pu5e0xytu6695p62xf8xagq6zc6rpy6ftgqy93gtr",
+    "liquidity_provision_validator": "addr_test1wquuqqd9dlsy5l6dxhq8f3urrng0pea37c9ws8fxlzvegqs8p87l4",
+    "simple_validator": "addr_test1wrvlv96ezpvjpk0xzjw2wxn3jdlf9ztxj28l3a8tj07dsuq9jq7s6"
+  },
+  "policyIds": {},
+  "contracts": {
+    "swap_validator": {
+      "contractName": "swap_validator",
+      "type": "validator",
+      "scriptHash": "157f5676db9af0f2997988be6b45a074a324e6ea01a16343093495a0",
+      "address": "addr_test1wq2h74nkmwd0pu5e0xytu6695p62xf8xagq6zc6rpy6ftgqy93gtr",
+      "computedAt": "2025-06-26T13:09:00.708Z"
+    },
+    "liquidity_provision_validator": {
+      "contractName": "liquidity_provision_validator",
+      "type": "validator",
+      "scriptHash": "39c001a56fe04a7f4d35c074c7831cd0f0e7b1f60ae81d26f8999402",
+      "address": "addr_test1wquuqqd9dlsy5l6dxhq8f3urrng0pea37c9ws8fxlzvegqs8p87l4",
+      "computedAt": "2025-06-26T13:09:00.710Z"
+    },
+    "simple_validator": {
+      "contractName": "simple_validator",
+      "type": "validator",
+      "scriptHash": "d9f61759105920d9e6149ca71a71937e928966928ff8f4eb93fcd870",
+      "address": "addr_test1wrvlv96ezpvjpk0xzjw2wxn3jdlf9ztxj28l3a8tj07dsuq9jq7s6",
+      "computedAt": "2025-06-26T13:09:00.711Z"
+    }
+  }
+}

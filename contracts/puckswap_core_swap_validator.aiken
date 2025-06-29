@@ -1,0 +1,182 @@
+// PuckSwap Core Swap Validator - Production Ready
+// Implements constant product AMM formula (x * y = k) with 0.3% fee
+// Focused on ADA ↔ PUCKY swaps for Preprod testnet deployment
+
+use aiken/transaction.{ScriptContext, Spend, Input, Output, OutputReference, find_input, find_output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of}
+use aiken/list
+use aiken/math
+use aiken/option.{Option, Some, None}
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+use puckswap/lib/min_ada_utils.{validate_min_ada_output}
+
+// Minimum ADA required in UTxOs (Cardano protocol parameter)
+const min_ada: Int = 2_000_000
+
+// Use CIP-68 compliant pool datum structure from lib
+// This ensures compatibility with existing PuckSwap infrastructure
+
+// Core swap redeemer
+type SwapRedeemer {
+  amount_in: Int,
+  min_amount_out: Int,
+  swap_in_token: Bool,        // True: PUCKY -> ADA, False: ADA -> PUCKY
+  recipient: Address,
+  deadline_slot: Int,
+}
+
+// Main swap validator
+validator puckswap_core_swap(
+  ctx: ScriptContext,
+  datum: PoolCIP68Datum,
+  redeemer: SwapRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find pool input and output UTxOs
+      expect Some(pool_input) = find_pool_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_pool_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate CIP-68 structure
+      expect datum.version > 0
+
+      // Validate pool is not paused
+      expect !datum.pool_config.is_paused
+
+      // Validate redeemer parameters
+      expect redeemer.amount_in > 0
+      expect redeemer.min_amount_out >= 0
+
+      // Get current pool reserves from UTxO values
+      let current_ada_reserve = quantity_of(pool_input.output.value, ada_policy_id(), ada_asset_name())
+      let current_token_reserve = quantity_of(pool_input.output.value, datum.pool_config.token_policy, datum.pool_config.token_name)
+
+      // Verify reserves match datum
+      expect current_ada_reserve == datum.pool_state.ada_reserve
+      expect current_token_reserve == datum.pool_state.token_reserve
+
+      // Calculate swap using constant product formula
+      let (output_amount, new_ada_reserve, new_token_reserve) =
+        calculate_swap_output(
+          current_ada_reserve,
+          current_token_reserve,
+          redeemer.amount_in,
+          redeemer.swap_in_token,
+          datum.pool_config.fee_bps
+        )
+
+      // Validate minimum output requirement (slippage protection)
+      expect output_amount >= redeemer.min_amount_out
+
+      // Extract output datum
+      expect Some(output_datum_data) = pool_output.datum
+      expect output_datum: PoolCIP68Datum = output_datum_data
+
+      // Validate pool state is correctly updated
+      expect output_datum.pool_state.ada_reserve == new_ada_reserve
+      expect output_datum.pool_state.token_reserve == new_token_reserve
+
+      // Validate other fields remain unchanged
+      expect output_datum.version == datum.version
+      expect output_datum.pool_config.token_policy == datum.pool_config.token_policy
+      expect output_datum.pool_config.token_name == datum.pool_config.token_name
+      expect output_datum.pool_config.lp_token_policy == datum.pool_config.lp_token_policy
+      expect output_datum.pool_config.lp_token_name == datum.pool_config.lp_token_name
+      expect output_datum.pool_state.total_lp_supply == datum.pool_state.total_lp_supply
+      expect output_datum.pool_config.fee_bps == datum.pool_config.fee_bps
+      expect output_datum.pool_config.creator == datum.pool_config.creator
+      expect output_datum.pool_config.is_paused == datum.pool_config.is_paused
+
+      // Validate pool UTxO value matches new reserves
+      let actual_ada = quantity_of(pool_output.value, ada_policy_id(), ada_asset_name())
+      let actual_token = quantity_of(pool_output.value, datum.pool_config.token_policy, datum.pool_config.token_name)
+      expect actual_ada == new_ada_reserve
+      expect actual_token == new_token_reserve
+
+      // Validate minimum ADA requirement
+      expect actual_ada >= min_ada
+
+      // Validate recipient receives correct output
+      validate_recipient_output(redeemer.recipient, output_amount, redeemer.swap_in_token, datum, ctx)
+    }
+    _ -> False
+  }
+}
+
+// Calculate swap output using constant product formula (x * y = k)
+fn calculate_swap_output(
+  ada_reserve: Int,
+  token_reserve: Int,
+  amount_in: Int,
+  swap_in_token: Bool,
+  fee_bps: Int
+) -> (Int, Int, Int) {
+  // Validate input parameters
+  expect ada_reserve > 0
+  expect token_reserve > 0
+  expect amount_in > 0
+
+  // Calculate fee using 0.3% model (997/1000)
+  let fee_numerator = 997
+  let fee_denominator = 1000
+  let amount_in_with_fee = amount_in * fee_numerator
+
+  // Calculate output using constant product formula
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    if swap_in_token {
+      // PUCKY -> ADA swap
+      let denominator = token_reserve * fee_denominator + amount_in_with_fee
+      let output = (ada_reserve * amount_in_with_fee) / denominator
+      (output, ada_reserve - output, token_reserve + amount_in)
+    } else {
+      // ADA -> PUCKY swap  
+      let denominator = ada_reserve * fee_denominator + amount_in_with_fee
+      let output = (token_reserve * amount_in_with_fee) / denominator
+      (output, ada_reserve + amount_in, token_reserve - output)
+    }
+
+  // Validate constant product invariant (k should increase due to fees)
+  let old_k = ada_reserve * token_reserve
+  let new_k = new_ada_reserve * new_token_reserve
+  expect new_k >= old_k
+
+  (output_amount, new_ada_reserve, new_token_reserve)
+}
+
+// Find pool input UTxO
+fn find_pool_input(inputs: List<Input>, output_ref: OutputReference) -> Option<Input> {
+  list.find(inputs, fn(input) { input.output_reference == output_ref })
+}
+
+// Find pool output UTxO
+fn find_pool_output(outputs: List<Output>, address: Address) -> Option<Output> {
+  list.find(outputs, fn(output) { output.address == address })
+}
+
+// Validate recipient receives correct output
+fn validate_recipient_output(
+  recipient: Address,
+  output_amount: Int,
+  swap_in_token: Bool,
+  datum: PoolCIP68Datum,
+  ctx: ScriptContext
+) -> Bool {
+  // Find recipient output
+  expect Some(recipient_output) = list.find(
+    ctx.transaction.outputs,
+    fn(output) { output.address == recipient }
+  )
+
+  // Validate recipient receives correct amount
+  let received_amount =
+    if swap_in_token {
+      quantity_of(recipient_output.value, ada_policy_id(), ada_asset_name())  // Receiving ADA
+    } else {
+      quantity_of(recipient_output.value, datum.pool_config.token_policy, datum.pool_config.token_name)  // Receiving PUCKY
+    }
+
+  expect received_amount >= output_amount
+
+  True
+}

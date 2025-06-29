@@ -1,0 +1,614 @@
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { PuckSwapGovernanceBuilder } from '../lucid/governance';
+import { formatNumber, formatADA } from '../lib/format-utils';
+
+interface Proposal {
+  id: string;
+  title: string;
+  description: string;
+  action: {
+    type: string;
+    parameters: any;
+  };
+  proposer: string;
+  createdAt: number;
+  votingDeadline: number;
+  executionDeadline: number;
+  status: 'Active' | 'Passed' | 'Failed' | 'Executed' | 'Cancelled';
+  votesFor: bigint;
+  votesAgainst: bigint;
+  totalVotes: bigint;
+  quorumReached: boolean;
+  deposit: bigint;
+}
+
+interface GovernanceData {
+  totalProposals: number;
+  activeProposals: number;
+  proposals: Proposal[];
+  governanceTokenPolicy: string;
+  governanceTokenName: string;
+  treasuryBalance: bigint;
+  votingPeriodSlots: number;
+  quorumThresholdBps: number;
+  approvalThresholdBps: number;
+  proposalDeposit: bigint;
+  minVotingPower: bigint;
+}
+
+export default function GovernanceV5() {
+  const [governanceData, setGovernanceData] = useState<GovernanceData | null>(null);
+  const [selectedProposal, setSelectedProposal] = useState<Proposal | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [walletConnected, setWalletConnected] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<string>('');
+  const [userVotingPower, setUserVotingPower] = useState<bigint>(0n);
+  const [txHash, setTxHash] = useState<string>('');
+  const [error, setError] = useState<string>('');
+  const [governanceBuilder, setGovernanceBuilder] = useState<PuckSwapGovernanceBuilder | null>(null);
+  const [showCreateProposal, setShowCreateProposal] = useState(false);
+
+  // New proposal form state
+  const [newProposal, setNewProposal] = useState({
+    title: '',
+    description: '',
+    actionType: 'UpdateProtocolFee',
+    parameters: { newFeeBps: 25 },
+    deposit: '100'
+  });
+
+  // Mock governance data for demo
+  const mockGovernanceData: GovernanceData = {
+    totalProposals: 5,
+    activeProposals: 2,
+    proposals: [
+      {
+        id: 'prop_001',
+        title: 'Reduce Protocol Fee',
+        description: 'Proposal to reduce protocol fee from 0.3% to 0.25% to increase trading volume',
+        action: { type: 'UpdateProtocolFee', parameters: { newFeeBps: 25 } },
+        proposer: 'addr_test1...proposer1',
+        createdAt: Date.now() - 86400000, // 1 day ago
+        votingDeadline: Date.now() + 518400000, // 6 days from now
+        executionDeadline: Date.now() + 864000000, // 10 days from now
+        status: 'Active',
+        votesFor: 750000000000n, // 750K votes
+        votesAgainst: 250000000000n, // 250K votes
+        totalVotes: 1000000000000n, // 1M votes
+        quorumReached: true,
+        deposit: 100000000n // 100 ADA
+      },
+      {
+        id: 'prop_002',
+        title: 'Treasury Payout for Development',
+        description: 'Allocate 50,000 ADA from treasury for continued development and marketing',
+        action: { type: 'TreasuryPayout', parameters: { recipient: 'addr_test1...dev', amount: 50000000000n } },
+        proposer: 'addr_test1...proposer2',
+        createdAt: Date.now() - 172800000, // 2 days ago
+        votingDeadline: Date.now() + 432000000, // 5 days from now
+        executionDeadline: Date.now() + 777600000, // 9 days from now
+        status: 'Active',
+        votesFor: 600000000000n, // 600K votes
+        votesAgainst: 200000000000n, // 200K votes
+        totalVotes: 800000000000n, // 800K votes
+        quorumReached: false,
+        deposit: 100000000n // 100 ADA
+      }
+    ],
+    governanceTokenPolicy: 'gov_token_policy',
+    governanceTokenName: 'PUCKY_GOV',
+    treasuryBalance: 500000000000n, // 500K ADA
+    votingPeriodSlots: 604800, // 7 days
+    quorumThresholdBps: 1000, // 10%
+    approvalThresholdBps: 5000, // 50%
+    proposalDeposit: 100000000n, // 100 ADA
+    minVotingPower: 1000000n // 1 token minimum
+  };
+
+  useEffect(() => {
+    loadGovernanceData();
+  }, []);
+
+  const loadGovernanceData = async () => {
+    try {
+      setIsLoading(true);
+      setError('');
+
+      // Fetch real governance data from Context7 API
+      const response = await fetch('/api/context7/governance');
+      if (!response.ok) {
+        throw new Error(`Failed to fetch governance data: ${response.statusText}`);
+      }
+
+      const apiResponse = await response.json();
+
+      if (!apiResponse.success) {
+        throw new Error(apiResponse.error || 'API request failed');
+      }
+
+      const data = apiResponse.data;
+
+      // Transform API data to GovernanceData format
+      const governanceData: GovernanceData = {
+        totalProposals: data.totalProposals,
+        activeProposals: data.activeProposals,
+        proposals: data.proposals,
+        treasuryBalance: BigInt(data.proposalDeposit || 0),
+        quorumThreshold: data.quorumThresholdBps / 100,
+        votingPeriod: data.votingPeriodSlots,
+        executionDelay: data.executionDelaySlots,
+        proposalDeposit: BigInt(data.proposalDeposit || 0),
+        minVotingPower: BigInt(data.minVotingPower || 0)
+      };
+
+      setGovernanceData(governanceData);
+
+      // Load user voting power if wallet is connected
+      if (walletConnected && governanceBuilder) {
+        const votingPower = await governanceBuilder.getUserVotingPower(walletAddress, governanceData as any);
+        setUserVotingPower(votingPower);
+      }
+
+      console.log('✅ Governance data loaded successfully');
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to load governance data';
+      setError(errorMsg);
+      console.error('❌ Governance data loading error:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const connectWallet = async () => {
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      // Real wallet connection using Lucid Evolution
+      const builder = await PuckSwapGovernanceBuilder.create(
+        process.env.NEXT_PUBLIC_GOVERNANCE_VALIDATOR_CBOR || '',
+        process.env.NEXT_PUBLIC_GOVERNANCE_TOKEN_POLICY_CBOR || '',
+        process.env.NEXT_PUBLIC_GOVERNANCE_ADDRESS || '',
+        process.env.NEXT_PUBLIC_TREASURY_ADDRESS || '',
+        "Preprod",
+        "eternl"
+      );
+
+      setGovernanceBuilder(builder);
+
+      // Get actual wallet address from connected wallet
+      const walletApi = await window.cardano?.eternl?.enable();
+      if (walletApi) {
+        const addresses = await walletApi.getUsedAddresses();
+        if (addresses.length > 0) {
+          setWalletAddress(addresses[0]);
+        }
+      }
+
+      setWalletConnected(true);
+      toast.success('Wallet connected successfully!');
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to connect wallet';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const createProposal = async () => {
+    if (!walletConnected || !governanceData) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      const depositAmount = BigInt(Math.floor(parseFloat(newProposal.deposit) * 1_000_000));
+      
+      if (governanceBuilder) {
+        // Real proposal creation using Lucid Evolution
+        const result = await governanceBuilder.createProposal({
+          action: {
+            type: newProposal.actionType,
+            parameters: newProposal.parameters
+          },
+          title: newProposal.title,
+          description: newProposal.description,
+          proposalDeposit: depositAmount
+        });
+
+        setTxHash(result.txHash);
+        toast.success(`Proposal created! TX: ${result.txHash.slice(0, 8)}...`, { icon: '✅' });
+
+        // Refresh governance data after transaction confirmation
+        setTimeout(() => loadGovernanceData(), 5000);
+      } else {
+        throw new Error('Governance builder not initialized. Please connect wallet first.');
+      }
+      
+      // Reset form
+      setNewProposal({
+        title: '',
+        description: '',
+        actionType: 'UpdateProtocolFee',
+        parameters: { newFeeBps: 25 },
+        deposit: '100'
+      });
+      setShowCreateProposal(false);
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to create proposal';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const voteOnProposal = async (proposalId: string, vote: 'For' | 'Against' | 'Abstain') => {
+    if (!walletConnected || !governanceData) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (governanceBuilder) {
+        // Real voting using Lucid Evolution
+        const result = await governanceBuilder.voteOnProposal({
+          proposalId,
+          vote,
+          votingPower: userVotingPower
+        });
+
+        setTxHash(result.txHash);
+        toast.success(`Vote "${vote}" cast! TX: ${result.txHash.slice(0, 8)}...`, { icon: '✅' });
+
+        // Refresh governance data after transaction confirmation
+        setTimeout(() => loadGovernanceData(), 5000);
+      } else {
+        throw new Error('Governance builder not initialized. Please connect wallet first.');
+      }
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to cast vote';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const executeProposal = async (proposalId: string) => {
+    if (!walletConnected || !governanceData) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (governanceBuilder) {
+        // Real proposal execution using Lucid Evolution
+        const result = await governanceBuilder.executeProposal({
+          proposalId
+        });
+
+        setTxHash(result.txHash);
+        toast.success(`Proposal executed! TX: ${result.txHash.slice(0, 8)}...`, { icon: '✅' });
+
+        // Refresh governance data after transaction confirmation
+        setTimeout(() => loadGovernanceData(), 5000);
+      } else {
+        throw new Error('Governance builder not initialized. Please connect wallet first.');
+      }
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to execute proposal';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const getProposalStatusColor = (status: string) => {
+    switch (status) {
+      case 'Active': return 'text-terminal-green';
+      case 'Passed': return 'text-terminal-amber';
+      case 'Failed': return 'text-terminal-red';
+      case 'Executed': return 'text-blue-400';
+      case 'Cancelled': return 'text-gray-400';
+      default: return 'text-terminal-green';
+    }
+  };
+
+  const clearTransaction = () => {
+    setTxHash('');
+    setError('');
+  };
+
+  if (!governanceData) {
+    return (
+      <div className="terminal-card p-6 max-w-4xl mx-auto">
+        <div className="text-center text-terminal-green font-mono">
+          {isLoading ? 'Loading governance data...' : 'Governance data unavailable'}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="terminal-card p-6 max-w-4xl mx-auto">
+      {/* Header */}
+      <div className="terminal-header mb-6">
+        <h2 className="text-xl font-bold text-terminal-green font-mono">
+          &gt; PUCKSWAP_GOVERNANCE_TERMINAL_v5.0
+        </h2>
+        <div className="text-sm text-terminal-amber font-mono mt-2">
+          DAO Governance | Total Proposals: {governanceData.totalProposals} |
+          Active: {governanceData.activeProposals} |
+          Treasury: {formatADA(governanceData.treasuryBalance)}
+        </div>
+      </div>
+
+      {/* Governance Stats */}
+      <div className="grid grid-cols-4 gap-4 mb-6 text-sm font-mono">
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Quorum Threshold:</div>
+          <div className="text-terminal-green">{governanceData.quorumThresholdBps / 100}%</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Approval Threshold:</div>
+          <div className="text-terminal-green">{governanceData.approvalThresholdBps / 100}%</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Proposal Deposit:</div>
+          <div className="text-terminal-green">{formatADA(governanceData.proposalDeposit)}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Your Voting Power:</div>
+          <div className="text-terminal-green">{formatNumber(Number(userVotingPower) / 1_000_000, 0)} GOV</div>
+        </div>
+      </div>
+
+      {/* Wallet Connection */}
+      {!walletConnected ? (
+        <motion.button
+          onClick={connectWallet}
+          disabled={isLoading}
+          className="w-full terminal-button mb-6"
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >
+          {isLoading ? 'Connecting...' : 'Connect Wallet'}
+        </motion.button>
+      ) : (
+        <div className="mb-6 p-3 terminal-border">
+          <div className="flex justify-between items-center">
+            <div className="text-terminal-green font-mono text-sm">
+              ✅ Wallet Connected: {walletAddress.slice(0, 12)}...{walletAddress.slice(-8)}
+            </div>
+            <button
+              onClick={() => setShowCreateProposal(!showCreateProposal)}
+              className="terminal-button px-4 py-1 text-sm"
+            >
+              {showCreateProposal ? 'Cancel' : 'Create Proposal'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Create Proposal Form */}
+      <AnimatePresence>
+        {showCreateProposal && walletConnected && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="mb-6 terminal-border p-4"
+          >
+            <h3 className="text-terminal-amber font-mono text-lg mb-4">Create New Proposal</h3>
+            <div className="space-y-4">
+              <div>
+                <label className="text-terminal-amber font-mono text-sm">Title:</label>
+                <input
+                  type="text"
+                  value={newProposal.title}
+                  onChange={(e) => setNewProposal({...newProposal, title: e.target.value})}
+                  className="w-full mt-1 p-2 bg-transparent border border-terminal-green text-terminal-green font-mono"
+                  placeholder="Proposal title..."
+                />
+              </div>
+              <div>
+                <label className="text-terminal-amber font-mono text-sm">Description:</label>
+                <textarea
+                  value={newProposal.description}
+                  onChange={(e) => setNewProposal({...newProposal, description: e.target.value})}
+                  className="w-full mt-1 p-2 bg-transparent border border-terminal-green text-terminal-green font-mono h-20"
+                  placeholder="Detailed description..."
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-terminal-amber font-mono text-sm">Action Type:</label>
+                  <select
+                    value={newProposal.actionType}
+                    onChange={(e) => setNewProposal({...newProposal, actionType: e.target.value})}
+                    className="w-full mt-1 p-2 bg-black border border-terminal-green text-terminal-green font-mono"
+                  >
+                    <option value="UpdateProtocolFee">Update Protocol Fee</option>
+                    <option value="TreasuryPayout">Treasury Payout</option>
+                    <option value="UpdateMinLiquidity">Update Min Liquidity</option>
+                    <option value="EmergencyPause">Emergency Pause</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-terminal-amber font-mono text-sm">Deposit (ADA):</label>
+                  <input
+                    type="number"
+                    value={newProposal.deposit}
+                    onChange={(e) => setNewProposal({...newProposal, deposit: e.target.value})}
+                    className="w-full mt-1 p-2 bg-transparent border border-terminal-green text-terminal-green font-mono"
+                    min={Number(governanceData.proposalDeposit) / 1_000_000}
+                    step="1"
+                  />
+                </div>
+              </div>
+              <motion.button
+                onClick={createProposal}
+                disabled={!newProposal.title || !newProposal.description || isLoading}
+                className="w-full terminal-button py-2"
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+              >
+                {isLoading ? 'Creating...' : 'Create Proposal'}
+              </motion.button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Proposals List */}
+      <div className="space-y-4">
+        <h3 className="text-terminal-amber font-mono text-lg">Active Proposals</h3>
+        {governanceData.proposals.map((proposal) => (
+          <div key={proposal.id} className="terminal-border p-4">
+            <div className="flex justify-between items-start mb-3">
+              <div>
+                <h4 className="text-terminal-green font-mono text-lg">{proposal.title}</h4>
+                <div className="text-terminal-amber font-mono text-sm mt-1">
+                  ID: {proposal.id} | Status: <span className={getProposalStatusColor(proposal.status)}>{proposal.status}</span>
+                </div>
+              </div>
+              <div className="text-right text-sm font-mono">
+                <div className="text-terminal-amber">Voting Ends:</div>
+                <div className="text-terminal-green">
+                  {new Date(proposal.votingDeadline).toLocaleDateString()}
+                </div>
+              </div>
+            </div>
+
+            <p className="text-terminal-green font-mono text-sm mb-4">{proposal.description}</p>
+
+            {/* Voting Stats */}
+            <div className="grid grid-cols-3 gap-4 mb-4 text-sm font-mono">
+              <div className="terminal-border p-2">
+                <div className="text-terminal-amber">Votes For:</div>
+                <div className="text-green-400">{formatNumber(Number(proposal.votesFor) / 1_000_000, 0)}</div>
+              </div>
+              <div className="terminal-border p-2">
+                <div className="text-terminal-amber">Votes Against:</div>
+                <div className="text-red-400">{formatNumber(Number(proposal.votesAgainst) / 1_000_000, 0)}</div>
+              </div>
+              <div className="terminal-border p-2">
+                <div className="text-terminal-amber">Quorum:</div>
+                <div className={proposal.quorumReached ? 'text-green-400' : 'text-red-400'}>
+                  {proposal.quorumReached ? 'Reached' : 'Not Reached'}
+                </div>
+              </div>
+            </div>
+
+            {/* Voting Buttons */}
+            {walletConnected && proposal.status === 'Active' && (
+              <div className="flex space-x-2">
+                <motion.button
+                  onClick={() => voteOnProposal(proposal.id, 'For')}
+                  disabled={isLoading || userVotingPower < governanceData.minVotingPower}
+                  className="flex-1 bg-green-600 hover:bg-green-700 text-white font-mono py-2 px-4"
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  Vote For
+                </motion.button>
+                <motion.button
+                  onClick={() => voteOnProposal(proposal.id, 'Against')}
+                  disabled={isLoading || userVotingPower < governanceData.minVotingPower}
+                  className="flex-1 bg-red-600 hover:bg-red-700 text-white font-mono py-2 px-4"
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  Vote Against
+                </motion.button>
+                <motion.button
+                  onClick={() => voteOnProposal(proposal.id, 'Abstain')}
+                  disabled={isLoading || userVotingPower < governanceData.minVotingPower}
+                  className="flex-1 bg-gray-600 hover:bg-gray-700 text-white font-mono py-2 px-4"
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  Abstain
+                </motion.button>
+              </div>
+            )}
+
+            {/* Execute Button */}
+            {walletConnected && proposal.status === 'Passed' && (
+              <motion.button
+                onClick={() => executeProposal(proposal.id)}
+                disabled={isLoading}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-mono py-2 px-4 mt-2"
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+              >
+                Execute Proposal
+              </motion.button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Transaction Result */}
+      <AnimatePresence>
+        {txHash && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <div className="text-terminal-green font-mono text-sm">✅ Transaction Submitted</div>
+                <div className="text-terminal-amber font-mono text-xs mt-1">
+                  TX: {txHash.slice(0, 16)}...{txHash.slice(-8)}
+                </div>
+              </div>
+              <button
+                onClick={clearTransaction}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Error Display */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border border-terminal-red p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div className="text-terminal-red font-mono text-sm">❌ {error}</div>
+              <button
+                onClick={() => setError('')}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

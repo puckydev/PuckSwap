@@ -1,0 +1,386 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, calculate_swap_output, calculate_lp_tokens_to_mint,
+  min_ada
+}
+
+// Import enhanced validator functions
+use puckswap_pool_validator_enhanced.{
+  EnhancedPoolDatum
+}
+
+// Import min ADA utilities
+use lib/min_ada_utils.{
+  calculate_pool_min_ada, pool_min_ada, base_min_ada
+}
+
+// =============================================================================
+// EMPTY POOL AND INITIALIZATION EDGE CASES
+// =============================================================================
+
+// Mock data setup
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+fn mock_pool_nft_policy() -> PolicyId {
+  #"1111111111111111111111111111111111111111111111111111111111111111"
+}
+
+fn mock_token_policy() -> PolicyId {
+  #"2222222222222222222222222222222222222222222222222222222222222222"
+}
+
+fn mock_pool_nft_name() -> AssetName {
+  #"504f4f4c" // "POOL" in hex
+}
+
+fn mock_token_name() -> AssetName {
+  #"50554b4b59" // "PUKKY" in hex
+}
+
+fn create_empty_pool_datum() -> PoolDatum {
+  PoolDatum {
+    ada_reserve: 0,
+    token_reserve: 0,
+    fee_bps: 30,
+    pool_nft_policy: mock_pool_nft_policy(),
+    pool_nft_name: mock_pool_nft_name(),
+    token_policy: mock_token_policy(),
+    token_name: mock_token_name(),
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+fn create_minimal_pool_datum(ada_amount: Int, token_amount: Int) -> PoolDatum {
+  PoolDatum {
+    ada_reserve: ada_amount,
+    token_reserve: token_amount,
+    fee_bps: 30,
+    pool_nft_policy: mock_pool_nft_policy(),
+    pool_nft_name: mock_pool_nft_name(),
+    token_policy: mock_token_policy(),
+    token_name: mock_token_name(),
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+// =============================================================================
+// EMPTY POOL CREATION TESTS
+// =============================================================================
+
+test test_empty_pool_initialization() {
+  // Test creating a pool with zero reserves
+  let empty_datum = create_empty_pool_datum()
+  
+  // Empty pool should have zero reserves
+  expect empty_datum.ada_reserve == 0
+  expect empty_datum.token_reserve == 0
+  expect empty_datum.total_lp_tokens == 0
+  
+  True
+}
+
+test test_minimal_valid_pool_creation() {
+  // Test creating pool with minimal valid liquidity
+  let minimal_ada = pool_min_ada + 1000000  // Just above minimum ADA requirement
+  let minimal_token = 1000  // Minimal token amount
+  
+  let minimal_datum = create_minimal_pool_datum(minimal_ada, minimal_token)
+  
+  // Should be valid with minimal amounts
+  expect minimal_datum.ada_reserve > 0
+  expect minimal_datum.token_reserve > 0
+  expect minimal_datum.ada_reserve >= pool_min_ada
+  
+  True
+}
+
+test test_first_liquidity_provision() {
+  // Test the first liquidity provision to an empty pool
+  let initial_ada = 1000_000_000  // 1000 ADA
+  let initial_token = 2000_000_000  // 2000 tokens
+  let total_lp_supply = 0  // Empty pool
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(
+    0, 0, initial_ada, initial_token, total_lp_supply
+  )
+  
+  // For initial liquidity, should use geometric mean
+  // sqrt(1000 * 2000) * 1_000_000 ≈ 1414_213_562
+  let expected_lp = 1414_213_562
+  
+  // Allow for small rounding differences
+  let diff = if lp_tokens > expected_lp {
+    lp_tokens - expected_lp
+  } else {
+    expected_lp - lp_tokens
+  }
+  
+  expect diff < expected_lp / 100  // Within 1%
+  expect lp_tokens > 0
+  
+  True
+}
+
+test test_pool_creation_with_unbalanced_ratios() {
+  // Test pool creation with various token ratios
+  let ada_amount = 1000_000_000  // 1000 ADA
+  
+  // Test different token amounts (different ratios)
+  let token_amounts = [
+    100_000_000,   // 10:1 ADA:Token ratio
+    1000_000_000,  // 1:1 ratio
+    10000_000_000  // 1:10 ratio
+  ]
+  
+  list.all(token_amounts, fn(token_amount) {
+    let lp_tokens = calculate_lp_tokens_to_mint(0, 0, ada_amount, token_amount, 0)
+    lp_tokens > 0
+  })
+}
+
+// =============================================================================
+// ZERO RESERVE PROTECTION TESTS
+// =============================================================================
+
+test test_swap_with_zero_ada_reserve() {
+  // Test swap when ADA reserve is zero
+  let ada_reserve = 0
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle zero reserve gracefully
+  expect output_amount == 0  // No output possible with zero reserve
+  expect new_ada_reserve >= 0
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+test test_swap_with_zero_token_reserve() {
+  // Test swap when token reserve is zero
+  let ada_reserve = 1000_000_000
+  let token_reserve = 0
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle zero reserve gracefully
+  expect output_amount == 0  // No output possible with zero reserve
+  expect new_ada_reserve >= 0
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+test test_swap_with_both_reserves_zero() {
+  // Test swap when both reserves are zero
+  let ada_reserve = 0
+  let token_reserve = 0
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle zero reserves gracefully
+  expect output_amount == 0
+  expect new_ada_reserve >= 0
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+// =============================================================================
+// POOL DRAINAGE PROTECTION TESTS
+// =============================================================================
+
+test test_complete_pool_drainage_attempt() {
+  // Test attempting to drain pool completely
+  let ada_reserve = 100_000_000  // 100 ADA
+  let token_reserve = 200_000_000  // 200 tokens
+  let fee_bps = 30
+  
+  // Try to swap all ADA in the pool
+  let drain_attempt = ada_reserve
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, drain_attempt, fee_bps)
+  
+  // Should not be able to drain pool completely
+  expect new_token_reserve >= 0
+  expect output_amount <= token_reserve
+  
+  // New ADA reserve should be higher than original (input added)
+  expect new_ada_reserve > ada_reserve
+  
+  True
+}
+
+test test_excessive_swap_attempt() {
+  // Test swap larger than pool reserves
+  let ada_reserve = 100_000_000
+  let token_reserve = 200_000_000
+  let fee_bps = 30
+  
+  // Try to swap more than exists in pool
+  let excessive_input = ada_reserve * 2
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, excessive_input, fee_bps)
+  
+  // Should handle excessive input gracefully
+  expect output_amount <= token_reserve
+  expect new_token_reserve >= 0
+  expect new_ada_reserve > ada_reserve  // Input is added to reserve
+  
+  True
+}
+
+test test_pool_minimum_liquidity_protection() {
+  // Test that pool maintains minimum liquidity
+  let minimal_ada = pool_min_ada
+  let minimal_token = 1000
+  let fee_bps = 30
+  
+  // Try to swap that would bring pool below minimum
+  let large_input = minimal_ada / 2
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(minimal_ada, minimal_token, large_input, fee_bps)
+  
+  // Pool should maintain some minimum liquidity
+  expect new_token_reserve >= 0
+  expect output_amount <= minimal_token
+  
+  True
+}
+
+// =============================================================================
+// EDGE CASES WITH MINIMAL AMOUNTS
+// =============================================================================
+
+test test_minimal_swap_amounts() {
+  // Test swaps with very small amounts
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  
+  // Very small swap (1 lovelace)
+  let tiny_input = 1
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, tiny_input, fee_bps)
+  
+  // Should handle tiny amounts (might be zero due to fees and rounding)
+  expect output_amount >= 0
+  expect new_ada_reserve >= ada_reserve
+  expect new_token_reserve <= token_reserve
+  
+  True
+}
+
+test test_single_unit_liquidity() {
+  // Test pool with single unit of each asset
+  let ada_reserve = 1
+  let token_reserve = 1
+  let fee_bps = 30
+  let input_amount = 1
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle single unit amounts
+  expect output_amount >= 0
+  expect new_ada_reserve >= 1
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+test test_asymmetric_minimal_pool() {
+  // Test pool with very unbalanced minimal amounts
+  let ada_reserve = pool_min_ada  // Minimum ADA
+  let token_reserve = 1  // Single token unit
+  let fee_bps = 30
+  let input_amount = 1000000  // 1 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle asymmetric pools
+  expect output_amount >= 0
+  expect new_ada_reserve > ada_reserve
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+// =============================================================================
+// INITIALIZATION SEQUENCE TESTS
+// =============================================================================
+
+test test_pool_initialization_sequence() {
+  // Test the complete pool initialization sequence
+  
+  // Step 1: Empty pool
+  let empty_datum = create_empty_pool_datum()
+  expect empty_datum.ada_reserve == 0
+  expect empty_datum.token_reserve == 0
+  
+  // Step 2: First liquidity addition
+  let initial_ada = 1000_000_000
+  let initial_token = 2000_000_000
+  let lp_tokens = calculate_lp_tokens_to_mint(0, 0, initial_ada, initial_token, 0)
+  
+  expect lp_tokens > 0
+  
+  // Step 3: Pool after initialization
+  let initialized_datum = create_minimal_pool_datum(initial_ada, initial_token)
+  expect initialized_datum.ada_reserve == initial_ada
+  expect initialized_datum.token_reserve == initial_token
+  
+  True
+}
+
+test test_multiple_initialization_attempts() {
+  // Test that pool can only be initialized once
+  let initial_ada = 1000_000_000
+  let initial_token = 2000_000_000
+  
+  // First initialization
+  let first_lp = calculate_lp_tokens_to_mint(0, 0, initial_ada, initial_token, 0)
+  expect first_lp > 0
+  
+  // Second "initialization" (should be treated as normal liquidity addition)
+  let second_ada = 500_000_000
+  let second_token = 1000_000_000
+  let second_lp = calculate_lp_tokens_to_mint(
+    initial_ada, initial_token, second_ada, second_token, first_lp
+  )
+  
+  // Should get proportional LP tokens, not initialization amount
+  expect second_lp > 0
+  expect second_lp != first_lp  // Should be different from initialization
+  
+  True
+}

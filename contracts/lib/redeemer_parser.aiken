@@ -1,0 +1,1007 @@
+use aiken/transaction.{ScriptContext, OutputReference}
+use aiken/transaction/credential.{Address, Credential, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{PolicyId, AssetName}
+use aiken/list
+use aiken/option
+use aiken/bytearray
+use aiken/cbor
+use aiken/dict.{Dict}
+use aiken/string
+
+// Import CIP-68 types for enhanced parsing
+use puckswap/lib/cip68_types.{
+  CIP68Metadata, LPTokenMetadata, CIP68Datum
+}
+
+// =============================================================================
+// REDEEMER TYPE DEFINITIONS
+// =============================================================================
+
+// Pool validator redeemer types
+pub type PoolRedeemer {
+  // Swap tokens with slippage protection
+  Swap {
+    input_amount: Int,
+    min_output: Int,
+    deadline: Int,           // Slot deadline for MEV protection
+    recipient: Address,      // Where to send output tokens
+  }
+
+  // Add liquidity with balanced deposits
+  AddLiquidity {
+    ada_amount: Int,
+    token_amount: Int,
+    min_lp_tokens: Int,      // Minimum LP tokens to receive
+    deadline: Int,
+  }
+
+  // Remove liquidity with minimum output guarantees
+  RemoveLiquidity {
+    lp_tokens: Int,
+    min_ada_out: Int,        // Minimum ADA to receive
+    min_token_out: Int,      // Minimum tokens to receive
+    deadline: Int,
+  }
+
+  // Pool creation (one-time operation)
+  CreatePool {
+    initial_ada: Int,
+    initial_token: Int,
+    fee_bps: Int,
+  }
+
+  // Emergency operations (governance only)
+  EmergencyPause
+  EmergencyUnpause
+}
+
+// Enhanced swap redeemer with CIP-68 support
+pub type SwapRedeemer {
+  swap_in_token: Bool,      // true if swapping token -> ADA, false for ADA -> token
+  amount_in: Int,
+  min_out: Int,
+  deadline_slot: Int,       // Added deadline validation
+  user_address: Address,    // For validation
+}
+
+// LP token policy redeemer
+pub type LPRedeemer {
+  // Mint LP tokens during liquidity addition
+  MintLP {
+    amount: Int,
+    pool_utxo_ref: OutputReference,
+    recipient: Address,
+    metadata: LPTokenMetadata,
+  }
+
+  // Burn LP tokens during liquidity removal
+  BurnLP {
+    amount: Int,
+    pool_utxo_ref: OutputReference,
+    owner: Address,
+  }
+
+  // Update metadata (for pool state changes)
+  UpdateMetadata {
+    token_name: AssetName,
+    new_metadata: LPTokenMetadata,
+    pool_utxo_ref: OutputReference,
+  }
+}
+
+// Factory validator redeemer
+pub type FactoryRedeemer {
+  CreatePool {
+    token_policy: PolicyId,
+    token_name: AssetName,
+    initial_ada: Int,
+    initial_token: Int,
+    fee_bps: Int,
+  }
+  UpdateConfig {
+    new_admin: Option<Address>,
+    new_creation_fee: Option<Int>,
+    new_protocol_fee: Option<Int>,
+  }
+  PauseFactory
+  UnpauseFactory
+}
+
+// =============================================================================
+// PARSING RESULT TYPES
+// =============================================================================
+
+// Result type for parsing operations
+pub type ParseResult<a> {
+  Success(a)
+  Error(ParseError)
+}
+
+// Detailed error information for debugging
+pub type ParseError {
+  InvalidConstructor { expected: Int, found: Int }
+  InvalidFieldCount { expected: Int, found: Int }
+  InvalidFieldType { field_index: Int, expected_type: ByteArray }
+  MissingRequiredField { field_name: ByteArray }
+  InvalidAddress { raw_data: ByteArray }
+  InvalidAmount { value: Int, constraint: ByteArray }
+  InvalidDeadline { deadline: Int, current_slot: Int }
+  InvalidPolicyId { raw_data: ByteArray }
+  InvalidAssetName { raw_data: ByteArray }
+  CBORDecodingError { error_msg: ByteArray }
+}
+
+// =============================================================================
+// CORE PARSING FUNCTIONS
+// =============================================================================
+
+// Parse PoolRedeemer from CBOR data
+pub fn parse_pool_redeemer(cbor_data: Data) -> ParseResult<PoolRedeemer> {
+  when cbor_data is {
+    // Constructor 0: Swap
+    Constr(0, fields) -> {
+      if list.length(fields) != 4 {
+        Error(InvalidFieldCount { expected: 4, found: list.length(fields) })
+      } else {
+        expect Some(input_amount) = list.at(fields, 0)
+        expect Some(min_output) = list.at(fields, 1)
+        expect Some(deadline) = list.at(fields, 2)
+        expect Some(recipient_data) = list.at(fields, 3)
+        
+        when parse_int(input_amount) is {
+          Success(amount) -> when parse_int(min_output) is {
+            Success(min_out) -> when parse_int(deadline) is {
+              Success(deadline_val) -> when parse_address(recipient_data) is {
+                Success(recipient) -> {
+                  if amount > 0 && min_out >= 0 {
+                    Success(Swap { 
+                      input_amount: amount, 
+                      min_output: min_out, 
+                      deadline: deadline_val, 
+                      recipient: recipient 
+                    })
+                  } else {
+                    Error(InvalidAmount { value: amount, constraint: "positive_amount" })
+                  }
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+    
+    // Constructor 1: AddLiquidity
+    Constr(1, fields) -> {
+      if list.length(fields) != 4 {
+        Error(InvalidFieldCount { expected: 4, found: list.length(fields) })
+      } else {
+        expect Some(ada_amount_data) = list.at(fields, 0)
+        expect Some(token_amount_data) = list.at(fields, 1)
+        expect Some(min_lp_tokens_data) = list.at(fields, 2)
+        expect Some(deadline_data) = list.at(fields, 3)
+        
+        when parse_int(ada_amount_data) is {
+          Success(ada_amount) -> when parse_int(token_amount_data) is {
+            Success(token_amount) -> when parse_int(min_lp_tokens_data) is {
+              Success(min_lp_tokens) -> when parse_int(deadline_data) is {
+                Success(deadline) -> {
+                  if ada_amount > 0 && token_amount > 0 && min_lp_tokens >= 0 {
+                    Success(AddLiquidity { 
+                      ada_amount: ada_amount, 
+                      token_amount: token_amount, 
+                      min_lp_tokens: min_lp_tokens, 
+                      deadline: deadline 
+                    })
+                  } else {
+                    Error(InvalidAmount { value: ada_amount, constraint: "positive_amounts" })
+                  }
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+    
+    // Constructor 2: RemoveLiquidity
+    Constr(2, fields) -> {
+      if list.length(fields) != 4 {
+        Error(InvalidFieldCount { expected: 4, found: list.length(fields) })
+      } else {
+        expect Some(lp_tokens_data) = list.at(fields, 0)
+        expect Some(min_ada_out_data) = list.at(fields, 1)
+        expect Some(min_token_out_data) = list.at(fields, 2)
+        expect Some(deadline_data) = list.at(fields, 3)
+        
+        when parse_int(lp_tokens_data) is {
+          Success(lp_tokens) -> when parse_int(min_ada_out_data) is {
+            Success(min_ada_out) -> when parse_int(min_token_out_data) is {
+              Success(min_token_out) -> when parse_int(deadline_data) is {
+                Success(deadline) -> {
+                  if lp_tokens > 0 && min_ada_out >= 0 && min_token_out >= 0 {
+                    Success(RemoveLiquidity { 
+                      lp_tokens: lp_tokens, 
+                      min_ada_out: min_ada_out, 
+                      min_token_out: min_token_out, 
+                      deadline: deadline 
+                    })
+                  } else {
+                    Error(InvalidAmount { value: lp_tokens, constraint: "positive_lp_tokens" })
+                  }
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+    
+    // Constructor 3: CreatePool
+    Constr(3, fields) -> {
+      if list.length(fields) != 3 {
+        Error(InvalidFieldCount { expected: 3, found: list.length(fields) })
+      } else {
+        expect Some(initial_ada_data) = list.at(fields, 0)
+        expect Some(initial_token_data) = list.at(fields, 1)
+        expect Some(fee_bps_data) = list.at(fields, 2)
+        
+        when parse_int(initial_ada_data) is {
+          Success(initial_ada) -> when parse_int(initial_token_data) is {
+            Success(initial_token) -> when parse_int(fee_bps_data) is {
+              Success(fee_bps) -> {
+                if initial_ada > 0 && initial_token > 0 && fee_bps >= 0 && fee_bps <= 10000 {
+                  Success(CreatePool { 
+                    initial_ada: initial_ada, 
+                    initial_token: initial_token, 
+                    fee_bps: fee_bps 
+                  })
+                } else {
+                  Error(InvalidAmount { value: fee_bps, constraint: "valid_fee_bps" })
+                }
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+    
+    // Constructor 4: EmergencyPause
+    Constr(4, fields) -> {
+      if list.length(fields) == 0 {
+        Success(EmergencyPause)
+      } else {
+        Error(InvalidFieldCount { expected: 0, found: list.length(fields) })
+      }
+    }
+    
+    // Constructor 5: EmergencyUnpause
+    Constr(5, fields) -> {
+      if list.length(fields) == 0 {
+        Success(EmergencyUnpause)
+      } else {
+        Error(InvalidFieldCount { expected: 0, found: list.length(fields) })
+      }
+    }
+    
+    // Invalid constructor
+    Constr(alt, _) -> Error(InvalidConstructor { expected: 0, found: alt })
+    _ -> Error(CBORDecodingError { error_msg: "invalid_cbor_structure" })
+  }
+}
+
+// Parse SwapRedeemer from CBOR data
+pub fn parse_swap_redeemer(cbor_data: Data) -> ParseResult<SwapRedeemer> {
+  when cbor_data is {
+    Constr(0, fields) -> {
+      if list.length(fields) != 5 {
+        Error(InvalidFieldCount { expected: 5, found: list.length(fields) })
+      } else {
+        expect Some(swap_in_token_data) = list.at(fields, 0)
+        expect Some(amount_in_data) = list.at(fields, 1)
+        expect Some(min_out_data) = list.at(fields, 2)
+        expect Some(deadline_slot_data) = list.at(fields, 3)
+        expect Some(user_address_data) = list.at(fields, 4)
+
+        when parse_bool(swap_in_token_data) is {
+          Success(swap_in_token) -> when parse_int(amount_in_data) is {
+            Success(amount_in) -> when parse_int(min_out_data) is {
+              Success(min_out) -> when parse_int(deadline_slot_data) is {
+                Success(deadline_slot) -> when parse_address(user_address_data) is {
+                  Success(user_address) -> {
+                    if amount_in > 0 && min_out >= 0 {
+                      Success(SwapRedeemer {
+                        swap_in_token: swap_in_token,
+                        amount_in: amount_in,
+                        min_out: min_out,
+                        deadline_slot: deadline_slot,
+                        user_address: user_address
+                      })
+                    } else {
+                      Error(InvalidAmount { value: amount_in, constraint: "positive_amount_in" })
+                    }
+                  }
+                  Error(err) -> Error(err)
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+    Constr(alt, _) -> Error(InvalidConstructor { expected: 0, found: alt })
+    _ -> Error(CBORDecodingError { error_msg: "invalid_swap_redeemer_structure" })
+  }
+}
+
+// Parse LPRedeemer from CBOR data
+pub fn parse_lp_redeemer(cbor_data: Data) -> ParseResult<LPRedeemer> {
+  when cbor_data is {
+    // Constructor 0: MintLP
+    Constr(0, fields) -> {
+      if list.length(fields) != 4 {
+        Error(InvalidFieldCount { expected: 4, found: list.length(fields) })
+      } else {
+        expect Some(amount_data) = list.at(fields, 0)
+        expect Some(pool_utxo_ref_data) = list.at(fields, 1)
+        expect Some(recipient_data) = list.at(fields, 2)
+        expect Some(metadata_data) = list.at(fields, 3)
+
+        when parse_int(amount_data) is {
+          Success(amount) -> when parse_output_reference(pool_utxo_ref_data) is {
+            Success(pool_utxo_ref) -> when parse_address(recipient_data) is {
+              Success(recipient) -> when parse_lp_token_metadata(metadata_data) is {
+                Success(metadata) -> {
+                  if amount > 0 {
+                    Success(MintLP {
+                      amount: amount,
+                      pool_utxo_ref: pool_utxo_ref,
+                      recipient: recipient,
+                      metadata: metadata
+                    })
+                  } else {
+                    Error(InvalidAmount { value: amount, constraint: "positive_mint_amount" })
+                  }
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+
+    // Constructor 1: BurnLP
+    Constr(1, fields) -> {
+      if list.length(fields) != 3 {
+        Error(InvalidFieldCount { expected: 3, found: list.length(fields) })
+      } else {
+        expect Some(amount_data) = list.at(fields, 0)
+        expect Some(pool_utxo_ref_data) = list.at(fields, 1)
+        expect Some(owner_data) = list.at(fields, 2)
+
+        when parse_int(amount_data) is {
+          Success(amount) -> when parse_output_reference(pool_utxo_ref_data) is {
+            Success(pool_utxo_ref) -> when parse_address(owner_data) is {
+              Success(owner) -> {
+                if amount > 0 {
+                  Success(BurnLP {
+                    amount: amount,
+                    pool_utxo_ref: pool_utxo_ref,
+                    owner: owner
+                  })
+                } else {
+                  Error(InvalidAmount { value: amount, constraint: "positive_burn_amount" })
+                }
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+
+    // Constructor 2: UpdateMetadata
+    Constr(2, fields) -> {
+      if list.length(fields) != 3 {
+        Error(InvalidFieldCount { expected: 3, found: list.length(fields) })
+      } else {
+        expect Some(token_name_data) = list.at(fields, 0)
+        expect Some(new_metadata_data) = list.at(fields, 1)
+        expect Some(pool_utxo_ref_data) = list.at(fields, 2)
+
+        when parse_asset_name(token_name_data) is {
+          Success(token_name) -> when parse_lp_token_metadata(new_metadata_data) is {
+            Success(new_metadata) -> when parse_output_reference(pool_utxo_ref_data) is {
+              Success(pool_utxo_ref) -> {
+                Success(UpdateMetadata {
+                  token_name: token_name,
+                  new_metadata: new_metadata,
+                  pool_utxo_ref: pool_utxo_ref
+                })
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+
+    Constr(alt, _) -> Error(InvalidConstructor { expected: 0, found: alt })
+    _ -> Error(CBORDecodingError { error_msg: "invalid_lp_redeemer_structure" })
+  }
+}
+
+// Parse FactoryRedeemer from CBOR data
+pub fn parse_factory_redeemer(cbor_data: Data) -> ParseResult<FactoryRedeemer> {
+  when cbor_data is {
+    // Constructor 0: CreatePool
+    Constr(0, fields) -> {
+      if list.length(fields) != 5 {
+        Error(InvalidFieldCount { expected: 5, found: list.length(fields) })
+      } else {
+        expect Some(token_policy_data) = list.at(fields, 0)
+        expect Some(token_name_data) = list.at(fields, 1)
+        expect Some(initial_ada_data) = list.at(fields, 2)
+        expect Some(initial_token_data) = list.at(fields, 3)
+        expect Some(fee_bps_data) = list.at(fields, 4)
+
+        when parse_policy_id(token_policy_data) is {
+          Success(token_policy) -> when parse_asset_name(token_name_data) is {
+            Success(token_name) -> when parse_int(initial_ada_data) is {
+              Success(initial_ada) -> when parse_int(initial_token_data) is {
+                Success(initial_token) -> when parse_int(fee_bps_data) is {
+                  Success(fee_bps) -> {
+                    if initial_ada > 0 && initial_token > 0 && fee_bps >= 0 && fee_bps <= 10000 {
+                      Success(CreatePool {
+                        token_policy: token_policy,
+                        token_name: token_name,
+                        initial_ada: initial_ada,
+                        initial_token: initial_token,
+                        fee_bps: fee_bps
+                      })
+                    } else {
+                      Error(InvalidAmount { value: fee_bps, constraint: "valid_factory_fee_bps" })
+                    }
+                  }
+                  Error(err) -> Error(err)
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+
+    // Constructor 1: UpdateConfig
+    Constr(1, fields) -> {
+      if list.length(fields) != 3 {
+        Error(InvalidFieldCount { expected: 3, found: list.length(fields) })
+      } else {
+        expect Some(new_admin_data) = list.at(fields, 0)
+        expect Some(new_creation_fee_data) = list.at(fields, 1)
+        expect Some(new_protocol_fee_data) = list.at(fields, 2)
+
+        when parse_optional_address(new_admin_data) is {
+          Success(new_admin) -> when parse_optional_int(new_creation_fee_data) is {
+            Success(new_creation_fee) -> when parse_optional_int(new_protocol_fee_data) is {
+              Success(new_protocol_fee) -> {
+                Success(UpdateConfig {
+                  new_admin: new_admin,
+                  new_creation_fee: new_creation_fee,
+                  new_protocol_fee: new_protocol_fee
+                })
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      }
+    }
+
+    // Constructor 2: PauseFactory
+    Constr(2, fields) -> {
+      if list.length(fields) == 0 {
+        Success(PauseFactory)
+      } else {
+        Error(InvalidFieldCount { expected: 0, found: list.length(fields) })
+      }
+    }
+
+    // Constructor 3: UnpauseFactory
+    Constr(3, fields) -> {
+      if list.length(fields) == 0 {
+        Success(UnpauseFactory)
+      } else {
+        Error(InvalidFieldCount { expected: 0, found: list.length(fields) })
+      }
+    }
+
+    Constr(alt, _) -> Error(InvalidConstructor { expected: 0, found: alt })
+    _ -> Error(CBORDecodingError { error_msg: "invalid_factory_redeemer_structure" })
+  }
+}
+
+// =============================================================================
+// UTILITY PARSING FUNCTIONS
+// =============================================================================
+
+// Parse integer from Data
+pub fn parse_int(data: Data) -> ParseResult<Int> {
+  when data is {
+    data if data is Int -> Success(data)
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "integer" })
+  }
+}
+
+// Parse boolean from Data
+pub fn parse_bool(data: Data) -> ParseResult<Bool> {
+  when data is {
+    Constr(0, []) -> Success(False)
+    Constr(1, []) -> Success(True)
+    data if data is Int -> {
+      if data == 0 {
+        Success(False)
+      } else if data == 1 {
+        Success(True)
+      } else {
+        Error(InvalidFieldType { field_index: 0, expected_type: "boolean" })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "boolean" })
+  }
+}
+
+// Parse ByteArray from Data
+pub fn parse_bytearray(data: Data) -> ParseResult<ByteArray> {
+  when data is {
+    data if data is ByteArray -> Success(data)
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "bytearray" })
+  }
+}
+
+// Parse Address from Data
+pub fn parse_address(data: Data) -> ParseResult<Address> {
+  when data is {
+    Constr(0, fields) -> {
+      if list.length(fields) == 2 {
+        expect Some(payment_cred_data) = list.at(fields, 0)
+        expect Some(staking_cred_data) = list.at(fields, 1)
+
+        when parse_credential(payment_cred_data) is {
+          Success(payment_credential) -> when parse_optional_credential(staking_cred_data) is {
+            Success(staking_credential) -> {
+              Success(Address {
+                payment_credential: payment_credential,
+                staking_credential: staking_credential
+              })
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 2, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidAddress { raw_data: cbor.serialise(data) })
+  }
+}
+
+// Parse Credential from Data
+pub fn parse_credential(data: Data) -> ParseResult<Credential> {
+  when data is {
+    // VerificationKeyCredential
+    Constr(0, fields) -> {
+      if list.length(fields) == 1 {
+        expect Some(pkh_data) = list.at(fields, 0)
+        when parse_bytearray(pkh_data) is {
+          Success(pkh) -> Success(VerificationKeyCredential(pkh))
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 1, found: list.length(fields) })
+      }
+    }
+    // ScriptCredential
+    Constr(1, fields) -> {
+      if list.length(fields) == 1 {
+        expect Some(script_hash_data) = list.at(fields, 0)
+        when parse_bytearray(script_hash_data) is {
+          Success(script_hash) -> Success(ScriptCredential(script_hash))
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 1, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "credential" })
+  }
+}
+
+// Parse optional Credential from Data
+pub fn parse_optional_credential(data: Data) -> ParseResult<Option<Credential>> {
+  when data is {
+    Constr(0, []) -> Success(None)
+    Constr(1, fields) -> {
+      if list.length(fields) == 1 {
+        expect Some(cred_data) = list.at(fields, 0)
+        when parse_credential(cred_data) is {
+          Success(credential) -> Success(Some(credential))
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 1, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "optional_credential" })
+  }
+}
+
+// Parse PolicyId from Data
+pub fn parse_policy_id(data: Data) -> ParseResult<PolicyId> {
+  when parse_bytearray(data) is {
+    Success(bytes) -> {
+      if bytearray.length(bytes) == 28 {
+        Success(bytes)
+      } else {
+        Error(InvalidPolicyId { raw_data: bytes })
+      }
+    }
+    Error(err) -> Error(err)
+  }
+}
+
+// Parse AssetName from Data
+pub fn parse_asset_name(data: Data) -> ParseResult<AssetName> {
+  when parse_bytearray(data) is {
+    Success(bytes) -> {
+      if bytearray.length(bytes) <= 32 {
+        Success(bytes)
+      } else {
+        Error(InvalidAssetName { raw_data: bytes })
+      }
+    }
+    Error(err) -> Error(err)
+  }
+}
+
+// Parse OutputReference from Data
+pub fn parse_output_reference(data: Data) -> ParseResult<OutputReference> {
+  when data is {
+    Constr(0, fields) -> {
+      if list.length(fields) == 2 {
+        expect Some(tx_id_data) = list.at(fields, 0)
+        expect Some(output_index_data) = list.at(fields, 1)
+
+        when parse_bytearray(tx_id_data) is {
+          Success(transaction_id) -> when parse_int(output_index_data) is {
+            Success(output_index) -> {
+              if bytearray.length(transaction_id) == 32 && output_index >= 0 {
+                Success(OutputReference {
+                  transaction_id: transaction_id,
+                  output_index: output_index
+                })
+              } else {
+                Error(InvalidFieldType { field_index: 0, expected_type: "valid_output_reference" })
+              }
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 2, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "output_reference" })
+  }
+}
+
+// Parse optional Address from Data
+pub fn parse_optional_address(data: Data) -> ParseResult<Option<Address>> {
+  when data is {
+    Constr(0, []) -> Success(None)
+    Constr(1, fields) -> {
+      if list.length(fields) == 1 {
+        expect Some(addr_data) = list.at(fields, 0)
+        when parse_address(addr_data) is {
+          Success(address) -> Success(Some(address))
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 1, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "optional_address" })
+  }
+}
+
+// Parse optional Int from Data
+pub fn parse_optional_int(data: Data) -> ParseResult<Option<Int>> {
+  when data is {
+    Constr(0, []) -> Success(None)
+    Constr(1, fields) -> {
+      if list.length(fields) == 1 {
+        expect Some(int_data) = list.at(fields, 0)
+        when parse_int(int_data) is {
+          Success(value) -> Success(Some(value))
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 1, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "optional_int" })
+  }
+}
+
+// Parse LPTokenMetadata from Data
+pub fn parse_lp_token_metadata(data: Data) -> ParseResult<LPTokenMetadata> {
+  when data is {
+    Constr(0, fields) -> {
+      if list.length(fields) >= 6 {
+        expect Some(name_data) = list.at(fields, 0)
+        expect Some(description_data) = list.at(fields, 1)
+        expect Some(image_data) = list.at(fields, 2)
+        expect Some(pool_ada_reserve_data) = list.at(fields, 3)
+        expect Some(pool_token_reserve_data) = list.at(fields, 4)
+        expect Some(created_at_data) = list.at(fields, 5)
+
+        when parse_bytearray(name_data) is {
+          Success(name) -> when parse_bytearray(description_data) is {
+            Success(description) -> when parse_bytearray(image_data) is {
+              Success(image) -> when parse_int(pool_ada_reserve_data) is {
+                Success(pool_ada_reserve) -> when parse_int(pool_token_reserve_data) is {
+                  Success(pool_token_reserve) -> when parse_int(created_at_data) is {
+                    Success(created_at) -> {
+                      Success(LPTokenMetadata {
+                        name: name,
+                        description: description,
+                        image: image,
+                        pool_ada_reserve: pool_ada_reserve,
+                        pool_token_reserve: pool_token_reserve,
+                        created_at: created_at
+                      })
+                    }
+                    Error(err) -> Error(err)
+                  }
+                  Error(err) -> Error(err)
+                }
+                Error(err) -> Error(err)
+              }
+              Error(err) -> Error(err)
+            }
+            Error(err) -> Error(err)
+          }
+          Error(err) -> Error(err)
+        }
+      } else {
+        Error(InvalidFieldCount { expected: 6, found: list.length(fields) })
+      }
+    }
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "lp_token_metadata" })
+  }
+}
+
+// =============================================================================
+// VALIDATION UTILITIES
+// =============================================================================
+
+// Validate redeemer against current context
+pub fn validate_redeemer_context(
+  redeemer: PoolRedeemer,
+  ctx: ScriptContext
+) -> ParseResult<Bool> {
+  when redeemer is {
+    Swap { deadline, .. } -> validate_deadline(deadline, ctx)
+    AddLiquidity { deadline, .. } -> validate_deadline(deadline, ctx)
+    RemoveLiquidity { deadline, .. } -> validate_deadline(deadline, ctx)
+    CreatePool { fee_bps, .. } -> {
+      if fee_bps >= 0 && fee_bps <= 10000 {
+        Success(True)
+      } else {
+        Error(InvalidAmount { value: fee_bps, constraint: "fee_bps_range" })
+      }
+    }
+    EmergencyPause -> Success(True)
+    EmergencyUnpause -> Success(True)
+  }
+}
+
+// Validate deadline against transaction validity range
+pub fn validate_deadline(deadline: Int, ctx: ScriptContext) -> ParseResult<Bool> {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    transaction.Finite(upper_bound) -> {
+      if upper_bound <= deadline {
+        Success(True)
+      } else {
+        Error(InvalidDeadline { deadline: deadline, current_slot: upper_bound })
+      }
+    }
+    transaction.PosInfinity -> Success(True)
+    _ -> Error(InvalidFieldType { field_index: 0, expected_type: "valid_time_range" })
+  }
+}
+
+// Validate swap redeemer amounts
+pub fn validate_swap_amounts(
+  amount_in: Int,
+  min_out: Int,
+  max_slippage_bps: Int
+) -> ParseResult<Bool> {
+  if amount_in > 0 && min_out >= 0 {
+    // Additional slippage validation could be added here
+    Success(True)
+  } else {
+    Error(InvalidAmount { value: amount_in, constraint: "positive_swap_amounts" })
+  }
+}
+
+// Validate liquidity amounts
+pub fn validate_liquidity_amounts(
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int
+) -> ParseResult<Bool> {
+  if ada_amount > 0 && token_amount > 0 && min_lp_tokens >= 0 {
+    Success(True)
+  } else {
+    Error(InvalidAmount { value: ada_amount, constraint: "positive_liquidity_amounts" })
+  }
+}
+
+// =============================================================================
+// SERIALIZATION UTILITIES (for off-chain use)
+// =============================================================================
+
+// Serialize PoolRedeemer to CBOR Data
+pub fn serialize_pool_redeemer(redeemer: PoolRedeemer) -> Data {
+  when redeemer is {
+    Swap { input_amount, min_output, deadline, recipient } ->
+      Constr(0, [input_amount, min_output, deadline, serialize_address(recipient)])
+
+    AddLiquidity { ada_amount, token_amount, min_lp_tokens, deadline } ->
+      Constr(1, [ada_amount, token_amount, min_lp_tokens, deadline])
+
+    RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, deadline } ->
+      Constr(2, [lp_tokens, min_ada_out, min_token_out, deadline])
+
+    CreatePool { initial_ada, initial_token, fee_bps } ->
+      Constr(3, [initial_ada, initial_token, fee_bps])
+
+    EmergencyPause -> Constr(4, [])
+    EmergencyUnpause -> Constr(5, [])
+  }
+}
+
+// Serialize SwapRedeemer to CBOR Data
+pub fn serialize_swap_redeemer(redeemer: SwapRedeemer) -> Data {
+  Constr(0, [
+    serialize_bool(redeemer.swap_in_token),
+    redeemer.amount_in,
+    redeemer.min_out,
+    redeemer.deadline_slot,
+    serialize_address(redeemer.user_address)
+  ])
+}
+
+// Serialize Address to CBOR Data
+pub fn serialize_address(address: Address) -> Data {
+  Constr(0, [
+    serialize_credential(address.payment_credential),
+    serialize_optional_credential(address.staking_credential)
+  ])
+}
+
+// Serialize Credential to CBOR Data
+pub fn serialize_credential(credential: Credential) -> Data {
+  when credential is {
+    VerificationKeyCredential(pkh) -> Constr(0, [pkh])
+    ScriptCredential(script_hash) -> Constr(1, [script_hash])
+  }
+}
+
+// Serialize optional Credential to CBOR Data
+pub fn serialize_optional_credential(credential: Option<Credential>) -> Data {
+  when credential is {
+    None -> Constr(0, [])
+    Some(cred) -> Constr(1, [serialize_credential(cred)])
+  }
+}
+
+// Serialize Bool to CBOR Data
+pub fn serialize_bool(value: Bool) -> Data {
+  if value {
+    Constr(1, [])
+  } else {
+    Constr(0, [])
+  }
+}
+
+// =============================================================================
+// ERROR HANDLING UTILITIES
+// =============================================================================
+
+// Convert ParseError to human-readable string
+pub fn error_to_string(error: ParseError) -> ByteArray {
+  when error is {
+    InvalidConstructor { expected, found } ->
+      "invalid_constructor_expected_" <> bytearray.from_string(string.from_int(expected)) <> "_found_" <> bytearray.from_string(string.from_int(found))
+
+    InvalidFieldCount { expected, found } ->
+      "invalid_field_count_expected_" <> bytearray.from_string(string.from_int(expected)) <> "_found_" <> bytearray.from_string(string.from_int(found))
+
+    InvalidFieldType { field_index, expected_type } ->
+      "invalid_field_type_at_index_" <> bytearray.from_string(string.from_int(field_index)) <> "_expected_" <> expected_type
+
+    MissingRequiredField { field_name } ->
+      "missing_required_field_" <> field_name
+
+    InvalidAddress { raw_data } ->
+      "invalid_address_data"
+
+    InvalidAmount { value, constraint } ->
+      "invalid_amount_" <> bytearray.from_string(string.from_int(value)) <> "_constraint_" <> constraint
+
+    InvalidDeadline { deadline, current_slot } ->
+      "invalid_deadline_" <> bytearray.from_string(string.from_int(deadline)) <> "_current_" <> bytearray.from_string(string.from_int(current_slot))
+
+    InvalidPolicyId { raw_data } ->
+      "invalid_policy_id"
+
+    InvalidAssetName { raw_data } ->
+      "invalid_asset_name"
+
+    CBORDecodingError { error_msg } ->
+      "cbor_decoding_error_" <> error_msg
+  }
+}
+
+// Check if ParseResult is successful
+pub fn is_success(result: ParseResult<a>) -> Bool {
+  when result is {
+    Success(_) -> True
+    Error(_) -> False
+  }
+}
+
+// Extract value from successful ParseResult (unsafe - use with is_success check)
+pub fn unwrap(result: ParseResult<a>) -> a {
+  when result is {
+    Success(value) -> value
+    Error(_) -> error @"attempted to unwrap error result"
+  }
+}

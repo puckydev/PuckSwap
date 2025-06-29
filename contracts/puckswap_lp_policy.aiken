@@ -1,0 +1,151 @@
+use aiken/transaction.{ScriptContext, Mint, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, tokens, to_minted_value, from_minted_value
+}
+use aiken/list
+use aiken/cbor
+use aiken/dict.{Dict}
+use aiken/option
+use aiken/bytearray
+use aiken/string
+
+// CIP-25 compliant metadata for LP tokens
+// Following NFT metadata standard for LP position representation
+type LPTokenMetadata {
+  // Core CIP-25 fields
+  name: String,
+  description: String,
+  image: String,
+  mediaType: String,
+
+  // Pool-specific metadata
+  pool_ada_reserve: Int,
+  pool_token_reserve: Int,
+  pool_token_policy: PolicyId,
+  pool_token_name: AssetName,
+
+  // LP token details
+  total_supply: Int,
+  created_at: Int,
+  pool_fee_bps: Int,
+
+  // Additional attributes
+  attributes: Dict<String, String>,
+}
+
+// Enhanced redeemer for LP token operations with security
+type LPRedeemer {
+  // Mint LP tokens during liquidity addition
+  MintLP {
+    amount: Int,
+    pool_utxo_ref: transaction.OutputReference,
+    recipient: Address,
+    metadata: LPTokenMetadata,
+  }
+
+  // Burn LP tokens during liquidity removal
+  BurnLP {
+    amount: Int,
+    pool_utxo_ref: transaction.OutputReference,
+    owner: Address,
+  }
+
+  // Update metadata (for pool state changes)
+  UpdateMetadata {
+    token_name: AssetName,
+    new_metadata: LPTokenMetadata,
+    pool_utxo_ref: transaction.OutputReference,
+  }
+}
+
+// LP token minting policy validator
+validator lp_token_policy(
+  pool_validator_hash: ByteArray,
+  ctx: ScriptContext, 
+  redeemer: LPRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      when redeemer is {
+        MintLP { amount, pool_utxo_ref } ->
+          validate_lp_mint(ctx, policy_id, amount, pool_utxo_ref, pool_validator_hash)
+        
+        BurnLP { amount, pool_utxo_ref } ->
+          validate_lp_burn(ctx, policy_id, amount, pool_utxo_ref, pool_validator_hash)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate LP token minting during liquidity addition
+fn validate_lp_mint(
+  ctx: ScriptContext,
+  policy_id: ByteArray,
+  amount: Int,
+  pool_utxo_ref: transaction.OutputReference,
+  pool_validator_hash: ByteArray
+) -> Bool {
+  // Find the pool input being spent
+  expect Some(pool_input) = find_input(ctx.transaction.inputs, pool_utxo_ref)
+  
+  // Verify the input is from the correct pool validator
+  expect pool_input.output.address.payment_credential == 
+    transaction.credential.ScriptCredential(pool_validator_hash)
+  
+  // Get minted tokens from this policy
+  let minted_tokens = tokens(ctx.transaction.mint, policy_id)
+  
+  // Validate only positive amounts are minted
+  amount > 0 &&
+  // Validate the correct amount is being minted
+  list.all(minted_tokens, fn(token) { 
+    let (_, quantity) = token
+    quantity == amount
+  })
+}
+
+// Validate LP token burning during liquidity removal
+fn validate_lp_burn(
+  ctx: ScriptContext,
+  policy_id: ByteArray,
+  amount: Int,
+  pool_utxo_ref: transaction.OutputReference,
+  pool_validator_hash: ByteArray
+) -> Bool {
+  // Find the pool input being spent
+  expect Some(pool_input) = find_input(ctx.transaction.inputs, pool_utxo_ref)
+  
+  // Verify the input is from the correct pool validator
+  expect pool_input.output.address.payment_credential == 
+    transaction.credential.ScriptCredential(pool_validator_hash)
+  
+  // Get burned tokens from this policy (negative quantities)
+  let burned_tokens = tokens(ctx.transaction.mint, policy_id)
+  
+  // Validate only negative amounts (burning)
+  amount > 0 &&
+  // Validate the correct amount is being burned
+  list.all(burned_tokens, fn(token) { 
+    let (_, quantity) = token
+    quantity == -amount
+  })
+}
+
+// Generate CIP-25 compliant metadata for LP tokens
+fn generate_lp_metadata(
+  pool_ada_reserve: Int,
+  pool_token_reserve: Int,
+  token_name: ByteArray
+) -> LPTokenMetadata {
+  LPTokenMetadata {
+    name: "PuckSwap LP Token",
+    description: "Liquidity Provider token for PuckSwap AMM pool",
+    image: "ipfs://QmPuckSwapLPTokenImage",
+    pool_ada_reserve: pool_ada_reserve,
+    pool_token_reserve: pool_token_reserve,
+    created_at: 0, // Would be set to current timestamp
+  }
+}

@@ -1,0 +1,252 @@
+// =============================================================================
+// PUCKSWAP V5 - CENTRALIZED MINTING POLICY EXPORTS
+// =============================================================================
+//
+// This module centralizes all minting policy exports for PuckSwap v5 DEX.
+// It provides a single entry point for deployment, serialization, and
+// off-chain integration of all minting policies used in the protocol.
+//
+// EXPORTED POLICIES:
+// ==================
+// 1. lp_minting_policy - LP token minting/burning for AMM pools
+// 2. pADA_minting_policy - pADA liquid staking token minting/burning
+//
+// USAGE:
+// ======
+// This module is used for:
+// - Contract compilation and deployment
+// - Off-chain transaction builders (Lucid Evolution)
+// - Policy ID derivation for frontend integration
+// - Script serialization for Context7 indexing
+//
+// INTEGRATION:
+// ============
+// - Works with all PuckSwap v5 validators
+// - Follows CIP-68 datum standards
+// - Compatible with Lucid Evolution off-chain builders
+// - Supports Context7 real-time monitoring
+//
+// =============================================================================
+
+// Import required Aiken standard library modules
+use aiken/transaction.{ScriptContext}
+use aiken/transaction/value.{PolicyId}
+use aiken/transaction/credential.{Address}
+use aiken/hash.{script_hash}
+
+// Import core LP minting policy (production-ready for Preprod testnet)
+use policies/core_lp_minting_policy.{core_lp_minting_policy, CoreLPMintingRedeemer}
+
+// Import legacy LP minting policy from its implementation file
+use policies/lp_minting_policy.{lp_minting_policy, LPMintingRedeemer}
+
+// Import pADA minting policy from its implementation file
+use policies/pADA_minting_policy.{pADA_minting_policy, PADAMintingRedeemer}
+
+// =============================================================================
+// CORE LP MINTING POLICY EXPORT (PRODUCTION-READY)
+// =============================================================================
+
+// Export core LP minting policy for ADA ↔ PUCKY AMM pool
+// This policy controls the minting and burning of LP tokens for the core
+// ADA ↔ PUCKY trading pair on Preprod testnet.
+//
+// FEATURES:
+// - Strict integration with core liquidity validators
+// - Proportional LP token minting based on pool reserves
+// - Enhanced security validations to prevent unauthorized operations
+// - CIP-68 compliant datum structures
+// - Focused on ADA ↔ PUCKY trading pair
+// - Production-ready for Preprod testnet deployment
+//
+// PARAMETERS:
+// - authorized_validators: List of authorized validator hashes
+// - ctx: Script context containing transaction information
+// - redeemer: Core LP minting redeemer specifying the operation type and parameters
+//
+// OPERATIONS:
+// - MintLP: Mint LP tokens during liquidity provision
+// - BurnLP: Burn LP tokens during liquidity withdrawal
+//
+// SECURITY:
+// - Only allows minting/burning when authorized validators are executed
+// - Validates pool state transitions and reserve updates
+// - Enforces minimum ADA requirements and reasonable amount limits
+// - Prevents unauthorized operations through strict validator coordination
+pub fn core_lp_token_policy(
+  authorized_validators: List<ByteArray>,
+  ctx: ScriptContext,
+  redeemer: CoreLPMintingRedeemer
+) -> Bool {
+  core_lp_minting_policy(authorized_validators, ctx, redeemer)
+}
+
+// =============================================================================
+// LEGACY LP MINTING POLICY EXPORT
+// =============================================================================
+
+// Export LP minting policy for AMM pool liquidity provision and withdrawal
+// This policy controls the minting and burning of LP tokens for all AMM pools
+// in the PuckSwap v5 protocol.
+//
+// FEATURES:
+// - Tight integration with liquidity provision and withdrawal validators
+// - Proportional LP token minting based on pool reserves
+// - Comprehensive security validations to prevent unauthorized operations
+// - CIP-68 compliant datum structures
+// - Slippage protection and pool draining prevention
+// - MEV protection and front-running resistance
+//
+// PARAMETERS:
+// - pool_validator_hash: Hash of the pool validator that controls the AMM pool
+// - ctx: Script context containing transaction information
+// - redeemer: LP minting redeemer specifying the operation type and parameters
+//
+// OPERATIONS:
+// - MintLP: Mint LP tokens during liquidity provision
+// - BurnLP: Burn LP tokens during liquidity withdrawal
+//
+// SECURITY:
+// - Only allows minting/burning when authorized validators are executed
+// - Validates pool state transitions and reserve updates
+// - Enforces minimum ADA requirements and reasonable amount limits
+// - Prevents excessive single operations and pool manipulation
+pub fn lp_token_policy(
+  pool_validator_hash: ByteArray,
+  ctx: ScriptContext,
+  redeemer: LPMintingRedeemer
+) -> Bool {
+  lp_minting_policy(pool_validator_hash, ctx, redeemer)
+}
+
+// =============================================================================
+// pADA MINTING POLICY EXPORT
+// =============================================================================
+
+// Export pADA minting policy for liquid staking functionality
+// This policy controls the minting and burning of pADA tokens which represent
+// staked ADA in the PuckSwap v5 liquid staking module.
+//
+// FEATURES:
+// - Secure minting only during valid staking deposit transactions
+// - Proportional pADA minting based on current staking ratio
+// - Tight integration with liquid staking validator
+// - CIP-68 compliant datum structures
+// - Oracle-based reward synchronization support
+// - Comprehensive security validations
+//
+// PARAMETERS:
+// - redeemer: pADA minting redeemer specifying the operation type
+// - ctx: Script context containing transaction information
+//
+// OPERATIONS:
+// - MintForDeposit: Mint pADA tokens when ADA is deposited for staking
+// - BurnForWithdrawal: Burn pADA tokens when ADA is withdrawn from staking
+//
+// SECURITY:
+// - Only allows minting/burning when staking validator is executed
+// - Validates staking state transitions and balance updates
+// - Enforces minimum ADA requirements and reasonable amount limits
+// - Prevents unauthorized minting and maintains proper pADA:ADA ratios
+pub fn liquid_staking_token_policy(
+  redeemer: PADAMintingRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  pADA_minting_policy(redeemer, ctx)
+}
+
+// =============================================================================
+// POLICY COMPILATION EXPORTS
+// =============================================================================
+
+// These exports provide the compiled policy scripts for deployment and
+// off-chain integration. They can be used to derive policy IDs and
+// serialize scripts for transaction building.
+
+// Note: In Aiken, policies are compiled at build time, not runtime.
+// The actual compilation happens during the build process using the
+// policy functions defined above. Off-chain code should use the
+// policy functions directly for transaction building.
+
+// =============================================================================
+// UTILITY FUNCTIONS FOR OFF-CHAIN INTEGRATION
+// =============================================================================
+
+// Get LP token policy for a specific pool validator
+// This function can be used by off-chain code to reference the correct
+// policy function for LP tokens associated with a particular AMM pool
+pub fn get_lp_token_policy() -> fn(ByteArray, ScriptContext, LPMintingRedeemer) -> Bool {
+  lp_token_policy
+}
+
+// Get pADA policy for liquid staking
+// This function returns the policy function for pADA tokens used in liquid staking
+pub fn get_liquid_staking_token_policy() -> fn(PADAMintingRedeemer, ScriptContext) -> Bool {
+  liquid_staking_token_policy
+}
+
+// =============================================================================
+// DEPLOYMENT INFORMATION
+// =============================================================================
+
+// DEPLOYMENT NOTES:
+// =================
+// 1. LP Token Policy:
+//    - Parameterized by pool validator hash
+//    - Each AMM pool will have unique LP tokens
+//    - Policy ID derived from pool validator hash parameter
+//    - Use lp_token_policy function for transaction building
+//
+// 2. pADA Token Policy:
+//    - Global policy for all liquid staking operations
+//    - Single policy ID used across entire protocol
+//    - No parameterization required
+//    - Use liquid_staking_token_policy function for transaction building
+//
+// OFF-CHAIN INTEGRATION:
+// ======================
+// 1. Lucid Evolution Builders:
+//    - Import policy functions from this module
+//    - Build transactions using policy functions directly
+//    - Attach proper redeemers for minting/burning operations
+//    - Example: lp_token_policy(pool_hash, ctx, redeemer)
+//
+// 2. Context7 Monitoring:
+//    - Monitor policy IDs for minting/burning events
+//    - Parse redeemers to understand operation types
+//    - Track LP token and pADA supply changes
+//    - Use policy functions to validate operations
+//
+// 3. Frontend Integration:
+//    - Display policy IDs to users for verification
+//    - Show LP token and pADA balances using policy IDs
+//    - Enable token selection using policy ID filtering
+//    - Reference policy functions for transaction building
+//
+// SECURITY CONSIDERATIONS:
+// ========================
+// 1. Policy Integrity:
+//    - Policies are immutable once deployed
+//    - Validator integration provides security guarantees
+//    - No admin keys or upgrade mechanisms
+//
+// 2. Validator Coordination:
+//    - Policies only work with authorized validators
+//    - Tight coupling prevents unauthorized operations
+//    - State transitions validated across all components
+//
+// 3. Economic Security:
+//    - LP tokens represent proportional pool ownership
+//    - pADA tokens maintain 1:1 backing with staked ADA
+//    - No inflationary mechanisms or arbitrary minting
+//
+// USAGE EXAMPLES:
+// ===============
+// 1. Import policies in off-chain code:
+//    use puckswap/policies/index.{lp_token_policy, liquid_staking_token_policy}
+//
+// 2. Build LP token minting transaction:
+//    let policy_result = lp_token_policy(pool_validator_hash, ctx, lp_redeemer)
+//
+// 3. Build pADA minting transaction:
+//    let policy_result = liquid_staking_token_policy(pADA_redeemer, ctx)

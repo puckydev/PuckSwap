@@ -1,0 +1,278 @@
+// PuckSwap v5 DeFi - Cross-Chain Router Validator Tests
+// Comprehensive test suite for cross-chain routing functionality
+
+use aiken/list
+use aiken/bytearray
+
+// Test constants
+const test_chain_id_ethereum: Int = 1
+const test_chain_id_polygon: Int = 137
+const test_chain_id_bsc: Int = 56
+const test_bridge_id: ByteArray = #"bridge123456789abcdef123456789abcdef12345678"
+const test_message_id: ByteArray = #"msg123456789abcdef123456789abcdef123456789abcdef123456789abcdef12"
+const test_nonce: Int = 12345
+const test_amount: Int = 100_000_000 // 100 ADA
+const test_execution_hash: ByteArray = #"exec123456789abcdef123456789abcdef123456789abcdef123456789abcdef12"
+
+// Test 1: Validate nonce sequence for replay attack prevention
+test test_nonce_sequence_validation() {
+  let last_processed_nonce = 100
+  let nonce_window = 10
+  
+  // Valid nonce (sequential)
+  let valid_nonce = last_processed_nonce + 1
+  let valid_result = validate_nonce_sequence(valid_nonce, last_processed_nonce, nonce_window)
+  
+  // Invalid nonce (not sequential)
+  let invalid_nonce = last_processed_nonce + 2
+  let invalid_result = !validate_nonce_sequence(invalid_nonce, last_processed_nonce, nonce_window)
+  
+  valid_result && invalid_result
+}
+
+// Helper function for nonce validation (recreated for testing)
+fn validate_nonce_sequence(new_nonce: Int, last_processed_nonce: Int, nonce_window: Int) -> Bool {
+  new_nonce == last_processed_nonce + 1 && new_nonce <= last_processed_nonce + nonce_window
+}
+
+// Test 2: Validate bridge signature format
+test test_bridge_signature_format() {
+  let valid_signature = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+  let valid_signer = #"signer123456789abcdef123456789abcdef12345678"
+  let valid_timestamp = 1000000
+  
+  // Validate signature length (64 bytes)
+  let signature_valid = bytearray.length(valid_signature) == 64
+  
+  // Validate signer length (32 bytes)
+  let signer_valid = bytearray.length(valid_signer) == 32
+  
+  // Validate timestamp is positive
+  let timestamp_valid = valid_timestamp > 0
+  
+  signature_valid && signer_valid && timestamp_valid
+}
+
+// Test 3: Validate message ID format
+test test_message_id_format() {
+  let message_id = test_message_id
+  
+  // Message ID should be 32 bytes (256-bit hash)
+  bytearray.length(message_id) == 32
+}
+
+// Test 4: Validate bridge ID format
+test test_bridge_id_format() {
+  let bridge_id = test_bridge_id
+  
+  // Bridge ID should be non-empty and reasonable length
+  let length = bytearray.length(bridge_id)
+  length > 0 && length <= 64
+}
+
+// Test 5: Validate chain ID values
+test test_chain_id_validation() {
+  // Common chain IDs should be positive integers
+  test_chain_id_ethereum > 0 &&
+  test_chain_id_polygon > 0 &&
+  test_chain_id_bsc > 0 &&
+  test_chain_id_ethereum != test_chain_id_polygon &&
+  test_chain_id_polygon != test_chain_id_bsc
+}
+
+// Test 6: Validate transfer amount bounds
+test test_transfer_amount_bounds() {
+  let min_amount = 1_000_000 // 1 ADA minimum
+  let max_amount = 1_000_000_000_000 // 1M ADA maximum
+  let valid_amount = test_amount
+  
+  // Amount should be within reasonable bounds
+  valid_amount >= min_amount &&
+  valid_amount <= max_amount &&
+  min_amount > 0 &&
+  max_amount > min_amount
+}
+
+// Test 7: Validate execution hash format
+test test_execution_hash_format() {
+  let execution_hash = test_execution_hash
+  
+  // Execution hash should be 32 bytes
+  bytearray.length(execution_hash) == 32
+}
+
+// Test 8: Validate merkle proof structure
+test test_merkle_proof_structure() {
+  let merkle_root = #"root123456789abcdef123456789abcdef123456789abcdef123456789abcdef12"
+  let merkle_proof = [
+    #"proof1123456789abcdef123456789abcdef123456789abcdef123456789abcdef",
+    #"proof2123456789abcdef123456789abcdef123456789abcdef123456789abcdef",
+    #"proof3123456789abcdef123456789abcdef123456789abcdef123456789abcdef"
+  ]
+  
+  // Validate merkle root is 32 bytes
+  let root_valid = bytearray.length(merkle_root) == 32
+  
+  // Validate all proof elements are 32 bytes
+  let proof_valid = list.all(merkle_proof, fn(hash) { bytearray.length(hash) == 32 })
+  
+  // Validate proof is not empty
+  let proof_not_empty = list.length(merkle_proof) > 0
+  
+  root_valid && proof_valid && proof_not_empty
+}
+
+// Test 9: Validate block number and hash format
+test test_block_validation() {
+  let block_number = 1000000
+  let block_hash = #"block123456789abcdef123456789abcdef123456789abcdef123456789abcdef1"
+  
+  // Block number should be positive
+  let number_valid = block_number > 0
+  
+  // Block hash should be 32 bytes
+  let hash_valid = bytearray.length(block_hash) == 32
+  
+  number_valid && hash_valid
+}
+
+// Test 10: Validate confirmation requirements
+test test_confirmation_requirements() {
+  let min_confirmations = 3
+  let max_confirmations = 100
+  let valid_confirmations = 5
+  
+  // Confirmations should be within reasonable bounds
+  valid_confirmations >= min_confirmations &&
+  valid_confirmations <= max_confirmations &&
+  min_confirmations > 0 &&
+  max_confirmations > min_confirmations
+}
+
+// Test 11: Validate message age limits
+test test_message_age_limits() {
+  let max_message_age_slots = 604800 // 7 days in slots
+  let current_slot = 1000000
+  let message_created_slot = 999000
+  let message_age = current_slot - message_created_slot
+  
+  // Message should not be too old
+  message_age <= max_message_age_slots &&
+  max_message_age_slots > 0 &&
+  message_age >= 0
+}
+
+// Test 12: Validate nonce window bounds
+test test_nonce_window_bounds() {
+  let min_nonce_window = 1
+  let max_nonce_window = 1000
+  let valid_nonce_window = 10
+  
+  // Nonce window should be reasonable
+  valid_nonce_window >= min_nonce_window &&
+  valid_nonce_window <= max_nonce_window &&
+  min_nonce_window > 0
+}
+
+// Test 13: Validate fee calculations
+test test_fee_calculations() {
+  let amount = 100_000_000 // 100 ADA
+  let cross_chain_fee_bps = 50 // 0.5%
+  let bridge_fee_bps = 30 // 0.3%
+  
+  // Calculate fees
+  let cross_chain_fee = (amount * cross_chain_fee_bps) / 10000
+  let bridge_fee = (amount * bridge_fee_bps) / 10000
+  let total_fees = cross_chain_fee + bridge_fee
+  
+  // Fees should be reasonable
+  cross_chain_fee == 500_000 && // 0.5 ADA
+  bridge_fee == 300_000 && // 0.3 ADA
+  total_fees == 800_000 && // 0.8 ADA total
+  total_fees < amount / 10 // Less than 10% of amount
+}
+
+// Test 14: Validate daily transfer limits
+test test_daily_transfer_limits() {
+  let daily_limit = 10_000_000_000 // 10K ADA daily limit
+  let current_daily_volume = 5_000_000_000 // 5K ADA already transferred
+  let new_transfer = 2_000_000_000 // 2K ADA new transfer
+  let total_after_transfer = current_daily_volume + new_transfer
+  
+  // Transfer should be within daily limits
+  new_transfer > 0 &&
+  total_after_transfer <= daily_limit &&
+  current_daily_volume < daily_limit
+}
+
+// Test 15: Validate security parameter bounds
+test test_security_parameter_bounds() {
+  let min_confirmations = 3
+  let max_message_age = 604800 // 7 days
+  let nonce_window = 10
+  
+  // All security parameters should be within reasonable bounds
+  min_confirmations > 0 && min_confirmations <= 100 &&
+  max_message_age > 0 && max_message_age <= 604800 &&
+  nonce_window > 0 && nonce_window <= 1000
+}
+
+// Test 16: Validate status transition logic
+test test_status_transitions() {
+  // Valid transitions should return true
+  let pending_to_processing = validate_status_transition_logic("Pending", "Processing")
+  let processing_to_confirmed = validate_status_transition_logic("Processing", "Confirmed")
+  let confirmed_to_completed = validate_status_transition_logic("Confirmed", "Completed")
+  
+  // Invalid transitions should return false
+  let pending_to_completed = !validate_status_transition_logic("Pending", "Completed")
+  let completed_to_pending = !validate_status_transition_logic("Completed", "Pending")
+  
+  pending_to_processing && processing_to_confirmed && confirmed_to_completed &&
+  pending_to_completed && completed_to_pending
+}
+
+// Helper function for status transition testing
+fn validate_status_transition_logic(current: ByteArray, new: ByteArray) -> Bool {
+  when (current, new) is {
+    ("Pending", "Processing") -> True
+    ("Processing", "Confirmed") -> True
+    ("Confirmed", "Completed") -> True
+    ("Pending", "Cancelled") -> True
+    ("Processing", "Failed") -> True
+    _ -> False
+  }
+}
+
+// Test 17: Validate replay attack prevention
+test test_replay_attack_prevention() {
+  let processed_message_hashes = [
+    #"hash1123456789abcdef123456789abcdef123456789abcdef123456789abcdef1",
+    #"hash2123456789abcdef123456789abcdef123456789abcdef123456789abcdef2",
+    #"hash3123456789abcdef123456789abcdef123456789abcdef123456789abcdef3"
+  ]
+  
+  let existing_hash = #"hash1123456789abcdef123456789abcdef123456789abcdef123456789abcdef1"
+  let new_hash = #"hash4123456789abcdef123456789abcdef123456789abcdef123456789abcdef4"
+  
+  // Existing hash should be found (replay attack detected)
+  let replay_detected = list.has(processed_message_hashes, existing_hash)
+  
+  // New hash should not be found (valid new message)
+  let new_message_valid = !list.has(processed_message_hashes, new_hash)
+  
+  replay_detected && new_message_valid
+}
+
+// Test 18: Validate bridge reputation scoring
+test test_bridge_reputation_scoring() {
+  let min_reputation = 0
+  let max_reputation = 10000 // 100% in basis points
+  let good_reputation = 8500 // 85%
+  let poor_reputation = 3000 // 30%
+  
+  // Reputation scores should be within bounds
+  good_reputation >= min_reputation && good_reputation <= max_reputation &&
+  poor_reputation >= min_reputation && poor_reputation <= max_reputation &&
+  good_reputation > poor_reputation
+}

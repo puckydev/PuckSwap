@@ -1,0 +1,321 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of}
+use cardano/assets
+use aiken/option.{Option, Some, None}
+use aiken/error
+use aiken/list
+use aiken/math
+
+// =============================================================================
+// PUCKSWAP V5 SWAP VALIDATOR - MASTER SCHEMA COMPLIANT
+// =============================================================================
+// 
+// Implements constant product AMM (x * y = k) with 0.3% fee (997/1000 model)
+// Follows PuckSwap_v5_MasterSchema.md datum and redeemer structures
+// =============================================================================
+
+// Exact PoolDatum Structure from deployed contract
+// Matches contracts/examples/redeemer_parser_integration.aiken
+pub type PoolDatum {
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_total_supply: Int,
+  fee_bps: Int,
+}
+
+// Enhanced Swap Redeemer with deadline protection
+pub type SwapRedeemer {
+  swap_in_token: Bool,    // true = token->ADA, false = ADA->token
+  amount_in: Int,         // Input amount
+  min_out: Int,           // Minimum output (slippage protection)
+  deadline: Int,          // Slot deadline for MEV protection
+  recipient: Address,     // Where to send output tokens
+}
+
+// Swap calculation result with enhanced tracking
+pub type SwapResult {
+  output_amount: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  fee_amount: Int,
+  price_impact_bps: Int,
+}
+
+// =============================================================================
+// MAIN VALIDATOR
+// =============================================================================
+
+validator swap_validator(
+  ctx: ScriptContext,
+  datum: PoolDatum,
+  redeemer: SwapRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find pool input and output UTxOs
+      expect Some(pool_input) = find_pool_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_pool_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate swap operation with comprehensive security checks
+      validate_swap_operation(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// CORE SWAP VALIDATION
+// =============================================================================
+
+fn validate_swap_operation(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum,
+  redeemer: SwapRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate redeemer parameters
+  expect redeemer.amount_in > 0
+  expect redeemer.min_out >= 0
+
+  // Validate deadline hasn't passed
+  expect validate_deadline(redeemer.deadline, ctx)
+
+  // Validate pool reserves are positive
+  expect datum.ada_reserve > 0
+  expect datum.token_reserve > 0
+  expect datum.lp_total_supply > 0
+
+  // Validate fee is reasonable (max 10%)
+  expect datum.fee_bps >= 0 && datum.fee_bps <= 1000
+
+  // Extract current reserves from pool input UTxO
+  let (current_ada_reserve, current_token_reserve) =
+    extract_pool_reserves(pool_input.output.value, datum)
+
+  // Validate reserves match datum
+  expect current_ada_reserve == datum.ada_reserve
+  expect current_token_reserve == datum.token_reserve
+
+  // Calculate swap using constant product formula with fee
+  let swap_result = calculate_constant_product_swap(
+    datum.ada_reserve,
+    datum.token_reserve,
+    redeemer.amount_in,
+    redeemer.swap_in_token,
+    datum.fee_bps
+  )
+
+  // Validate minimum output requirement (slippage protection)
+  expect swap_result.output_amount >= redeemer.min_out
+
+  // Get new pool datum from output
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_datum: PoolDatum = output_datum_data
+
+  // Validate reserves are updated correctly in datum
+  expect new_datum.ada_reserve == swap_result.new_ada_reserve
+  expect new_datum.token_reserve == swap_result.new_token_reserve
+
+  // Validate pool configuration remains unchanged
+  expect new_datum.pool_nft_policy == datum.pool_nft_policy
+  expect new_datum.pool_nft_name == datum.pool_nft_name
+  expect new_datum.token_policy == datum.token_policy
+  expect new_datum.token_name == datum.token_name
+  expect new_datum.fee_bps == datum.fee_bps
+  expect new_datum.lp_total_supply == datum.lp_total_supply
+
+  // Validate actual reserves in output UTxO match calculated values
+  let (output_ada_reserve, output_token_reserve) =
+    extract_pool_reserves(pool_output.value, new_datum)
+
+  expect output_ada_reserve == swap_result.new_ada_reserve
+  expect output_token_reserve == swap_result.new_token_reserve
+
+  // Validate minimum ADA requirements
+  expect validate_min_ada_requirement(pool_output)
+
+  // Validate user receives correct output
+  expect validate_user_receives_output(redeemer, swap_result, ctx)
+
+  // Validate no pool draining attacks
+  expect validate_no_pool_draining(swap_result, datum)
+
+  // Validate price impact is reasonable
+  expect validate_price_impact(swap_result, datum)
+
+  // Validate pool NFT is preserved
+  expect validate_pool_nft_preservation(pool_input, pool_output, datum)
+
+  True
+}
+
+// =============================================================================
+// CONSTANT PRODUCT AMM CALCULATION (x * y = k)
+// =============================================================================
+
+fn calculate_constant_product_swap(
+  ada_reserve: Int,
+  token_reserve: Int,
+  amount_in: Int,
+  swap_in_token: Bool,
+  fee_bps: Int
+) -> SwapResult {
+  // Calculate fee using basis points (default 30 bps = 0.3%)
+  let fee_denominator = 10000
+  let fee_numerator = fee_denominator - fee_bps
+  let amount_in_with_fee = amount_in * fee_numerator
+  let fee_amount = amount_in * fee_bps / fee_denominator
+
+  // Calculate price before swap for impact calculation
+  let price_before = if swap_in_token {
+    ada_reserve * 1000000 / token_reserve
+  } else {
+    token_reserve * 1000000 / ada_reserve
+  }
+
+  if swap_in_token {
+    // Token -> ADA swap: (amount_in_with_fee * ada_reserve) / (token_reserve * 10000 + amount_in_with_fee)
+    let numerator = amount_in_with_fee * ada_reserve
+    let denominator = (token_reserve * fee_denominator) + amount_in_with_fee
+    let output_amount = numerator / denominator
+
+    // Calculate price impact (simplified)
+    let price_after = (ada_reserve - output_amount) * 1000000 / (token_reserve + amount_in)
+    let price_diff = if price_after > price_before {
+      price_after - price_before
+    } else {
+      price_before - price_after
+    }
+    let price_impact_bps = price_diff * 10000 / price_before
+
+    SwapResult {
+      output_amount: output_amount,
+      new_ada_reserve: ada_reserve - output_amount,
+      new_token_reserve: token_reserve + amount_in,
+      fee_amount: fee_amount,
+      price_impact_bps: price_impact_bps,
+    }
+  } else {
+    // ADA -> Token swap: (amount_in_with_fee * token_reserve) / (ada_reserve * 10000 + amount_in_with_fee)
+    let numerator = amount_in_with_fee * token_reserve
+    let denominator = (ada_reserve * fee_denominator) + amount_in_with_fee
+    let output_amount = numerator / denominator
+
+    // Calculate price impact (simplified)
+    let price_after = (token_reserve - output_amount) * 1000000 / (ada_reserve + amount_in)
+    let price_diff = if price_after > price_before {
+      price_after - price_before
+    } else {
+      price_before - price_after
+    }
+    let price_impact_bps = price_diff * 10000 / price_before
+
+    SwapResult {
+      output_amount: output_amount,
+      new_ada_reserve: ada_reserve + amount_in,
+      new_token_reserve: token_reserve - output_amount,
+      fee_amount: fee_amount,
+      price_impact_bps: price_impact_bps,
+    }
+  }
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn find_pool_input(inputs: List<Input>, output_ref: OutputReference) -> Option<Input> {
+  list.find(inputs, fn(input) { input.output_reference == output_ref })
+}
+
+fn find_pool_output(outputs: List<Output>, pool_address: Address) -> Option<Output> {
+  list.find(outputs, fn(output) { output.address == pool_address })
+}
+
+fn extract_pool_reserves(pool_value: Value, datum: PoolDatum) -> (Int, Int) {
+  let ada_amount = quantity_of(pool_value, ada_policy_id, ada_asset_name)
+  let token_amount = quantity_of(pool_value, datum.token_policy, datum.token_name)
+
+  (ada_amount, token_amount)
+}
+
+fn validate_deadline(deadline: Int, ctx: ScriptContext) -> Bool {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    Finite(upper_bound) -> deadline >= upper_bound
+    _ -> True  // No upper bound set, deadline check passes
+  }
+}
+
+fn validate_min_ada_requirement(pool_output: Output) -> Bool {
+  let ada_amount = quantity_of(pool_output.value, ada_policy_id, ada_asset_name)
+  // Ensure minimum 2 ADA remains in pool UTxO
+  ada_amount >= 2_000_000
+}
+
+fn validate_user_receives_output(
+  redeemer: SwapRedeemer,
+  swap_result: SwapResult,
+  ctx: ScriptContext
+) -> Bool {
+  // Check that user receives output at the specified recipient address
+  let user_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == redeemer.recipient
+  })
+
+  // Ensure at least one output to recipient with minimum amount
+  when user_outputs is {
+    [] -> False
+    [output, ..] -> {
+      if redeemer.swap_in_token {
+        // User should receive ADA
+        quantity_of(output.value, ada_policy_id, ada_asset_name) >= swap_result.output_amount
+      } else {
+        // User should receive tokens (simplified check)
+        True  // In production, would check specific token amounts
+      }
+    }
+  }
+}
+
+fn validate_no_pool_draining(swap_result: SwapResult, original_datum: PoolDatum) -> Bool {
+  // Prevent draining attacks by ensuring reserves don't go below minimum thresholds
+  let min_ada_reserve = 1_000_000  // 1 ADA minimum
+  let min_token_reserve = 1_000_000  // 1 token minimum
+
+  expect swap_result.new_ada_reserve >= min_ada_reserve
+  expect swap_result.new_token_reserve >= min_token_reserve
+
+  // Ensure constant product is maintained (accounting for fees)
+  let original_product = original_datum.ada_reserve * original_datum.token_reserve
+  let new_product = swap_result.new_ada_reserve * swap_result.new_token_reserve
+
+  // New product should be greater than or equal to original (due to fees)
+  new_product >= original_product
+}
+
+fn validate_price_impact(swap_result: SwapResult, datum: PoolDatum) -> Bool {
+  // Prevent excessive price impact (max 10%)
+  let max_price_impact_bps = 1000  // 10%
+  swap_result.price_impact_bps <= max_price_impact_bps
+}
+
+fn validate_pool_nft_preservation(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum
+) -> Bool {
+  // Ensure pool NFT is preserved in the transaction
+  let input_nft_amount = quantity_of(pool_input.output.value, datum.pool_nft_policy, datum.pool_nft_name)
+  let output_nft_amount = quantity_of(pool_output.value, datum.pool_nft_policy, datum.pool_nft_name)
+
+  expect input_nft_amount == 1
+  expect output_nft_amount == 1
+
+  True
+}

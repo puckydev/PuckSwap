@@ -1,0 +1,305 @@
+// PuckSwap v5 DeFi - Cross-Chain Router Page
+// Next.js page for cross-chain bridge with multi-chain asset transfers
+// Retro terminal aesthetic with professional DeFi functionality
+
+import React, { useState, useEffect } from 'react';
+import Head from 'next/head';
+import { toast, Toaster } from 'react-hot-toast';
+import CrossChainRouter from '../components/CrossChainRouter';
+import { PuckSwapCrossChainRouter } from '../lucid/crosschain';
+import { CrossChainMonitor } from '../context7/crosschain-monitor';
+
+// Cross-chain page component
+export default function CrossChainPage() {
+  const [router, setRouter] = useState<PuckSwapCrossChainRouter | null>(null);
+  const [monitor, setMonitor] = useState<CrossChainMonitor | null>(null);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isDemoMode, setIsDemoMode] = useState(true); // Start in demo mode
+  const [error, setError] = useState<string | null>(null);
+
+  // Initialize cross-chain system
+  useEffect(() => {
+    const initializeCrossChain = async () => {
+      try {
+        setIsInitializing(true);
+        setError(null);
+
+        if (isDemoMode) {
+          // Demo mode - no actual initialization needed
+          console.log('Running in demo mode');
+          setIsInitializing(false);
+          return;
+        }
+
+        // Check for environment variables
+        const blockfrostApiKey = process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY;
+        const network = (process.env.NEXT_PUBLIC_NETWORK as "Mainnet" | "Preview" | "Preprod") || "Preview";
+
+        if (!blockfrostApiKey) {
+          throw new Error('Blockfrost API key not configured');
+        }
+
+        // Initialize cross-chain router
+        const routerInstance = await PuckSwapCrossChainRouter.create(
+          blockfrostApiKey,
+          network,
+          {
+            routerValidator: process.env.NEXT_PUBLIC_ROUTER_VALIDATOR_CBOR || "",
+            packetValidator: process.env.NEXT_PUBLIC_PACKET_VALIDATOR_CBOR || ""
+          },
+          process.env.NEXT_PUBLIC_ROUTER_ADDRESS || ""
+        );
+
+        setRouter(routerInstance);
+
+        // Initialize monitor
+        const monitorInstance = new CrossChainMonitor({
+          routerAddress: process.env.NEXT_PUBLIC_ROUTER_ADDRESS || "",
+          packetAddresses: [
+            process.env.NEXT_PUBLIC_PACKET_ADDRESS_1 || "",
+            process.env.NEXT_PUBLIC_PACKET_ADDRESS_2 || "",
+            process.env.NEXT_PUBLIC_PACKET_ADDRESS_3 || ""
+          ].filter(addr => addr.length > 0),
+          blockfrostApiKey,
+          network: network.toLowerCase() as "mainnet" | "preview" | "preprod",
+          enableWebSocket: true,
+          pollingInterval: 15000,
+          maxRetries: 3,
+          retryDelay: 5000,
+          enableAlerts: true,
+          alertThresholds: {
+            highFailureRateThreshold: 5, // 5% failure rate
+            suspiciousVolumeThreshold: BigInt(10_000_000_000_000), // 10M ADA
+            longPendingTimeHours: 2,
+            dailyLimitPercentage: 80 // 80% of daily limit
+          },
+          externalChainRPCs: new Map([
+            [1, process.env.NEXT_PUBLIC_ETHEREUM_RPC || ""],
+            [56, process.env.NEXT_PUBLIC_BSC_RPC || ""],
+            [137, process.env.NEXT_PUBLIC_POLYGON_RPC || ""],
+            [43114, process.env.NEXT_PUBLIC_AVALANCHE_RPC || ""],
+            [42161, process.env.NEXT_PUBLIC_ARBITRUM_RPC || ""]
+          ])
+        });
+
+        await monitorInstance.initialize();
+        await monitorInstance.startMonitoring();
+        setMonitor(monitorInstance);
+
+        console.log('Cross-chain system initialized successfully');
+      } catch (error) {
+        console.error('Failed to initialize cross-chain system:', error);
+        setError(error instanceof Error ? error.message : 'Failed to initialize cross-chain system');
+        toast.error('Failed to initialize cross-chain system. Running in demo mode.');
+        setIsDemoMode(true); // Fallback to demo mode
+      } finally {
+        setIsInitializing(false);
+      }
+    };
+
+    initializeCrossChain();
+
+    // Cleanup on unmount
+    return () => {
+      if (monitor) {
+        monitor.stopMonitoring();
+      }
+    };
+  }, [isDemoMode]);
+
+  // Toggle demo mode
+  const toggleDemoMode = () => {
+    setIsDemoMode(!isDemoMode);
+    setError(null);
+  };
+
+  return (
+    <>
+      <Head>
+        <title>Cross-Chain Bridge - PuckSwap v5 DeFi</title>
+        <meta name="description" content="Bridge assets across multiple blockchains with PuckSwap's secure cross-chain router. Support for Ethereum, BSC, Polygon, and more." />
+        <meta name="keywords" content="cross-chain bridge, multi-chain, Ethereum bridge, BSC bridge, Polygon bridge, DeFi bridge, asset transfer" />
+        <meta property="og:title" content="Cross-Chain Bridge - PuckSwap v5 DeFi" />
+        <meta property="og:description" content="Bridge assets across multiple blockchains with PuckSwap's secure cross-chain router." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://puckswap.com/crosschain" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Cross-Chain Bridge - PuckSwap v5 DeFi" />
+        <meta name="twitter:description" content="Bridge assets across multiple blockchains securely." />
+        <link rel="canonical" href="https://puckswap.com/crosschain" />
+      </Head>
+
+      <div className="min-h-screen bg-terminal-black">
+        {/* Loading Screen */}
+        {isInitializing && (
+          <div className="fixed inset-0 bg-terminal-black flex items-center justify-center z-50">
+            <div className="text-center">
+              <div className="w-16 h-16 border-4 border-terminal-green border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+              <div className="text-terminal-green font-mono text-lg">
+                INITIALIZING_CROSSCHAIN_ROUTER.exe
+              </div>
+              <div className="text-terminal-green/70 font-mono text-sm mt-2">
+                Connecting to multi-chain infrastructure...
+              </div>
+              <div className="text-terminal-green/50 font-mono text-xs mt-4">
+                Establishing bridge connections...
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Error Banner */}
+        {error && !isInitializing && (
+          <div className="bg-red-900/20 border-b border-red-500/30 p-4">
+            <div className="max-w-7xl mx-auto flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <span className="text-red-400">⚠️</span>
+                <div>
+                  <div className="text-red-400 font-bold">Bridge Connection Error</div>
+                  <div className="text-red-300 text-sm">{error}</div>
+                </div>
+              </div>
+              <button
+                onClick={toggleDemoMode}
+                className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+              >
+                Switch to Demo Mode
+              </button>
+            </div>
+          </div>
+        )}
+
+
+
+        {/* Security Notice */}
+        {!isDemoMode && !isInitializing && (
+          <div className="bg-terminal-green/10 border-b border-terminal-green/30 p-4">
+            <div className="max-w-7xl mx-auto">
+              <div className="flex items-start space-x-3">
+                <span className="text-terminal-green text-xl">🔒</span>
+                <div>
+                  <div className="text-terminal-green font-bold">Security Notice</div>
+                  <div className="text-terminal-green/80 text-sm mt-1">
+                    Cross-chain transfers involve multiple blockchains and trusted bridges. 
+                    Always verify recipient addresses and understand the risks before proceeding.
+                  </div>
+                  <div className="text-terminal-green/60 text-xs mt-2">
+                    • Transfers are irreversible once confirmed on destination chain
+                    • Bridge operators are trusted third parties
+                    • Network congestion may cause delays
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Main Content */}
+        {!isInitializing && (
+          <CrossChainRouter 
+            router={router || undefined}
+            monitor={monitor || undefined}
+            isDemoMode={isDemoMode}
+          />
+        )}
+
+        {/* Toast Notifications */}
+        <Toaster
+          position="bottom-right"
+          toastOptions={{
+            duration: 6000, // Longer duration for cross-chain notifications
+            style: {
+              background: '#1a1a1a',
+              color: '#00ff00',
+              border: '1px solid #00ff0050',
+              fontFamily: 'monospace',
+            },
+            success: {
+              iconTheme: {
+                primary: '#00ff00',
+                secondary: '#1a1a1a',
+              },
+            },
+            error: {
+              iconTheme: {
+                primary: '#ff4444',
+                secondary: '#1a1a1a',
+              },
+            },
+          }}
+        />
+
+        {/* Terminal Footer */}
+        <footer className="border-t border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm">
+          <div className="max-w-7xl mx-auto px-4 py-6">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">CROSSCHAIN_ROUTER.exe</h3>
+                <p className="text-terminal-green/70 text-sm">
+                  Secure multi-chain asset transfers with trusted bridge operators 
+                  and comprehensive message passing infrastructure.
+                </p>
+              </div>
+              
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">SUPPORTED_CHAINS.dat</h3>
+                <ul className="text-terminal-green/70 text-sm space-y-1">
+                  <li>⟠ Ethereum (ETH)</li>
+                  <li>🟡 Binance Smart Chain</li>
+                  <li>🟣 Polygon (MATIC)</li>
+                  <li>🔺 Avalanche (AVAX)</li>
+                  <li>🔵 Arbitrum (ARB)</li>
+                </ul>
+              </div>
+              
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">FEATURES.log</h3>
+                <ul className="text-terminal-green/70 text-sm space-y-1">
+                  <li>• Multi-signature bridges</li>
+                  <li>• Real-time confirmations</li>
+                  <li>• Automated message routing</li>
+                  <li>• Fee optimization</li>
+                  <li>• Transfer history tracking</li>
+                </ul>
+              </div>
+              
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">SECURITY.sys</h3>
+                <ul className="text-terminal-green/70 text-sm space-y-1">
+                  <li>• Trusted bridge operators</li>
+                  <li>• Multi-chain validation</li>
+                  <li>• Emergency pause controls</li>
+                  <li>• Daily transfer limits</li>
+                  <li>• Governance oversight</li>
+                </ul>
+              </div>
+            </div>
+            
+            <div className="border-t border-terminal-green/30 mt-6 pt-6">
+              <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
+                <p className="text-terminal-green/50 text-sm font-mono">
+                  PUCKSWAP_V5_CROSSCHAIN_ROUTER © 2024 • DEFI_ECOSYSTEM_MODULE • 
+                  {isDemoMode ? 'DEMO_MODE_ACTIVE' : 'MAINNET_CONNECTED'}
+                </p>
+                
+                <div className="flex items-center space-x-4 text-xs text-terminal-green/50">
+                  <span>Bridge Status: {isDemoMode ? 'SIMULATED' : 'OPERATIONAL'}</span>
+                  <span>•</span>
+                  <span>Supported Chains: 5</span>
+                  <span>•</span>
+                  <span>Active Bridges: {isDemoMode ? '3' : 'Loading...'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </footer>
+      </div>
+    </>
+  );
+}
+
+// Export page configuration for Next.js
+export const config = {
+  runtime: 'nodejs',
+  unstable_includeFiles: ['public/**/*']
+};

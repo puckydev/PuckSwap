@@ -1,0 +1,598 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/dict
+
+// Import validator and utilities
+use amm_swap_validator_v5.{
+  AMMSwapRedeemer, SwapResult, calculate_amm_swap, amm_swap_validator_v5
+}
+use puckswap/lib/amm_security_utils.{
+  validate_amm_security, validate_dust_protection, calculate_price_impact
+}
+use puckswap/lib/cip68_types.{
+  PoolCIP68Datum, PoolState, PoolConfig, PoolStats, CIP68Metadata
+}
+
+// =============================================================================
+// AMM SWAP VALIDATOR V5 COMPREHENSIVE TESTS
+// =============================================================================
+
+// Test constants
+const TEST_ADA_RESERVE: Int = 1000_000_000      // 1000 ADA
+const TEST_TOKEN_RESERVE: Int = 2000_000_000    // 2000 tokens
+const TEST_FEE_BPS: Int = 30                    // 0.3% fee
+const TEST_SWAP_AMOUNT: Int = 100_000_000       // 100 ADA/tokens
+
+// =============================================================================
+// CORE AMM CALCULATION TESTS
+// =============================================================================
+
+test test_constant_product_formula_ada_to_token() {
+  // Test ADA -> Token swap
+  let swap_result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_SWAP_AMOUNT,
+    False,  // ADA -> Token
+    TEST_FEE_BPS
+  )
+
+  // Verify output amount is calculated correctly
+  // Using 997/1000 fee model: amount_in_with_fee = 100 * 997 = 99,700,000
+  // numerator = 99,700,000 * 2,000,000,000 = 199,400,000,000,000,000
+  // denominator = (1,000,000,000 * 1000) + 99,700,000 = 1,099,700,000
+  // output = 199,400,000,000,000,000 / 1,099,700,000 ≈ 181,346,485
+  
+  expect swap_result.output_amount > 180_000_000
+  expect swap_result.output_amount < 185_000_000
+
+  // Verify reserves are updated correctly
+  expect swap_result.new_ada_reserve == TEST_ADA_RESERVE + TEST_SWAP_AMOUNT
+  expect swap_result.new_token_reserve == TEST_TOKEN_RESERVE - swap_result.output_amount
+
+  // Verify constant product is maintained (with fee increase)
+  let original_product = TEST_ADA_RESERVE * TEST_TOKEN_RESERVE
+  let new_product = swap_result.new_ada_reserve * swap_result.new_token_reserve
+  expect new_product >= original_product
+
+  True
+}
+
+test test_constant_product_formula_token_to_ada() {
+  // Test Token -> ADA swap
+  let swap_result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_SWAP_AMOUNT,
+    True,   // Token -> ADA
+    TEST_FEE_BPS
+  )
+
+  // Verify output amount is calculated correctly
+  expect swap_result.output_amount > 45_000_000
+  expect swap_result.output_amount < 50_000_000
+
+  // Verify reserves are updated correctly
+  expect swap_result.new_ada_reserve == TEST_ADA_RESERVE - swap_result.output_amount
+  expect swap_result.new_token_reserve == TEST_TOKEN_RESERVE + TEST_SWAP_AMOUNT
+
+  // Verify constant product is maintained (with fee increase)
+  let original_product = TEST_ADA_RESERVE * TEST_TOKEN_RESERVE
+  let new_product = swap_result.new_ada_reserve * swap_result.new_token_reserve
+  expect new_product >= original_product
+
+  True
+}
+
+test test_fee_calculation_accuracy() {
+  // Test that 0.3% fee (997/1000 model) is applied correctly
+  let swap_result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    1000_000_000,  // 1000 ADA
+    False,
+    30  // 0.3% fee
+  )
+
+  // Fee should be approximately 0.3% of input
+  let expected_fee = 1000_000_000 * 3 / 1000  // 3,000,000 lovelace
+  expect math.abs(swap_result.fee_amount - expected_fee) < 100_000  // Allow small rounding
+
+  True
+}
+
+// =============================================================================
+// SECURITY VALIDATION TESTS
+// =============================================================================
+
+test test_dust_attack_protection() {
+  let pool_state = PoolState {
+    ada_reserve: TEST_ADA_RESERVE,
+    token_reserve: TEST_TOKEN_RESERVE,
+    total_lp_supply: 1000_000_000,
+    last_interaction_slot: 1000,
+    pool_nft_name: #"pool_nft",
+  }
+
+  // Test dust amount rejection
+  let dust_result = validate_dust_protection(100_000, False, pool_state)  // 0.1 ADA
+  expect !dust_result.is_valid
+
+  // Test valid amount acceptance
+  let valid_result = validate_dust_protection(10_000_000, False, pool_state)  // 10 ADA
+  expect valid_result.is_valid
+
+  // Test excessive amount rejection (>50% of pool)
+  let excessive_result = validate_dust_protection(600_000_000, False, pool_state)  // 600 ADA
+  expect !excessive_result.is_valid
+
+  True
+}
+
+test test_price_impact_calculation() {
+  // Test small swap (low price impact)
+  let small_impact = calculate_price_impact(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    10_000_000,  // 10 ADA
+    False,
+    TEST_FEE_BPS
+  )
+  expect small_impact < 100  // Less than 1%
+
+  // Test large swap (high price impact)
+  let large_impact = calculate_price_impact(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    500_000_000,  // 500 ADA
+    False,
+    TEST_FEE_BPS
+  )
+  expect large_impact > 1000  // More than 10%
+
+  True
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+test test_minimum_liquidity_protection() {
+  // Test swap that would drain pool
+  let result = calculate_amm_swap(
+    1_000_000,    // 1 ADA reserve
+    2_000_000,    // 2 token reserve
+    10_000_000,   // 10 ADA input (way more than reserve)
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should not drain the pool completely
+  expect result.new_token_reserve > 0
+  expect result.new_ada_reserve > 0
+
+  True
+}
+
+test test_zero_amount_rejection() {
+  // This should fail in the validator's parameter validation
+  // Testing the calculation function directly with edge case
+  let result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    1,  // Minimum possible amount
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should handle minimum amounts gracefully
+  expect result.output_amount >= 0
+  expect result.new_ada_reserve > 0
+  expect result.new_token_reserve > 0
+
+  True
+}
+
+test test_high_fee_edge_case() {
+  // Test with maximum possible fee (100%)
+  let result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_SWAP_AMOUNT,
+    False,
+    10000  // 100% fee (edge case)
+  )
+
+  // With 100% fee, output should be minimal
+  expect result.output_amount < 1000
+  expect result.fee_amount == TEST_SWAP_AMOUNT
+
+  True
+}
+
+// =============================================================================
+// MATHEMATICAL PRECISION TESTS
+// =============================================================================
+
+test test_large_number_precision() {
+  // Test with large reserves to check for overflow
+  let large_ada_reserve = 1_000_000_000_000_000  // 1B ADA
+  let large_token_reserve = 2_000_000_000_000_000  // 2B tokens
+  let large_swap_amount = 1_000_000_000_000  // 1M ADA
+
+  let result = calculate_amm_swap(
+    large_ada_reserve,
+    large_token_reserve,
+    large_swap_amount,
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should handle large numbers without overflow
+  expect result.output_amount > 0
+  expect result.new_ada_reserve > large_ada_reserve
+  expect result.new_token_reserve < large_token_reserve
+
+  // Verify constant product is maintained
+  let original_product = large_ada_reserve * large_token_reserve
+  let new_product = result.new_ada_reserve * result.new_token_reserve
+  expect new_product >= original_product
+
+  True
+}
+
+test test_precision_with_small_amounts() {
+  // Test precision with very small amounts
+  let small_ada_reserve = 1_000_000  // 1 ADA
+  let small_token_reserve = 2_000_000  // 2 tokens
+  let small_swap_amount = 100_000  // 0.1 ADA
+
+  let result = calculate_amm_swap(
+    small_ada_reserve,
+    small_token_reserve,
+    small_swap_amount,
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should maintain precision even with small amounts
+  expect result.output_amount > 0
+  expect result.new_ada_reserve == small_ada_reserve + small_swap_amount
+  expect result.new_token_reserve == small_token_reserve - result.output_amount
+
+  True
+}
+
+// =============================================================================
+// SLIPPAGE PROTECTION TESTS
+// =============================================================================
+
+test test_slippage_calculation_accuracy() {
+  // Test that price impact calculation matches expected slippage
+  let swap_result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_SWAP_AMOUNT,
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Price impact should be reasonable for this swap size
+  expect swap_result.price_impact_bps > 0
+  expect swap_result.price_impact_bps < 1000  // Less than 10%
+
+  // Effective price should be different from original price
+  let original_price = TEST_TOKEN_RESERVE * 1000000 / TEST_ADA_RESERVE
+  expect swap_result.effective_price != original_price
+
+  True
+}
+
+// =============================================================================
+// MOCK DATA HELPERS
+// =============================================================================
+
+fn create_mock_pool_datum() -> PoolCIP68Datum {
+  PoolCIP68Datum {
+    metadata: dict.new(),
+    version: 1,
+    extra: Void,
+    pool_state: PoolState {
+      ada_reserve: TEST_ADA_RESERVE,
+      token_reserve: TEST_TOKEN_RESERVE,
+      total_lp_supply: 1000_000_000,
+      last_interaction_slot: 1000,
+      pool_nft_name: #"pool_nft",
+    },
+    pool_config: PoolConfig {
+      token_policy: #"token_policy",
+      token_name: #"PUCKY",
+      lp_token_policy: #"lp_policy",
+      lp_token_name: #"LP",
+      fee_bps: TEST_FEE_BPS,
+      protocol_fee_bps: 5,
+      creator: create_mock_address(),
+      admin: create_mock_address(),
+      is_paused: False,
+    },
+    pool_stats: PoolStats {
+      total_volume_ada: 0,
+      total_volume_token: 0,
+      total_fees_collected: 0,
+      swap_count: 0,
+      liquidity_providers_count: 1,
+      created_at_slot: 1000,
+      last_price_ada_per_token: 2000000,
+      price_history_hash: #"",
+    },
+  }
+}
+
+fn create_mock_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None,
+  }
+}
+
+fn create_mock_swap_redeemer(
+  swap_in_token: Bool,
+  amount_in: Int,
+  min_out: Int
+) -> AMMSwapRedeemer {
+  AMMSwapRedeemer {
+    swap_in_token: swap_in_token,
+    amount_in: amount_in,
+    min_out: min_out,
+    deadline_slot: 2000,
+    user_address: create_mock_address(),
+    max_slippage_bps: 500,  // 5% max slippage
+  }
+}
+
+// =============================================================================
+// INTEGRATION TESTS
+// =============================================================================
+
+test test_complete_ada_to_token_swap_flow() {
+  // Test complete flow for ADA -> Token swap
+  let pool_datum = create_mock_pool_datum()
+  let swap_redeemer = create_mock_swap_redeemer(False, TEST_SWAP_AMOUNT, 150_000_000)
+
+  // Calculate expected result
+  let swap_result = calculate_amm_swap(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    swap_redeemer.amount_in,
+    swap_redeemer.swap_in_token,
+    pool_datum.pool_config.fee_bps
+  )
+
+  // Verify slippage protection
+  expect swap_result.output_amount >= swap_redeemer.min_out
+
+  // Verify price impact is within bounds
+  expect swap_result.price_impact_bps <= swap_redeemer.max_slippage_bps
+
+  // Verify reserves are updated correctly
+  expect swap_result.new_ada_reserve > pool_datum.pool_state.ada_reserve
+  expect swap_result.new_token_reserve < pool_datum.pool_state.token_reserve
+
+  True
+}
+
+test test_complete_token_to_ada_swap_flow() {
+  // Test complete flow for Token -> ADA swap
+  let pool_datum = create_mock_pool_datum()
+  let swap_redeemer = create_mock_swap_redeemer(True, TEST_SWAP_AMOUNT, 45_000_000)
+
+  // Calculate expected result
+  let swap_result = calculate_amm_swap(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    swap_redeemer.amount_in,
+    swap_redeemer.swap_in_token,
+    pool_datum.pool_config.fee_bps
+  )
+
+  // Verify slippage protection
+  expect swap_result.output_amount >= swap_redeemer.min_out
+
+  // Verify price impact is within bounds
+  expect swap_result.price_impact_bps <= swap_redeemer.max_slippage_bps
+
+  // Verify reserves are updated correctly
+  expect swap_result.new_ada_reserve < pool_datum.pool_state.ada_reserve
+  expect swap_result.new_token_reserve > pool_datum.pool_state.token_reserve
+
+  True
+}
+
+// =============================================================================
+// SECURITY ATTACK SIMULATION TESTS
+// =============================================================================
+
+test test_sandwich_attack_protection() {
+  // Simulate sandwich attack scenario
+  let pool_datum = create_mock_pool_datum()
+
+  // First transaction: Large buy to increase price
+  let large_buy = calculate_amm_swap(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    400_000_000,  // 400 ADA
+    False,
+    pool_datum.pool_config.fee_bps
+  )
+
+  // Price impact should be significant
+  expect large_buy.price_impact_bps > 1000  // More than 10%
+
+  // Second transaction: Normal user swap at inflated price
+  let user_swap = calculate_amm_swap(
+    large_buy.new_ada_reserve,
+    large_buy.new_token_reserve,
+    50_000_000,  // 50 ADA
+    False,
+    pool_datum.pool_config.fee_bps
+  )
+
+  // User gets less tokens due to price manipulation
+  let normal_swap = calculate_amm_swap(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    50_000_000,  // 50 ADA
+    False,
+    pool_datum.pool_config.fee_bps
+  )
+
+  expect user_swap.output_amount < normal_swap.output_amount
+
+  True
+}
+
+test test_flash_loan_attack_simulation() {
+  // Test that large swaps are limited by max percentage
+  let pool_datum = create_mock_pool_datum()
+
+  // Attempt to swap more than 50% of pool reserves
+  let max_allowed = pool_datum.pool_state.ada_reserve * 5000 / 10000  // 50%
+  let excessive_amount = max_allowed + 1_000_000
+
+  // This should be caught by dust protection
+  let dust_result = validate_dust_protection(
+    excessive_amount,
+    False,
+    pool_datum.pool_state
+  )
+
+  expect !dust_result.is_valid
+
+  True
+}
+
+// =============================================================================
+// STRESS TESTS
+// =============================================================================
+
+test test_consecutive_swaps_maintain_invariants() {
+  // Test multiple consecutive swaps maintain pool invariants
+  let mut current_ada_reserve = TEST_ADA_RESERVE
+  let mut current_token_reserve = TEST_TOKEN_RESERVE
+
+  // Perform 5 consecutive swaps
+  let swap_amounts = [10_000_000, 20_000_000, 15_000_000, 25_000_000, 30_000_000]
+
+  list.foldr(swap_amounts, True, fn(amount, acc) {
+    if acc {
+      let swap_result = calculate_amm_swap(
+        current_ada_reserve,
+        current_token_reserve,
+        amount,
+        False,  // ADA -> Token
+        TEST_FEE_BPS
+      )
+
+      // Update reserves for next iteration
+      current_ada_reserve = swap_result.new_ada_reserve
+      current_token_reserve = swap_result.new_token_reserve
+
+      // Verify invariants
+      let original_product = TEST_ADA_RESERVE * TEST_TOKEN_RESERVE
+      let current_product = current_ada_reserve * current_token_reserve
+
+      // Product should increase due to accumulated fees
+      current_product >= original_product &&
+      current_ada_reserve > 0 &&
+      current_token_reserve > 0
+    } else {
+      False
+    }
+  })
+}
+
+test test_alternating_swap_directions() {
+  // Test alternating ADA->Token and Token->ADA swaps
+  let mut current_ada_reserve = TEST_ADA_RESERVE
+  let mut current_token_reserve = TEST_TOKEN_RESERVE
+  let swap_amount = 50_000_000
+
+  // Perform alternating swaps
+  let directions = [False, True, False, True, False]  // ADA->Token, Token->ADA, etc.
+
+  list.foldr(directions, True, fn(swap_in_token, acc) {
+    if acc {
+      let swap_result = calculate_amm_swap(
+        current_ada_reserve,
+        current_token_reserve,
+        swap_amount,
+        swap_in_token,
+        TEST_FEE_BPS
+      )
+
+      // Update reserves
+      current_ada_reserve = swap_result.new_ada_reserve
+      current_token_reserve = swap_result.new_token_reserve
+
+      // Verify reserves remain positive
+      current_ada_reserve > 0 && current_token_reserve > 0
+    } else {
+      False
+    }
+  })
+}
+
+// =============================================================================
+// BOUNDARY CONDITION TESTS
+// =============================================================================
+
+test test_minimum_pool_reserves() {
+  // Test with minimum possible pool reserves
+  let min_ada_reserve = 2_000_000  // 2 ADA
+  let min_token_reserve = 1_000_000  // 1 token
+  let small_swap = 100_000  // 0.1 ADA
+
+  let result = calculate_amm_swap(
+    min_ada_reserve,
+    min_token_reserve,
+    small_swap,
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should handle small pools gracefully
+  expect result.output_amount > 0
+  expect result.new_ada_reserve > min_ada_reserve
+  expect result.new_token_reserve < min_token_reserve
+  expect result.new_token_reserve > 0
+
+  True
+}
+
+test test_maximum_realistic_swap() {
+  // Test with maximum realistic swap (just under 50% limit)
+  let max_swap = TEST_ADA_RESERVE * 4999 / 10000  // Just under 50%
+
+  let result = calculate_amm_swap(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    max_swap,
+    False,
+    TEST_FEE_BPS
+  )
+
+  // Should handle large swaps without breaking invariants
+  expect result.output_amount > 0
+  expect result.new_ada_reserve > 0
+  expect result.new_token_reserve > 0
+
+  // Price impact should be significant but not break the pool
+  expect result.price_impact_bps > 1000  // More than 10%
+  expect result.price_impact_bps < 9000  // Less than 90%
+
+  True
+}

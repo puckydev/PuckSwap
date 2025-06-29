@@ -1,0 +1,26 @@
+// Simple test validator to verify Aiken compilation
+use aiken/transaction.{ScriptContext, Spend}
+
+// Simple test datum
+pub type TestDatum {
+  value: Int,
+}
+
+// Simple test redeemer
+pub type TestRedeemer {
+  action: Int,
+}
+
+// Simple test validator
+validator test_validator(
+  ctx: ScriptContext,
+  datum: TestDatum,
+  redeemer: TestRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(_) -> {
+      datum.value > 0 && redeemer.action > 0
+    }
+    _ -> False
+  }
+}

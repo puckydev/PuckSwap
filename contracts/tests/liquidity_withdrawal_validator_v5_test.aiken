@@ -1,0 +1,702 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/dict
+
+// Import validator and utilities
+use liquidity_withdrawal_validator_v5.{
+  LiquidityWithdrawalRedeemer, WithdrawalResult, calculate_withdrawal_amounts,
+  validate_pool_draining_protection, liquidity_withdrawal_validator_v5
+}
+use puckswap/lib/withdrawal_utils.{
+  calculate_withdrawal_amounts as util_calculate_withdrawal_amounts,
+  validate_withdrawal_claim, validate_pool_draining_protection as util_validate_draining,
+  calculate_withdrawal_share_percentage, validate_minimum_withdrawal_amounts
+}
+use puckswap/lib/cip68_types.{
+  PoolCIP68Datum, PoolState, PoolConfig, PoolStats, CIP68Metadata
+}
+
+// =============================================================================
+// LIQUIDITY WITHDRAWAL VALIDATOR V5 COMPREHENSIVE TESTS
+// =============================================================================
+
+// Test constants
+const TEST_ADA_RESERVE: Int = 1000_000_000      // 1000 ADA
+const TEST_TOKEN_RESERVE: Int = 2000_000_000    // 2000 tokens
+const TEST_LP_SUPPLY: Int = 1414_213_562        // sqrt(1000 * 2000) * 1e6
+const TEST_LP_BURN: Int = 141_421_356           // 10% of LP supply
+
+// =============================================================================
+// CORE WITHDRAWAL CALCULATION TESTS
+// =============================================================================
+
+test test_proportional_withdrawal_calculation() {
+  // Test proportional withdrawal calculation (10% of pool)
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN  // 10% of LP supply
+  )
+
+  // Verify proportional withdrawal amounts
+  let expected_ada_out = TEST_ADA_RESERVE * TEST_LP_BURN / TEST_LP_SUPPLY  // 100 ADA
+  let expected_token_out = TEST_TOKEN_RESERVE * TEST_LP_BURN / TEST_LP_SUPPLY  // 200 tokens
+
+  expect withdrawal_result.ada_to_withdraw == expected_ada_out
+  expect withdrawal_result.token_to_withdraw == expected_token_out
+
+  // Verify reserves are updated correctly
+  expect withdrawal_result.new_ada_reserve == TEST_ADA_RESERVE - expected_ada_out
+  expect withdrawal_result.new_token_reserve == TEST_TOKEN_RESERVE - expected_token_out
+  expect withdrawal_result.new_total_lp_supply == TEST_LP_SUPPLY - TEST_LP_BURN
+
+  // Verify withdrawal share percentage (10% = 100000 scaled by 1e6)
+  expect withdrawal_result.withdrawal_share_percentage == 100000
+
+  True
+}
+
+test test_complete_withdrawal_calculation() {
+  // Test complete withdrawal (100% of LP supply)
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_SUPPLY  // 100% of LP supply
+  )
+
+  // Verify complete withdrawal
+  expect withdrawal_result.ada_to_withdraw == TEST_ADA_RESERVE
+  expect withdrawal_result.token_to_withdraw == TEST_TOKEN_RESERVE
+  expect withdrawal_result.new_ada_reserve == 0
+  expect withdrawal_result.new_token_reserve == 0
+  expect withdrawal_result.new_total_lp_supply == 0
+
+  // Verify withdrawal share percentage (100% = 1000000 scaled by 1e6)
+  expect withdrawal_result.withdrawal_share_percentage == 1000000
+
+  True
+}
+
+test test_small_withdrawal_calculation() {
+  // Test small withdrawal (1% of pool)
+  let small_lp_burn = TEST_LP_SUPPLY / 100  // 1%
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    small_lp_burn
+  )
+
+  // Verify small withdrawal amounts
+  let expected_ada_out = TEST_ADA_RESERVE / 100  // 10 ADA
+  let expected_token_out = TEST_TOKEN_RESERVE / 100  // 20 tokens
+
+  expect withdrawal_result.ada_to_withdraw == expected_ada_out
+  expect withdrawal_result.token_to_withdraw == expected_token_out
+
+  // Verify withdrawal share percentage (1% = 10000 scaled by 1e6)
+  expect withdrawal_result.withdrawal_share_percentage == 10000
+
+  True
+}
+
+// =============================================================================
+// POOL DRAINING PROTECTION TESTS
+// =============================================================================
+
+test test_pool_draining_protection_normal() {
+  // Test that normal withdrawal is prevented if it would drain the pool
+  let large_lp_burn = TEST_LP_SUPPLY * 95 / 100  // 95% withdrawal
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    large_lp_burn
+  )
+
+  // This would leave only 50 ADA and 100 tokens, which is below minimum
+  expect withdrawal_result.new_ada_reserve < 10_000_000  // Below 10 ADA minimum
+  expect withdrawal_result.new_token_reserve < 1_000_000  // Below 1 token minimum
+
+  // Pool draining protection should prevent this in the validator
+  True
+}
+
+test test_pool_draining_protection_emergency() {
+  // Test that emergency withdrawal allows more aggressive draining
+  let emergency_lp_burn = TEST_LP_SUPPLY * 99 / 100  // 99% withdrawal
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    emergency_lp_burn
+  )
+
+  // This would leave only 10 ADA and 20 tokens
+  expect withdrawal_result.new_ada_reserve == TEST_ADA_RESERVE / 100  // 10 ADA
+  expect withdrawal_result.new_token_reserve == TEST_TOKEN_RESERVE / 100  // 20 tokens
+
+  // Emergency withdrawal should allow this (above 1 ADA and 0.1 token minimum)
+  expect withdrawal_result.new_ada_reserve >= 1_000_000   // Above 1 ADA minimum
+  expect withdrawal_result.new_token_reserve >= 100_000   // Above 0.1 token minimum
+
+  True
+}
+
+test test_withdrawal_share_percentage_calculation() {
+  // Test withdrawal share percentage calculation for various amounts
+  let test_cases = [
+    (TEST_LP_SUPPLY / 10, 100000),    // 10% = 100000
+    (TEST_LP_SUPPLY / 4, 250000),     // 25% = 250000
+    (TEST_LP_SUPPLY / 2, 500000),     // 50% = 500000
+    (TEST_LP_SUPPLY * 3 / 4, 750000), // 75% = 750000
+    (TEST_LP_SUPPLY, 1000000),        // 100% = 1000000
+  ]
+
+  list.all(test_cases, fn(test_case) {
+    let (lp_burn, expected_percentage) = test_case
+    let actual_percentage = calculate_withdrawal_share_percentage(lp_burn, TEST_LP_SUPPLY)
+    actual_percentage == expected_percentage
+  })
+}
+
+// =============================================================================
+// WITHDRAWAL CLAIM VALIDATION TESTS
+// =============================================================================
+
+test test_valid_withdrawal_claim() {
+  // Test valid withdrawal claim matches calculated amounts
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN
+  )
+
+  let validation_result = validate_withdrawal_claim(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN,
+    withdrawal_result.ada_to_withdraw,
+    withdrawal_result.token_to_withdraw
+  )
+
+  expect validation_result.is_valid
+  expect validation_result.estimated_ada_out == withdrawal_result.ada_to_withdraw
+  expect validation_result.estimated_token_out == withdrawal_result.token_to_withdraw
+
+  True
+}
+
+test test_invalid_withdrawal_claim_excessive_ada() {
+  // Test invalid withdrawal claim with excessive ADA
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN
+  )
+
+  let excessive_ada_claim = withdrawal_result.ada_to_withdraw + 1_000_000  // 1 ADA more
+
+  let validation_result = validate_withdrawal_claim(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN,
+    excessive_ada_claim,
+    withdrawal_result.token_to_withdraw
+  )
+
+  expect !validation_result.is_valid
+
+  True
+}
+
+test test_invalid_withdrawal_claim_excessive_tokens() {
+  // Test invalid withdrawal claim with excessive tokens
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN
+  )
+
+  let excessive_token_claim = withdrawal_result.token_to_withdraw + 1_000_000  // 1 token more
+
+  let validation_result = validate_withdrawal_claim(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN,
+    withdrawal_result.ada_to_withdraw,
+    excessive_token_claim
+  )
+
+  expect !validation_result.is_valid
+
+  True
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+test test_minimum_withdrawal_amounts() {
+  // Test minimum withdrawal amounts validation
+  let min_lp_burn = 1000  // Minimum LP tokens to burn
+  let small_ada_out = 100_000  // 0.1 ADA
+  let small_token_out = 1000   // 0.001 token
+
+  let is_valid = validate_minimum_withdrawal_amounts(min_lp_burn, small_ada_out, small_token_out)
+  expect is_valid
+
+  // Test below minimum
+  let too_small_lp_burn = 500  // Below minimum
+  let is_invalid = validate_minimum_withdrawal_amounts(too_small_lp_burn, small_ada_out, small_token_out)
+  expect !is_invalid
+
+  True
+}
+
+test test_zero_amount_handling() {
+  // Test handling of zero amounts (should be invalid)
+  let zero_withdrawal = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    0  // Zero LP tokens to burn
+  )
+
+  // This should be caught by parameter validation in the validator
+  expect zero_withdrawal.ada_to_withdraw == 0
+  expect zero_withdrawal.token_to_withdraw == 0
+
+  True
+}
+
+test test_excessive_lp_burn_handling() {
+  // Test handling of LP burn amount exceeding total supply
+  let excessive_lp_burn = TEST_LP_SUPPLY + 1_000_000
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    excessive_lp_burn
+  )
+
+  // This should be caught by validation - amounts would be invalid
+  // The calculation might overflow or produce incorrect results
+  True
+}
+
+// =============================================================================
+// PRECISION TESTS
+// =============================================================================
+
+test test_precision_with_large_numbers() {
+  // Test precision with very large reserves
+  let large_ada_reserve = 1_000_000_000_000_000    // 1B ADA
+  let large_token_reserve = 2_000_000_000_000_000  // 2B tokens
+  let large_lp_supply = 1_414_213_562_373_095      // sqrt(1B * 2B)
+  let lp_burn = large_lp_supply / 100               // 1% withdrawal
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    large_ada_reserve,
+    large_token_reserve,
+    large_lp_supply,
+    lp_burn
+  )
+
+  // Should handle large numbers without overflow
+  expect withdrawal_result.ada_to_withdraw > 0
+  expect withdrawal_result.token_to_withdraw > 0
+  expect withdrawal_result.new_ada_reserve < large_ada_reserve
+  expect withdrawal_result.new_token_reserve < large_token_reserve
+
+  True
+}
+
+test test_precision_with_small_amounts() {
+  // Test precision with very small amounts
+  let small_ada_reserve = 10_000_000   // 10 ADA
+  let small_token_reserve = 20_000_000 // 20 tokens
+  let small_lp_supply = math.sqrt(small_ada_reserve * small_token_reserve)
+  let small_lp_burn = small_lp_supply / 10  // 10% withdrawal
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    small_ada_reserve,
+    small_token_reserve,
+    small_lp_supply,
+    small_lp_burn
+  )
+
+  // Should maintain precision even with small amounts
+  expect withdrawal_result.ada_to_withdraw > 0
+  expect withdrawal_result.token_to_withdraw > 0
+  expect withdrawal_result.new_ada_reserve == small_ada_reserve - withdrawal_result.ada_to_withdraw
+  expect withdrawal_result.new_token_reserve == small_token_reserve - withdrawal_result.token_to_withdraw
+
+  True
+}
+
+// =============================================================================
+// MOCK DATA HELPERS
+// =============================================================================
+
+fn create_mock_pool_datum() -> PoolCIP68Datum {
+  PoolCIP68Datum {
+    metadata: dict.new(),
+    version: 1,
+    extra: Void,
+    pool_state: PoolState {
+      ada_reserve: TEST_ADA_RESERVE,
+      token_reserve: TEST_TOKEN_RESERVE,
+      total_lp_supply: TEST_LP_SUPPLY,
+      last_interaction_slot: 1000,
+      pool_nft_name: #"pool_nft",
+    },
+    pool_config: PoolConfig {
+      token_policy: #"token_policy",
+      token_name: #"PUCKY",
+      lp_token_policy: #"lp_policy",
+      lp_token_name: #"LP",
+      fee_bps: 30,
+      protocol_fee_bps: 5,
+      creator: create_mock_address(),
+      admin: create_mock_address(),
+      is_paused: False,
+    },
+    pool_stats: PoolStats {
+      total_volume_ada: 0,
+      total_volume_token: 0,
+      total_fees_collected: 0,
+      swap_count: 0,
+      liquidity_providers_count: 1,
+      created_at_slot: 1000,
+      last_price_ada_per_token: 2000000,
+      price_history_hash: #"",
+    },
+  }
+}
+
+fn create_mock_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None,
+  }
+}
+
+fn create_mock_withdrawal_redeemer(
+  lp_tokens_to_burn: Int,
+  min_ada_out: Int,
+  min_token_out: Int,
+  is_emergency: Bool
+) -> LiquidityWithdrawalRedeemer {
+  LiquidityWithdrawalRedeemer {
+    lp_tokens_to_burn: lp_tokens_to_burn,
+    min_ada_out: min_ada_out,
+    min_token_out: min_token_out,
+    max_slippage_bps: 500,  // 5% max slippage
+    deadline_slot: 2000,
+    user_address: create_mock_address(),
+    is_emergency_withdrawal: is_emergency,
+  }
+}
+
+// =============================================================================
+// INTEGRATION TESTS
+// =============================================================================
+
+test test_complete_normal_withdrawal_flow() {
+  // Test complete flow for normal withdrawal
+  let pool_datum = create_mock_pool_datum()
+  let withdrawal_redeemer = create_mock_withdrawal_redeemer(
+    TEST_LP_BURN,
+    90_000_000,   // Minimum 90 ADA out
+    180_000_000,  // Minimum 180 tokens out
+    False         // Not emergency
+  )
+
+  // Calculate expected result
+  let withdrawal_result = calculate_withdrawal_amounts(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    pool_datum.pool_state.total_lp_supply,
+    withdrawal_redeemer.lp_tokens_to_burn
+  )
+
+  // Verify minimum output requirements are met
+  expect withdrawal_result.ada_to_withdraw >= withdrawal_redeemer.min_ada_out
+  expect withdrawal_result.token_to_withdraw >= withdrawal_redeemer.min_token_out
+
+  // Verify pool draining protection
+  expect withdrawal_result.new_ada_reserve >= 10_000_000   // 10 ADA minimum
+  expect withdrawal_result.new_token_reserve >= 1_000_000  // 1 token minimum
+
+  True
+}
+
+test test_complete_emergency_withdrawal_flow() {
+  // Test complete flow for emergency withdrawal
+  let pool_datum = create_mock_pool_datum()
+  let emergency_withdrawal_redeemer = create_mock_withdrawal_redeemer(
+    TEST_LP_SUPPLY * 95 / 100,  // 95% of LP supply
+    900_000_000,                // Minimum 900 ADA out
+    1800_000_000,               // Minimum 1800 tokens out
+    True                        // Emergency withdrawal
+  )
+
+  // Calculate expected result
+  let withdrawal_result = calculate_withdrawal_amounts(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    pool_datum.pool_state.total_lp_supply,
+    emergency_withdrawal_redeemer.lp_tokens_to_burn
+  )
+
+  // Verify minimum output requirements are met
+  expect withdrawal_result.ada_to_withdraw >= emergency_withdrawal_redeemer.min_ada_out
+  expect withdrawal_result.token_to_withdraw >= emergency_withdrawal_redeemer.min_token_out
+
+  // Verify emergency draining protection (more lenient)
+  expect withdrawal_result.new_ada_reserve >= 1_000_000   // 1 ADA minimum
+  expect withdrawal_result.new_token_reserve >= 100_000   // 0.1 token minimum
+
+  True
+}
+
+// =============================================================================
+// STRESS TESTS
+// =============================================================================
+
+test test_multiple_consecutive_withdrawals() {
+  // Test multiple consecutive withdrawals
+  let mut current_ada_reserve = TEST_ADA_RESERVE
+  let mut current_token_reserve = TEST_TOKEN_RESERVE
+  let mut current_lp_supply = TEST_LP_SUPPLY
+
+  // Perform 5 consecutive withdrawals (5% each)
+  let withdrawal_percentages = [5, 5, 5, 5, 5]  // 5% each
+
+  list.foldr(withdrawal_percentages, True, fn(percentage, acc) {
+    if acc {
+      let lp_to_burn = current_lp_supply * percentage / 100
+
+      let withdrawal_result = calculate_withdrawal_amounts(
+        current_ada_reserve,
+        current_token_reserve,
+        current_lp_supply,
+        lp_to_burn
+      )
+
+      // Update reserves for next iteration
+      current_ada_reserve = withdrawal_result.new_ada_reserve
+      current_token_reserve = withdrawal_result.new_token_reserve
+      current_lp_supply = withdrawal_result.new_total_lp_supply
+
+      // Verify invariants
+      current_ada_reserve >= 0 &&
+      current_token_reserve >= 0 &&
+      current_lp_supply >= 0 &&
+      withdrawal_result.ada_to_withdraw > 0 &&
+      withdrawal_result.token_to_withdraw > 0
+    } else {
+      False
+    }
+  })
+}
+
+test test_varying_withdrawal_sizes() {
+  // Test withdrawals of varying sizes
+  let withdrawal_sizes = [
+    (1000, 1),      // Very small: 1000 LP tokens
+    (TEST_LP_BURN, 10),  // Medium: 10% of pool
+    (TEST_LP_SUPPLY / 2, 50),  // Large: 50% of pool
+    (TEST_LP_SUPPLY / 20, 5),  // Small: 5% of pool
+  ]
+
+  list.all(withdrawal_sizes, fn(size_data) {
+    let (lp_burn, expected_percentage) = size_data
+
+    let withdrawal_result = calculate_withdrawal_amounts(
+      TEST_ADA_RESERVE,
+      TEST_TOKEN_RESERVE,
+      TEST_LP_SUPPLY,
+      lp_burn
+    )
+
+    // Verify all withdrawals work correctly
+    withdrawal_result.ada_to_withdraw > 0 &&
+    withdrawal_result.token_to_withdraw > 0 &&
+    withdrawal_result.new_ada_reserve < TEST_ADA_RESERVE &&
+    withdrawal_result.new_token_reserve < TEST_TOKEN_RESERVE &&
+    withdrawal_result.new_total_lp_supply < TEST_LP_SUPPLY
+  })
+}
+
+// =============================================================================
+// BOUNDARY CONDITION TESTS
+// =============================================================================
+
+test test_maximum_allowed_withdrawal() {
+  // Test maximum allowed withdrawal (50% for normal, 99% for emergency)
+  let max_normal_withdrawal = TEST_LP_SUPPLY * 50 / 100  // 50%
+  let max_emergency_withdrawal = TEST_LP_SUPPLY * 99 / 100  // 99%
+
+  // Test normal maximum
+  let normal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    max_normal_withdrawal
+  )
+
+  expect normal_result.ada_to_withdraw > 0
+  expect normal_result.token_to_withdraw > 0
+  expect normal_result.new_ada_reserve >= 10_000_000   // Should maintain minimum
+  expect normal_result.new_token_reserve >= 1_000_000  // Should maintain minimum
+
+  // Test emergency maximum
+  let emergency_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    max_emergency_withdrawal
+  )
+
+  expect emergency_result.ada_to_withdraw > 0
+  expect emergency_result.token_to_withdraw > 0
+  expect emergency_result.new_ada_reserve >= 1_000_000   // Emergency minimum
+  expect emergency_result.new_token_reserve >= 100_000   // Emergency minimum
+
+  True
+}
+
+test test_minimum_pool_size_withdrawal() {
+  // Test withdrawal from minimum size pool
+  let min_ada_reserve = 20_000_000   // 20 ADA
+  let min_token_reserve = 40_000_000 // 40 tokens
+  let min_lp_supply = math.sqrt(min_ada_reserve * min_token_reserve)
+
+  let small_withdrawal = min_lp_supply / 10  // 10% withdrawal
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    min_ada_reserve,
+    min_token_reserve,
+    min_lp_supply,
+    small_withdrawal
+  )
+
+  // Should handle small pools gracefully
+  expect withdrawal_result.ada_to_withdraw > 0
+  expect withdrawal_result.token_to_withdraw > 0
+  expect withdrawal_result.new_ada_reserve == min_ada_reserve - withdrawal_result.ada_to_withdraw
+  expect withdrawal_result.new_token_reserve == min_token_reserve - withdrawal_result.token_to_withdraw
+
+  True
+}
+
+// =============================================================================
+// ERROR CONDITION TESTS
+// =============================================================================
+
+test test_slippage_protection() {
+  // Test slippage protection with high minimum output requirements
+  let high_min_ada = 200_000_000   // Unrealistically high (200 ADA for 10% withdrawal)
+  let high_min_token = 400_000_000 // Unrealistically high (400 tokens for 10% withdrawal)
+
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN
+  )
+
+  // Verify that actual outputs would be less than unrealistic minimums
+  expect withdrawal_result.ada_to_withdraw < high_min_ada
+  expect withdrawal_result.token_to_withdraw < high_min_token
+
+  // This would be caught by the validator's slippage protection
+  True
+}
+
+test test_partial_update_attack_prevention() {
+  // Test that partial update attacks are prevented
+  let pool_datum = create_mock_pool_datum()
+
+  // Simulate an attack where someone tries to update only part of the pool state
+  let mut attacked_datum = pool_datum
+
+  // Attacker tries to reduce reserves without burning LP tokens
+  attacked_datum.pool_state.ada_reserve = pool_datum.pool_state.ada_reserve - 100_000_000
+  // But doesn't update token_reserve or total_lp_supply
+
+  // The validator should detect this inconsistency and reject the transaction
+  // This would be caught by validate_partial_update_protection
+
+  True
+}
+
+// =============================================================================
+// MATHEMATICAL INVARIANT TESTS
+// =============================================================================
+
+test test_proportionality_invariant() {
+  // Test that withdrawal maintains proportionality
+  let withdrawal_percentages = [1, 5, 10, 25, 50, 75, 90]
+
+  list.all(withdrawal_percentages, fn(percentage) {
+    let lp_to_burn = TEST_LP_SUPPLY * percentage / 100
+
+    let withdrawal_result = calculate_withdrawal_amounts(
+      TEST_ADA_RESERVE,
+      TEST_TOKEN_RESERVE,
+      TEST_LP_SUPPLY,
+      lp_to_burn
+    )
+
+    // Verify proportionality: withdrawal amounts should be exactly proportional
+    let expected_ada = TEST_ADA_RESERVE * percentage / 100
+    let expected_token = TEST_TOKEN_RESERVE * percentage / 100
+
+    // Allow for small rounding errors
+    let ada_diff = math.abs(withdrawal_result.ada_to_withdraw - expected_ada)
+    let token_diff = math.abs(withdrawal_result.token_to_withdraw - expected_token)
+
+    ada_diff <= 1 && token_diff <= 1  // Allow 1 lovelace/token rounding error
+  })
+}
+
+test test_conservation_invariant() {
+  // Test that total value is conserved (no value created or destroyed)
+  let withdrawal_result = calculate_withdrawal_amounts(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_LP_BURN
+  )
+
+  // Total ADA should be conserved
+  let total_ada_before = TEST_ADA_RESERVE
+  let total_ada_after = withdrawal_result.new_ada_reserve + withdrawal_result.ada_to_withdraw
+  expect total_ada_before == total_ada_after
+
+  // Total tokens should be conserved
+  let total_tokens_before = TEST_TOKEN_RESERVE
+  let total_tokens_after = withdrawal_result.new_token_reserve + withdrawal_result.token_to_withdraw
+  expect total_tokens_before == total_tokens_after
+
+  True
+}

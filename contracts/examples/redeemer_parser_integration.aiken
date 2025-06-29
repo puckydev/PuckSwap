@@ -1,0 +1,467 @@
+// Example integration of redeemer parser with PuckSwap validators
+// This shows how to integrate the redeemer parser into existing validator code
+
+use aiken/transaction.{ScriptContext, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{Value, PolicyId, AssetName}
+use aiken/list
+
+// Import redeemer parser
+use puckswap/lib/redeemer_parser.{
+  PoolRedeemer, SwapRedeemer, LPRedeemer, FactoryRedeemer,
+  ParseResult, Success, Error,
+  parse_pool_redeemer, parse_swap_redeemer, parse_lp_redeemer, parse_factory_redeemer,
+  validate_redeemer_context, validate_swap_amounts, validate_liquidity_amounts,
+  error_to_string
+}
+
+// Import existing types
+use puckswap/lib/cip68_types.{PoolCIP68Datum, PoolState, PoolConfig}
+
+// =============================================================================
+// ENHANCED POOL VALIDATOR WITH REDEEMER PARSER
+// =============================================================================
+
+// Pool datum for basic operations
+type PoolDatum {
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_total_supply: Int,
+  fee_bps: Int,
+}
+
+// Enhanced pool validator using redeemer parser
+validator enhanced_pool_validator(
+  ctx: ScriptContext, 
+  datum: PoolDatum, 
+  redeemer_data: Data
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Parse the redeemer using our parser
+      when parse_pool_redeemer(redeemer_data) is {
+        Success(redeemer) -> {
+          // Validate redeemer against context first
+          when validate_redeemer_context(redeemer, ctx) is {
+            Success(True) -> {
+              // Find pool input and output
+              expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+              expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+              
+              // Handle specific operations with parsed redeemer
+              handle_pool_operation(redeemer, pool_input, pool_output, datum, ctx)
+            }
+            Success(False) -> {
+              trace "Redeemer context validation failed"
+              False
+            }
+            Error(error) -> {
+              trace error_to_string(error)
+              False
+            }
+          }
+        }
+        Error(error) -> {
+          trace "Failed to parse pool redeemer: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    _ -> False
+  }
+}
+
+// Handle different pool operations with parsed redeemer
+fn handle_pool_operation(
+  redeemer: PoolRedeemer,
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  when redeemer is {
+    PoolRedeemer::Swap { input_amount, min_output, deadline, recipient } -> {
+      // Validate swap amounts first
+      when validate_swap_amounts(input_amount, min_output, 1000) is {
+        Success(True) -> {
+          validate_enhanced_swap_operation(
+            pool_input, pool_output, datum, 
+            input_amount, min_output, deadline, recipient, ctx
+          )
+        }
+        Error(error) -> {
+          trace "Swap amount validation failed: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    
+    PoolRedeemer::AddLiquidity { ada_amount, token_amount, min_lp_tokens, deadline } -> {
+      // Validate liquidity amounts first
+      when validate_liquidity_amounts(ada_amount, token_amount, min_lp_tokens) is {
+        Success(True) -> {
+          validate_enhanced_add_liquidity_operation(
+            pool_input, pool_output, datum,
+            ada_amount, token_amount, min_lp_tokens, deadline, ctx
+          )
+        }
+        Error(error) -> {
+          trace "Liquidity amount validation failed: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    
+    PoolRedeemer::RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, deadline } -> {
+      validate_enhanced_remove_liquidity_operation(
+        pool_input, pool_output, datum,
+        lp_tokens, min_ada_out, min_token_out, deadline, ctx
+      )
+    }
+    
+    PoolRedeemer::CreatePool { initial_ada, initial_token, fee_bps } -> {
+      validate_enhanced_pool_creation(
+        pool_input, pool_output, datum,
+        initial_ada, initial_token, fee_bps, ctx
+      )
+    }
+    
+    PoolRedeemer::EmergencyPause -> {
+      validate_emergency_pause(pool_input, pool_output, datum, ctx)
+    }
+    
+    PoolRedeemer::EmergencyUnpause -> {
+      validate_emergency_unpause(pool_input, pool_output, datum, ctx)
+    }
+  }
+}
+
+// =============================================================================
+// ENHANCED CIP-68 SWAP VALIDATOR WITH REDEEMER PARSER
+// =============================================================================
+
+// Enhanced CIP-68 swap validator using redeemer parser
+validator enhanced_cip68_swap_validator(
+  ctx: ScriptContext,
+  datum: PoolCIP68Datum,
+  redeemer_data: Data
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Parse the enhanced swap redeemer
+      when parse_swap_redeemer(redeemer_data) is {
+        Success(redeemer) -> {
+          // Validate swap amounts
+          when validate_swap_amounts(redeemer.amount_in, redeemer.min_out, 1000) is {
+            Success(True) -> {
+              // Find pool input and output
+              expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+              expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+              
+              // Validate CIP-68 enhanced swap operation
+              validate_cip68_enhanced_swap_operation(
+                pool_input, pool_output, datum, redeemer, ctx
+              )
+            }
+            Error(error) -> {
+              trace "CIP-68 swap amount validation failed: " <> error_to_string(error)
+              False
+            }
+          }
+        }
+        Error(error) -> {
+          trace "Failed to parse CIP-68 swap redeemer: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// ENHANCED LP POLICY WITH REDEEMER PARSER
+// =============================================================================
+
+// Enhanced LP token policy using redeemer parser
+validator enhanced_lp_policy(
+  pool_validator_hash: ByteArray,
+  ctx: ScriptContext,
+  redeemer_data: Data
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Parse the LP redeemer
+      when parse_lp_redeemer(redeemer_data) is {
+        Success(redeemer) -> {
+          when redeemer is {
+            LPRedeemer::MintLP { amount, pool_utxo_ref, recipient, metadata } -> {
+              validate_enhanced_lp_mint(
+                ctx, policy_id, amount, pool_utxo_ref, recipient, metadata, pool_validator_hash
+              )
+            }
+            
+            LPRedeemer::BurnLP { amount, pool_utxo_ref, owner } -> {
+              validate_enhanced_lp_burn(
+                ctx, policy_id, amount, pool_utxo_ref, owner, pool_validator_hash
+              )
+            }
+            
+            LPRedeemer::UpdateMetadata { token_name, new_metadata, pool_utxo_ref } -> {
+              validate_enhanced_lp_metadata_update(
+                ctx, policy_id, token_name, new_metadata, pool_utxo_ref, pool_validator_hash
+              )
+            }
+          }
+        }
+        Error(error) -> {
+          trace "Failed to parse LP redeemer: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// ENHANCED FACTORY VALIDATOR WITH REDEEMER PARSER
+// =============================================================================
+
+// Factory datum
+type FactoryDatum {
+  admin: Address,
+  creation_fee: Int,
+  protocol_fee_bps: Int,
+  paused: Bool,
+  pool_count: Int,
+}
+
+// Enhanced factory validator using redeemer parser
+validator enhanced_factory_validator(
+  ctx: ScriptContext,
+  datum: FactoryDatum,
+  redeemer_data: Data
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Parse the factory redeemer
+      when parse_factory_redeemer(redeemer_data) is {
+        Success(redeemer) -> {
+          // Find factory input and output
+          expect Some(factory_input) = find_input(ctx.transaction.inputs, output_ref)
+          expect Some(factory_output) = find_output(ctx.transaction.outputs, factory_input.output.address)
+          
+          when redeemer is {
+            FactoryRedeemer::CreatePool { token_policy, token_name, initial_ada, initial_token, fee_bps } -> {
+              validate_enhanced_factory_pool_creation(
+                factory_input, factory_output, datum,
+                token_policy, token_name, initial_ada, initial_token, fee_bps, ctx
+              )
+            }
+            
+            FactoryRedeemer::UpdateConfig { new_admin, new_creation_fee, new_protocol_fee } -> {
+              validate_enhanced_factory_config_update(
+                factory_input, factory_output, datum,
+                new_admin, new_creation_fee, new_protocol_fee, ctx
+              )
+            }
+            
+            FactoryRedeemer::PauseFactory -> {
+              validate_enhanced_factory_pause(factory_input, factory_output, datum, ctx)
+            }
+            
+            FactoryRedeemer::UnpauseFactory -> {
+              validate_enhanced_factory_unpause(factory_input, factory_output, datum, ctx)
+            }
+          }
+        }
+        Error(error) -> {
+          trace "Failed to parse factory redeemer: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// PLACEHOLDER VALIDATION FUNCTIONS
+// =============================================================================
+// These would contain the actual business logic for each operation
+
+fn validate_enhanced_swap_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  input_amount: Int,
+  min_output: Int,
+  deadline: Int,
+  recipient: Address,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_add_liquidity_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  deadline: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_remove_liquidity_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  lp_tokens: Int,
+  min_ada_out: Int,
+  min_token_out: Int,
+  deadline: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_pool_creation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  initial_ada: Int,
+  initial_token: Int,
+  fee_bps: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_emergency_pause(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_emergency_unpause(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_cip68_enhanced_swap_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: PoolCIP68Datum,
+  redeemer: SwapRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_lp_mint(
+  ctx: ScriptContext,
+  policy_id: PolicyId,
+  amount: Int,
+  pool_utxo_ref: OutputReference,
+  recipient: Address,
+  metadata: LPTokenMetadata,
+  pool_validator_hash: ByteArray
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_lp_burn(
+  ctx: ScriptContext,
+  policy_id: PolicyId,
+  amount: Int,
+  pool_utxo_ref: OutputReference,
+  owner: Address,
+  pool_validator_hash: ByteArray
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_lp_metadata_update(
+  ctx: ScriptContext,
+  policy_id: PolicyId,
+  token_name: AssetName,
+  new_metadata: LPTokenMetadata,
+  pool_utxo_ref: OutputReference,
+  pool_validator_hash: ByteArray
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_factory_pool_creation(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  initial_ada: Int,
+  initial_token: Int,
+  fee_bps: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_factory_config_update(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  new_admin: Option<Address>,
+  new_creation_fee: Option<Int>,
+  new_protocol_fee: Option<Int>,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_factory_pause(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}
+
+fn validate_enhanced_factory_unpause(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Implementation would go here
+  True
+}

@@ -1,0 +1,256 @@
+{
+  "version": "1.0.0",
+  "description": "PuckSwap v4 Enterprise Bonding Curve Parameters",
+  "lastUpdated": "2024-06-22",
+  
+  "defaultParams": {
+    "initialSupply": 1000000,
+    "curveSlope": 1500,
+    "maxSupply": 100000000,
+    "incentiveMultiplier": 2000,
+    "decayFactor": 800,
+    "description": "Default bonding curve parameters for new pools"
+  },
+  
+  "poolSpecificParams": {
+    "ADA_PUCKY": {
+      "initialSupply": 5000000,
+      "curveSlope": 1200,
+      "maxSupply": 500000000,
+      "incentiveMultiplier": 2500,
+      "decayFactor": 750,
+      "description": "Enhanced incentives for the main ADA/PUCKY pool"
+    },
+    
+    "ADA_wBTC": {
+      "initialSupply": 2000000,
+      "curveSlope": 1800,
+      "maxSupply": 200000000,
+      "incentiveMultiplier": 1800,
+      "decayFactor": 850,
+      "description": "Conservative parameters for high-value BTC pool"
+    },
+    
+    "ADA_wETH": {
+      "initialSupply": 2500000,
+      "curveSlope": 1600,
+      "maxSupply": 250000000,
+      "incentiveMultiplier": 2000,
+      "decayFactor": 800,
+      "description": "Balanced parameters for ETH pool"
+    },
+    
+    "ADA_USDC": {
+      "initialSupply": 3000000,
+      "curveSlope": 1000,
+      "maxSupply": 300000000,
+      "incentiveMultiplier": 1500,
+      "decayFactor": 900,
+      "description": "Stable parameters for stablecoin pool"
+    }
+  },
+  
+  "tierBasedParams": {
+    "tier1": {
+      "description": "Premium tier for major trading pairs",
+      "minLiquidity": 100000000000,
+      "initialSupply": 5000000,
+      "curveSlope": 1200,
+      "maxSupply": 500000000,
+      "incentiveMultiplier": 2500,
+      "decayFactor": 750,
+      "eligiblePairs": [
+        "ADA_PUCKY",
+        "ADA_wBTC",
+        "ADA_wETH"
+      ]
+    },
+    
+    "tier2": {
+      "description": "Standard tier for established tokens",
+      "minLiquidity": 50000000000,
+      "initialSupply": 2000000,
+      "curveSlope": 1500,
+      "maxSupply": 200000000,
+      "incentiveMultiplier": 2000,
+      "decayFactor": 800,
+      "eligiblePairs": [
+        "ADA_USDC",
+        "ADA_USDT",
+        "ADA_wLTC"
+      ]
+    },
+    
+    "tier3": {
+      "description": "Basic tier for new or smaller tokens",
+      "minLiquidity": 10000000000,
+      "initialSupply": 1000000,
+      "curveSlope": 1800,
+      "maxSupply": 100000000,
+      "incentiveMultiplier": 1500,
+      "decayFactor": 850,
+      "eligiblePairs": [
+        "ADA_*"
+      ]
+    }
+  },
+  
+  "governanceParams": {
+    "description": "Parameters that can be updated through governance",
+    "updateableFields": [
+      "curveSlope",
+      "incentiveMultiplier",
+      "decayFactor",
+      "maxSupply"
+    ],
+    "restrictions": {
+      "curveSlope": {
+        "min": 500,
+        "max": 3000,
+        "description": "Curve slope must be between 0.5x and 3x"
+      },
+      "incentiveMultiplier": {
+        "min": 1000,
+        "max": 5000,
+        "description": "Incentive multiplier must be between 1x and 5x"
+      },
+      "decayFactor": {
+        "min": 500,
+        "max": 1000,
+        "description": "Decay factor must be between 0.5x and 1x"
+      },
+      "maxSupply": {
+        "minIncrease": 1.1,
+        "maxIncrease": 2.0,
+        "description": "Max supply can only be increased by 10% to 100%"
+      }
+    },
+    "proposalRequirements": {
+      "minVotingPower": 5000000,
+      "quorumThreshold": 1500,
+      "approvalThreshold": 6000,
+      "executionDelay": 259200,
+      "description": "Governance requirements for parameter updates"
+    }
+  },
+  
+  "calculationFormulas": {
+    "description": "Mathematical formulas used in bonding curve calculations",
+    "initialLPSupply": "sqrt(initialTokenA * initialTokenB) * curveSlope / 1000",
+    "bondingCurveBonus": "(currentLPSupply * incentiveMultiplier * decayMultiplier) / 10000",
+    "decayMultiplier": "1000 - ((supplyRatio * decayFactor) / 1000)",
+    "supplyRatio": "(currentLPSupply * 1000) / maxSupply",
+    "incentiveAmount": "(initialSupply * incentiveMultiplier) / 10000"
+  },
+  
+  "examples": {
+    "description": "Example calculations for different scenarios",
+    "scenario1": {
+      "description": "Early liquidity provider in ADA/PUCKY pool",
+      "params": {
+        "initialTokenA": 1000000000,
+        "initialTokenB": 1000000000,
+        "curveSlope": 1200,
+        "currentLPSupply": 5000000,
+        "maxSupply": 500000000,
+        "incentiveMultiplier": 2500,
+        "decayFactor": 750
+      },
+      "calculations": {
+        "baseLPTokens": 1200000,
+        "supplyRatio": 10,
+        "decayMultiplier": 992.5,
+        "bondingCurveBonus": 124062,
+        "totalLPTokens": 1324062
+      }
+    },
+    
+    "scenario2": {
+      "description": "Late liquidity provider in saturated pool",
+      "params": {
+        "initialTokenA": 1000000000,
+        "initialTokenB": 1000000000,
+        "curveSlope": 1200,
+        "currentLPSupply": 400000000,
+        "maxSupply": 500000000,
+        "incentiveMultiplier": 2500,
+        "decayFactor": 750
+      },
+      "calculations": {
+        "baseLPTokens": 1200000,
+        "supplyRatio": 800,
+        "decayMultiplier": 400,
+        "bondingCurveBonus": 40000,
+        "totalLPTokens": 1240000
+      }
+    }
+  },
+  
+  "monitoring": {
+    "description": "Parameters for monitoring bonding curve performance",
+    "alertThresholds": {
+      "highUtilization": 0.8,
+      "lowIncentiveEfficiency": 0.1,
+      "unusualGrowthRate": 2.0,
+      "description": "Thresholds for automated alerts"
+    },
+    "metrics": [
+      "totalLPSupply",
+      "utilizationRate",
+      "incentiveEfficiency",
+      "growthRate",
+      "participantCount",
+      "averageIncentive"
+    ],
+    "reportingInterval": 86400,
+    "description": "Metrics collected every 24 hours"
+  },
+  
+  "migration": {
+    "description": "Parameters for migrating existing pools to bonding curve system",
+    "migrationStrategy": "gradual",
+    "phases": [
+      {
+        "phase": 1,
+        "description": "Migrate tier 1 pools",
+        "duration": 604800,
+        "pools": ["ADA_PUCKY", "ADA_wBTC", "ADA_wETH"]
+      },
+      {
+        "phase": 2,
+        "description": "Migrate tier 2 pools",
+        "duration": 604800,
+        "pools": ["ADA_USDC", "ADA_USDT", "ADA_wLTC"]
+      },
+      {
+        "phase": 3,
+        "description": "Migrate remaining pools",
+        "duration": 1209600,
+        "pools": ["ADA_*"]
+      }
+    ],
+    "fallbackParams": {
+      "initialSupply": 1000000,
+      "curveSlope": 1500,
+      "maxSupply": 100000000,
+      "incentiveMultiplier": 1500,
+      "decayFactor": 850
+    }
+  },
+  
+  "testing": {
+    "description": "Parameters for testing bonding curve functionality",
+    "testnetParams": {
+      "acceleratedDecay": true,
+      "decayMultiplier": 10,
+      "reducedThresholds": true,
+      "debugMode": true
+    },
+    "simulationParams": {
+      "scenarios": 100,
+      "participantRange": [10, 1000],
+      "liquidityRange": [1000000, 1000000000],
+      "timeRange": [86400, 31536000]
+    }
+  }
+}

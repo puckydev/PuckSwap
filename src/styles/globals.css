@@ -1,0 +1,413 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Import PuckHub-compatible fonts with terminal fallbacks */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Share+Tech+Mono&display=swap');
+
+@layer base {
+  :root {
+    /* Windows 98 inspired theme */
+    --background: 0 0% 75.3%; /* Classic Windows 98 gray #C0C0C0 */
+    --foreground: 0 0% 0%; /* Black text */
+    --card: 0 0% 75.3%; /* Windows 98 gray */
+    --card-foreground: 0 0% 0%;
+    --popover: 0 0% 75.3%;
+    --popover-foreground: 0 0% 0%;
+    --primary: 240 100% 50%; /* Windows 98 blue #0000FF */
+    --primary-foreground: 0 0% 100%; /* White text on blue */
+    --secondary: 0 0% 87.1%; /* Light gray for secondary elements */
+    --secondary-foreground: 0 0% 0%;
+    --muted: 0 0% 87.1%;
+    --muted-foreground: 0 0% 25%;
+    --accent: 240 100% 50%; /* Windows 98 blue */
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 100% 50%; /* Bright red */
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 50%; /* Dark gray borders */
+    --input: 0 0% 100%; /* White input backgrounds */
+    --ring: 240 100% 50%; /* Windows 98 blue focus ring */
+    --radius: 0rem; /* Sharp corners for Windows 98 */
+  }
+
+  .dark {
+    /* Terminal mode - preserve for swap functionality */
+    --background: 0 0% 0%; /* Pure black terminal */
+    --foreground: 0 0% 100%; /* White text for terminal */
+    --card: 0 0% 0%;
+    --card-foreground: 0 0% 100%;
+    --popover: 0 0% 0%;
+    --popover-foreground: 0 0% 100%;
+    --primary: 0 0% 100%; /* White for terminal primary */
+    --primary-foreground: 0 0% 0%;
+    --secondary: 0 0% 10%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 0 0% 10%;
+    --muted-foreground: 0 0% 70%;
+    --accent: 0 0% 10%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 100% 50%; /* Red for errors */
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 20%;
+    --input: 0 0% 5%;
+    --ring: 0 0% 100%;
+  }
+}
+
+@layer base {
+  /* PuckHub-style base with terminal compatibility */
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+    padding: 0;
+    margin: 0;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', 'JetBrains Mono', monospace;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+
+  /* Terminal mode override */
+  .terminal-mode {
+    font-family: 'JetBrains Mono', monospace;
+    background-color: #0a0a0a;
+    color: #00ff00;
+  }
+
+  .terminal-mode body {
+    background: linear-gradient(
+        to bottom,
+        transparent,
+        rgba(26, 26, 26, 0.8)
+      )
+      #0a0a0a;
+  }
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 0, 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 0, 0.5);
+}
+
+/* Terminal cursor animation */
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.cursor-blink::after {
+  content: '_';
+  animation: cursor-blink 1s infinite;
+  color: #00ff00;
+}
+
+/* CRT screen effects */
+.crt-screen {
+  position: relative;
+}
+
+.crt-screen::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: 
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 255, 0, 0.03) 2px,
+      rgba(0, 255, 0, 0.03) 4px
+    );
+  pointer-events: none;
+  z-index: 1000;
+}
+
+/* Glitch effect for errors */
+@keyframes glitch {
+  0% {
+    transform: translate(0);
+  }
+  20% {
+    transform: translate(-2px, 2px);
+  }
+  40% {
+    transform: translate(-2px, -2px);
+  }
+  60% {
+    transform: translate(2px, 2px);
+  }
+  80% {
+    transform: translate(2px, -2px);
+  }
+  100% {
+    transform: translate(0);
+  }
+}
+
+.glitch {
+  animation: glitch 0.3s infinite;
+}
+
+/* Terminal text effects */
+.terminal-text {
+  font-family: 'Share Tech Mono', 'JetBrains Mono', monospace;
+  text-shadow: 0 0 5px currentColor;
+}
+
+/* Loading spinner */
+@keyframes terminal-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.terminal-spinner {
+  border: 2px solid rgba(0, 255, 0, 0.3);
+  border-top: 2px solid #00ff00;
+  border-radius: 50%;
+  animation: terminal-spin 1s linear infinite;
+}
+
+/* Button hover effects */
+.terminal-button:hover {
+  box-shadow: 
+    0 0 15px rgba(0, 255, 0, 0.4),
+    inset 0 0 15px rgba(0, 255, 0, 0.1);
+  text-shadow: 0 0 10px currentColor;
+}
+
+.terminal-button:active {
+  transform: scale(0.98);
+}
+
+/* Input focus effects */
+.terminal-input:focus {
+  box-shadow: 
+    0 0 10px rgba(0, 255, 0, 0.3),
+    inset 0 0 10px rgba(0, 255, 0, 0.1);
+}
+
+/* Card hover effects */
+.terminal-card:hover {
+  box-shadow: 
+    0 0 15px rgba(0, 255, 0, 0.2),
+    inset 0 0 15px rgba(0, 255, 0, 0.05);
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+  .terminal-card {
+    margin: 0.5rem;
+    padding: 1rem;
+  }
+  
+  .text-glow {
+    text-shadow: 0 0 3px currentColor;
+  }
+  
+  .text-glow-strong {
+    text-shadow: 0 0 5px currentColor, 0 0 10px currentColor;
+  }
+}
+
+/* High contrast mode */
+@media (prefers-contrast: high) {
+  .terminal-card {
+    border-width: 2px;
+  }
+  
+  .text-glow {
+    text-shadow: 0 0 8px currentColor, 0 0 12px currentColor;
+  }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .animate-flicker,
+  .animate-scan-line,
+  .animate-glow,
+  .animate-pulse-green {
+    animation: none;
+  }
+  
+  .crt-screen::before {
+    display: none;
+  }
+}
+
+/* Windows 98 Styles */
+.win98-window {
+  background: #C0C0C0;
+  border: 2px outset #C0C0C0;
+  box-shadow: inset 1px 1px 0px #DFDFDF, inset -1px -1px 0px #808080;
+}
+
+.win98-title-bar {
+  background: linear-gradient(90deg, #0000FF 0%, #0080FF 100%);
+  color: white;
+  padding: 2px 4px;
+  font-family: 'MS Sans Serif', sans-serif;
+  font-size: 11px;
+  font-weight: bold;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.win98-button {
+  background: #C0C0C0;
+  border: 1px outset #C0C0C0;
+  box-shadow: inset 1px 1px 0px #DFDFDF, inset -1px -1px 0px #808080;
+  padding: 2px 8px;
+  font-family: 'MS Sans Serif', sans-serif;
+  font-size: 11px;
+  cursor: pointer;
+  min-height: 23px;
+}
+
+.win98-button:hover {
+  background: #D4D0C8;
+}
+
+.win98-button:active {
+  border: 1px inset #C0C0C0;
+  box-shadow: inset -1px -1px 0px #DFDFDF, inset 1px 1px 0px #808080;
+}
+
+.win98-button:disabled {
+  color: #808080;
+  cursor: not-allowed;
+}
+
+.win98-input {
+  background: white;
+  border: 1px inset #C0C0C0;
+  box-shadow: inset 1px 1px 0px #808080, inset -1px -1px 0px #DFDFDF;
+  padding: 2px 4px;
+  font-family: 'MS Sans Serif', sans-serif;
+  font-size: 11px;
+}
+
+.win98-input:focus {
+  outline: 1px dotted #000;
+  outline-offset: -2px;
+}
+
+.win98-panel {
+  background: #C0C0C0;
+  border: 1px inset #C0C0C0;
+  box-shadow: inset 1px 1px 0px #DFDFDF, inset -1px -1px 0px #808080;
+  padding: 8px;
+}
+
+.win98-group-box {
+  border: 1px inset #C0C0C0;
+  box-shadow: inset 1px 1px 0px #808080, inset -1px -1px 0px #DFDFDF;
+  padding: 8px;
+  margin: 4px 0;
+  position: relative;
+}
+
+.win98-group-box-title {
+  position: absolute;
+  top: -6px;
+  left: 8px;
+  background: #C0C0C0;
+  padding: 0 4px;
+  font-family: 'MS Sans Serif', sans-serif;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+/* Terminal mode overrides for swap functionality */
+.terminal-mode {
+  background: #000 !important;
+  color: #fff !important;
+  font-family: 'JetBrains Mono', monospace !important;
+}
+
+.terminal-mode .win98-window {
+  background: #000 !important;
+  border: 1px solid #333 !important;
+  box-shadow: none !important;
+}
+
+.terminal-mode .win98-input {
+  background: #111 !important;
+  border: 1px solid #333 !important;
+  color: #fff !important;
+  box-shadow: none !important;
+}
+
+.terminal-mode .win98-button {
+  background: #222 !important;
+  border: 1px solid #444 !important;
+  color: #fff !important;
+  box-shadow: none !important;
+}
+
+/* Terminal utility classes */
+.terminal-border {
+  border: 1px solid rgba(255, 176, 0, 0.5);
+  background: rgba(0, 0, 0, 0.9);
+}
+
+.terminal-bg {
+  background: rgba(0, 0, 0, 0.9);
+}
+
+.terminal-white {
+  color: #ffffff;
+}
+
+.terminal-green {
+  color: #00ff00;
+}
+
+.terminal-amber {
+  color: #ffb000;
+}
+
+.terminal-red {
+  color: #ff0000;
+}
+
+/* Print styles */
+@media print {
+  .crt-screen::before {
+    display: none;
+  }
+
+  .terminal-card, .win98-window {
+    border: 1px solid #000;
+    box-shadow: none;
+  }
+
+  .text-glow {
+    text-shadow: none;
+  }
+}

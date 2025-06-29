@@ -1,0 +1,818 @@
+'use client';
+
+import React, { useState, useEffect, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { 
+  proposeGovernance, 
+  voteOnProposal, 
+  GovernanceAction, 
+  Proposal, 
+  GovernanceDatum,
+  ProposalCreationParams,
+  VotingParams,
+  GovernanceTransactionResult 
+} from '../../src/lucid/governance';
+import { createGovernanceMonitor, GovernanceMonitor, GovernanceState } from '../../src/context7/governance_monitor';
+import { createLucidInstance, connectWallet, isDemoMode } from '../../src/lib/lucid-config';
+import { formatADA, formatNumber } from '../../src/lib/format-utils';
+
+// Component interfaces
+interface GovernanceProps {
+  className?: string;
+}
+
+interface ProposalFormData {
+  type: 'UpdateFee' | 'TreasuryPayout';
+  newFee?: number;
+  payoutAmount?: number;
+  payoutAddress?: string;
+}
+
+interface TransactionState {
+  isSubmitting: boolean;
+  txHash: string;
+  error: string;
+  success: boolean;
+}
+
+// Demo data for development/testing
+const DEMO_PROPOSALS: Proposal[] = [
+  {
+    proposal_id: 1,
+    action: {
+      type: 'UpdateFee',
+      parameters: { new_fee: 25 }
+    },
+    votes_for: 1250000,
+    votes_against: 750000,
+    executed: false
+  },
+  {
+    proposal_id: 2,
+    action: {
+      type: 'TreasuryPayout',
+      parameters: { 
+        payout_value: { lovelace: 50000000n } // 50 ADA
+      }
+    },
+    votes_for: 2100000,
+    votes_against: 900000,
+    executed: true
+  },
+  {
+    proposal_id: 3,
+    action: {
+      type: 'UpdateFee',
+      parameters: { new_fee: 20 }
+    },
+    votes_for: 800000,
+    votes_against: 1200000,
+    executed: false
+  }
+];
+
+const DEMO_GOVERNANCE_STATE: GovernanceState = {
+  datum: {
+    proposals: DEMO_PROPOSALS
+  },
+  totalProposals: 3,
+  activeProposals: 2,
+  executedProposals: 1,
+  lastUpdated: Date.now()
+};
+
+export default function Governance({ className = '' }: GovernanceProps) {
+  // State management
+  const [governanceState, setGovernanceState] = useState<GovernanceState | null>(null);
+  const [walletConnected, setWalletConnected] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<string>('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [governanceMonitor, setGovernanceMonitor] = useState<GovernanceMonitor | null>(null);
+  
+  // Form state
+  const [showCreateProposal, setShowCreateProposal] = useState(false);
+  const [proposalForm, setProposalForm] = useState<ProposalFormData>({
+    type: 'UpdateFee',
+    newFee: 30,
+    payoutAmount: 0,
+    payoutAddress: ''
+  });
+  
+  // Transaction state
+  const [transactionState, setTransactionState] = useState<TransactionState>({
+    isSubmitting: false,
+    txHash: '',
+    error: '',
+    success: false
+  });
+
+  // Selected proposal for voting
+  const [selectedProposal, setSelectedProposal] = useState<Proposal | null>(null);
+  const [voteChoice, setVoteChoice] = useState<'for' | 'against'>('for');
+
+  // Demo mode detection
+  const demoMode = isDemoMode();
+
+  // Initialize governance monitor and subscribe to updates
+  useEffect(() => {
+    const initializeMonitor = async () => {
+      if (demoMode) {
+        // Use demo data
+        setGovernanceState(DEMO_GOVERNANCE_STATE);
+        return;
+      }
+
+      try {
+        const monitor = await createGovernanceMonitor({
+          governanceAddress: process.env.NEXT_PUBLIC_GOVERNANCE_ADDRESS!,
+          enableWebSocket: true,
+          pollingInterval: 10000
+        });
+
+        setGovernanceMonitor(monitor);
+
+        // Subscribe to governance state updates
+        monitor.addEventListener('GovernanceStateUpdate', (event) => {
+          setGovernanceState(event.data);
+        });
+
+        monitor.addEventListener('ProposalSubmitted', (event) => {
+          toast.success(`New proposal #${event.data.proposal_id} submitted!`);
+        });
+
+        monitor.addEventListener('VoteCast', (event) => {
+          toast.success(`Vote cast on proposal #${event.data.proposal_id}!`);
+        });
+
+        monitor.addEventListener('ProposalExecuted', (event) => {
+          toast.success(`Proposal #${event.data.proposal_id} executed!`);
+        });
+
+        // Start monitoring
+        await monitor.start();
+
+      } catch (error) {
+        console.error('Failed to initialize governance monitor:', error);
+        toast.error('Failed to connect to governance system');
+      }
+    };
+
+    initializeMonitor();
+
+    // Cleanup
+    return () => {
+      if (governanceMonitor) {
+        governanceMonitor.stop();
+      }
+    };
+  }, [demoMode]);
+
+  // Wallet connection
+  const connectWalletHandler = async () => {
+    try {
+      setIsLoading(true);
+      setTransactionState(prev => ({ ...prev, error: '' }));
+
+
+
+      // Real wallet connection
+      const lucid = await createLucidInstance();
+      await connectWallet(lucid, 'eternl');
+
+      const address = await lucid.wallet().address();
+      setWalletConnected(true);
+      setWalletAddress(address);
+      toast.success('Wallet connected successfully!');
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Failed to connect wallet';
+      setTransactionState(prev => ({ ...prev, error: errorMsg }));
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Submit new proposal
+  const submitProposal = async () => {
+    if (!walletConnected) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    try {
+      setTransactionState({
+        isSubmitting: true,
+        txHash: '',
+        error: '',
+        success: false
+      });
+
+      if (demoMode) {
+        // Simulate proposal submission
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const newProposal: Proposal = {
+          proposal_id: (governanceState?.datum.proposals.length || 0) + 1,
+          action: {
+            type: proposalForm.type,
+            parameters: proposalForm.type === 'UpdateFee' 
+              ? { new_fee: proposalForm.newFee }
+              : { payout_value: { lovelace: BigInt((proposalForm.payoutAmount || 0) * 1000000) } }
+          },
+          votes_for: 0,
+          votes_against: 0,
+          executed: false
+        };
+
+        setGovernanceState(prev => prev ? {
+          ...prev,
+          datum: {
+            proposals: [...prev.datum.proposals, newProposal]
+          },
+          totalProposals: prev.totalProposals + 1,
+          activeProposals: prev.activeProposals + 1
+        } : null);
+
+        setTransactionState({
+          isSubmitting: false,
+          txHash: 'demo_tx_hash_' + Date.now(),
+          error: '',
+          success: true
+        });
+
+        toast.success('Demo proposal submitted successfully!');
+        setShowCreateProposal(false);
+        return;
+      }
+
+      // Real proposal submission
+      const action: GovernanceAction = {
+        type: proposalForm.type,
+        parameters: proposalForm.type === 'UpdateFee' 
+          ? { new_fee: proposalForm.newFee }
+          : { 
+              payout_value: { 
+                lovelace: BigInt((proposalForm.payoutAmount || 0) * 1000000) 
+              } 
+            }
+      };
+
+      const params: ProposalCreationParams = {
+        action,
+        proposal_id: (governanceState?.datum.proposals.length || 0) + 1
+      };
+
+      const result = await proposeGovernance(
+        params,
+        process.env.NEXT_PUBLIC_GOVERNANCE_VALIDATOR_CBOR!,
+        process.env.NEXT_PUBLIC_GOVERNANCE_ADDRESS!,
+        "Preprod",
+        "eternl"
+      );
+
+      setTransactionState({
+        isSubmitting: false,
+        txHash: result.txHash,
+        error: '',
+        success: true
+      });
+
+      toast.success('Proposal submitted successfully!');
+      setShowCreateProposal(false);
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Failed to submit proposal';
+      setTransactionState({
+        isSubmitting: false,
+        txHash: '',
+        error: errorMsg,
+        success: false
+      });
+      toast.error(errorMsg);
+    }
+  };
+
+  // Cast vote on proposal
+  const castVote = async (proposalId: number, vote: 'for' | 'against') => {
+    if (!walletConnected) {
+      toast.error('Please connect your wallet first');
+      return;
+    }
+
+    try {
+      setTransactionState({
+        isSubmitting: true,
+        txHash: '',
+        error: '',
+        success: false
+      });
+
+      if (demoMode) {
+        // Simulate vote casting
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        
+        setGovernanceState(prev => {
+          if (!prev) return null;
+          
+          const updatedProposals = prev.datum.proposals.map(proposal => {
+            if (proposal.proposal_id === proposalId) {
+              return {
+                ...proposal,
+                votes_for: vote === 'for' ? proposal.votes_for + 100000 : proposal.votes_for,
+                votes_against: vote === 'against' ? proposal.votes_against + 100000 : proposal.votes_against
+              };
+            }
+            return proposal;
+          });
+
+          return {
+            ...prev,
+            datum: { proposals: updatedProposals }
+          };
+        });
+
+        setTransactionState({
+          isSubmitting: false,
+          txHash: 'demo_vote_tx_' + Date.now(),
+          error: '',
+          success: true
+        });
+
+        toast.success(`Demo vote "${vote}" cast successfully!`);
+        setSelectedProposal(null);
+        return;
+      }
+
+      // Real vote casting
+      const params: VotingParams = {
+        proposal_id: proposalId,
+        vote
+      };
+
+      const result = await voteOnProposal(
+        params,
+        process.env.NEXT_PUBLIC_GOVERNANCE_VALIDATOR_CBOR!,
+        process.env.NEXT_PUBLIC_GOVERNANCE_ADDRESS!,
+        "Preprod",
+        "eternl"
+      );
+
+      setTransactionState({
+        isSubmitting: false,
+        txHash: result.txHash,
+        error: '',
+        success: true
+      });
+
+      toast.success(`Vote "${vote}" cast successfully!`);
+      setSelectedProposal(null);
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Failed to cast vote';
+      setTransactionState({
+        isSubmitting: false,
+        txHash: '',
+        error: errorMsg,
+        success: false
+      });
+      toast.error(errorMsg);
+    }
+  };
+
+  // Format action display
+  const formatAction = (action: GovernanceAction): string => {
+    switch (action.type) {
+      case 'UpdateFee':
+        return `Update Fee to ${action.parameters.new_fee} basis points`;
+      case 'TreasuryPayout':
+        const amount = action.parameters.payout_value?.lovelace
+          ? Number(action.parameters.payout_value.lovelace) / 1000000
+          : 0;
+        return `Treasury Payout: ${formatADA(amount)} ADA`;
+      default:
+        return 'Unknown Action';
+    }
+  };
+
+  // Calculate vote percentage
+  const getVotePercentage = (votesFor: number, votesAgainst: number, isFor: boolean): number => {
+    const total = votesFor + votesAgainst;
+    if (total === 0) return 0;
+    return isFor ? (votesFor / total) * 100 : (votesAgainst / total) * 100;
+  };
+
+  // Determine proposal status
+  const getProposalStatus = (proposal: Proposal): { status: string; color: string } => {
+    if (proposal.executed) {
+      return { status: 'EXECUTED', color: 'text-green-400' };
+    }
+
+    const totalVotes = proposal.votes_for + proposal.votes_against;
+    if (totalVotes === 0) {
+      return { status: 'NO VOTES', color: 'text-gray-400' };
+    }
+
+    if (proposal.votes_for > proposal.votes_against) {
+      return { status: 'PASSING', color: 'text-green-400' };
+    } else {
+      return { status: 'FAILING', color: 'text-red-400' };
+    }
+  };
+
+  return (
+    <div className={`min-h-screen bg-black text-green-400 font-mono ${className}`}>
+      {/* Terminal Header */}
+      <div className="border-b border-green-400 p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-green-400">
+              [PUCKSWAP_GOVERNANCE_v5.0]
+            </h1>
+            <p className="text-sm text-green-300 mt-1">
+              DAO Governance Terminal - Proposal Management & Voting
+            </p>
+          </div>
+
+          {demoMode && (
+            <div className="bg-amber-900/20 border border-amber-400 px-3 py-1 rounded">
+              <span className="text-amber-400 text-sm">DEMO MODE</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="p-6 space-y-6">
+        {/* Wallet Connection Section */}
+        <div className="border border-green-400 p-4 rounded bg-green-400/5">
+          <h2 className="text-lg font-bold mb-3">[WALLET_CONNECTION]</h2>
+
+          {!walletConnected ? (
+            <button
+              onClick={connectWalletHandler}
+              disabled={isLoading}
+              className="bg-green-400 text-black px-4 py-2 rounded font-bold hover:bg-green-300 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isLoading ? 'CONNECTING...' : 'CONNECT_WALLET'}
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-green-300">
+                STATUS: <span className="text-green-400">CONNECTED</span>
+              </p>
+              <p className="text-green-300 break-all">
+                ADDRESS: <span className="text-green-400">{walletAddress}</span>
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Governance Stats */}
+        {governanceState && (
+          <div className="border border-green-400 p-4 rounded bg-green-400/5">
+            <h2 className="text-lg font-bold mb-3">[GOVERNANCE_STATS]</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="text-center">
+                <div className="text-2xl font-bold text-green-400">
+                  {governanceState.totalProposals}
+                </div>
+                <div className="text-sm text-green-300">TOTAL PROPOSALS</div>
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-bold text-amber-400">
+                  {governanceState.activeProposals}
+                </div>
+                <div className="text-sm text-green-300">ACTIVE PROPOSALS</div>
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-bold text-blue-400">
+                  {governanceState.executedProposals}
+                </div>
+                <div className="text-sm text-green-300">EXECUTED PROPOSALS</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Create Proposal Section */}
+        <div className="border border-green-400 p-4 rounded bg-green-400/5">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-bold">[CREATE_PROPOSAL]</h2>
+            <button
+              onClick={() => setShowCreateProposal(!showCreateProposal)}
+              className="bg-green-400 text-black px-3 py-1 rounded text-sm font-bold hover:bg-green-300"
+            >
+              {showCreateProposal ? 'CANCEL' : 'NEW_PROPOSAL'}
+            </button>
+          </div>
+
+          <AnimatePresence>
+            {showCreateProposal && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="space-y-4 mt-4"
+              >
+                {/* Proposal Type Selection */}
+                <div>
+                  <label className="block text-green-300 mb-2">PROPOSAL_TYPE:</label>
+                  <select
+                    value={proposalForm.type}
+                    onChange={(e) => setProposalForm(prev => ({
+                      ...prev,
+                      type: e.target.value as 'UpdateFee' | 'TreasuryPayout'
+                    }))}
+                    className="w-full bg-black border border-green-400 text-green-400 p-2 rounded font-mono"
+                  >
+                    <option value="UpdateFee">UPDATE_FEE</option>
+                    <option value="TreasuryPayout">TREASURY_PAYOUT</option>
+                  </select>
+                </div>
+
+                {/* Conditional Form Fields */}
+                {proposalForm.type === 'UpdateFee' ? (
+                  <div>
+                    <label className="block text-green-300 mb-2">
+                      NEW_FEE_BASIS_POINTS (current: 30):
+                    </label>
+                    <input
+                      type="number"
+                      value={proposalForm.newFee || ''}
+                      onChange={(e) => setProposalForm(prev => ({
+                        ...prev,
+                        newFee: parseInt(e.target.value) || 0
+                      }))}
+                      className="w-full bg-black border border-green-400 text-green-400 p-2 rounded font-mono"
+                      placeholder="25"
+                      min="0"
+                      max="1000"
+                    />
+                    <p className="text-xs text-green-300 mt-1">
+                      Fee percentage: {((proposalForm.newFee || 0) / 100).toFixed(2)}%
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-green-300 mb-2">PAYOUT_AMOUNT (ADA):</label>
+                      <input
+                        type="number"
+                        value={proposalForm.payoutAmount || ''}
+                        onChange={(e) => setProposalForm(prev => ({
+                          ...prev,
+                          payoutAmount: parseFloat(e.target.value) || 0
+                        }))}
+                        className="w-full bg-black border border-green-400 text-green-400 p-2 rounded font-mono"
+                        placeholder="50.0"
+                        min="0"
+                        step="0.1"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-green-300 mb-2">RECIPIENT_ADDRESS:</label>
+                      <input
+                        type="text"
+                        value={proposalForm.payoutAddress || ''}
+                        onChange={(e) => setProposalForm(prev => ({
+                          ...prev,
+                          payoutAddress: e.target.value
+                        }))}
+                        className="w-full bg-black border border-green-400 text-green-400 p-2 rounded font-mono text-xs"
+                        placeholder="addr_test1..."
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Submit Button */}
+                <button
+                  onClick={submitProposal}
+                  disabled={transactionState.isSubmitting || !walletConnected}
+                  className="w-full bg-green-400 text-black py-2 rounded font-bold hover:bg-green-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {transactionState.isSubmitting ? 'SUBMITTING...' : 'SUBMIT_PROPOSAL'}
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Proposals List */}
+        {governanceState && (
+          <div className="border border-green-400 p-4 rounded bg-green-400/5">
+            <h2 className="text-lg font-bold mb-4">[ACTIVE_PROPOSALS]</h2>
+
+            {governanceState.datum.proposals.length === 0 ? (
+              <p className="text-green-300 text-center py-8">
+                NO PROPOSALS FOUND
+              </p>
+            ) : (
+              <div className="space-y-4">
+                {governanceState.datum.proposals.map((proposal) => {
+                  const { status, color } = getProposalStatus(proposal);
+                  const totalVotes = proposal.votes_for + proposal.votes_against;
+                  const forPercentage = getVotePercentage(proposal.votes_for, proposal.votes_against, true);
+                  const againstPercentage = getVotePercentage(proposal.votes_for, proposal.votes_against, false);
+
+                  return (
+                    <motion.div
+                      key={proposal.proposal_id}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="border border-green-400/50 p-4 rounded bg-black/50"
+                    >
+                      {/* Proposal Header */}
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center space-x-3">
+                          <span className="text-green-400 font-bold">
+                            PROPOSAL #{proposal.proposal_id}
+                          </span>
+                          <span className={`text-sm font-bold ${color}`}>
+                            [{status}]
+                          </span>
+                        </div>
+
+                        {!proposal.executed && walletConnected && (
+                          <button
+                            onClick={() => setSelectedProposal(proposal)}
+                            className="bg-blue-400 text-black px-3 py-1 rounded text-sm font-bold hover:bg-blue-300"
+                          >
+                            VOTE
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Proposal Action */}
+                      <div className="mb-3">
+                        <p className="text-green-300 text-sm">ACTION:</p>
+                        <p className="text-green-400">{formatAction(proposal.action)}</p>
+                      </div>
+
+                      {/* Vote Statistics */}
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="text-green-300">VOTES FOR:</span>
+                          <span className="text-green-400">
+                            {formatNumber(proposal.votes_for)} ({forPercentage.toFixed(1)}%)
+                          </span>
+                        </div>
+
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="text-green-300">VOTES AGAINST:</span>
+                          <span className="text-red-400">
+                            {formatNumber(proposal.votes_against)} ({againstPercentage.toFixed(1)}%)
+                          </span>
+                        </div>
+
+                        {/* Vote Progress Bars */}
+                        {totalVotes > 0 && (
+                          <div className="space-y-1 mt-3">
+                            <div className="w-full bg-gray-700 rounded-full h-2">
+                              <div
+                                className="bg-green-400 h-2 rounded-full transition-all duration-300"
+                                style={{ width: `${forPercentage}%` }}
+                              />
+                            </div>
+                            <div className="w-full bg-gray-700 rounded-full h-2">
+                              <div
+                                className="bg-red-400 h-2 rounded-full transition-all duration-300"
+                                style={{ width: `${againstPercentage}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </motion.div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Voting Modal */}
+        <AnimatePresence>
+          {selectedProposal && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/80 flex items-center justify-center z-50"
+              onClick={() => setSelectedProposal(null)}
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-black border border-green-400 p-6 rounded max-w-md w-full mx-4"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <h3 className="text-lg font-bold text-green-400 mb-4">
+                  [VOTE_ON_PROPOSAL_#{selectedProposal.proposal_id}]
+                </h3>
+
+                <div className="mb-4">
+                  <p className="text-green-300 text-sm mb-2">ACTION:</p>
+                  <p className="text-green-400">{formatAction(selectedProposal.action)}</p>
+                </div>
+
+                <div className="mb-6">
+                  <p className="text-green-300 text-sm mb-3">SELECT_VOTE:</p>
+                  <div className="space-y-2">
+                    <label className="flex items-center space-x-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="vote"
+                        value="for"
+                        checked={voteChoice === 'for'}
+                        onChange={(e) => setVoteChoice(e.target.value as 'for' | 'against')}
+                        className="text-green-400"
+                      />
+                      <span className="text-green-400">VOTE FOR</span>
+                    </label>
+                    <label className="flex items-center space-x-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="vote"
+                        value="against"
+                        checked={voteChoice === 'against'}
+                        onChange={(e) => setVoteChoice(e.target.value as 'for' | 'against')}
+                        className="text-red-400"
+                      />
+                      <span className="text-red-400">VOTE AGAINST</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="flex space-x-3">
+                  <button
+                    onClick={() => castVote(selectedProposal.proposal_id, voteChoice)}
+                    disabled={transactionState.isSubmitting}
+                    className="flex-1 bg-green-400 text-black py-2 rounded font-bold hover:bg-green-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {transactionState.isSubmitting ? 'SUBMITTING...' : 'CAST_VOTE'}
+                  </button>
+                  <button
+                    onClick={() => setSelectedProposal(null)}
+                    className="flex-1 bg-gray-600 text-white py-2 rounded font-bold hover:bg-gray-500"
+                  >
+                    CANCEL
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Transaction Status */}
+        {(transactionState.txHash || transactionState.error) && (
+          <div className="border border-green-400 p-4 rounded bg-green-400/5">
+            <h3 className="text-lg font-bold mb-3">[TRANSACTION_STATUS]</h3>
+
+            {transactionState.success && transactionState.txHash && (
+              <div className="space-y-2">
+                <p className="text-green-400">
+                  STATUS: <span className="text-green-300">SUCCESS</span>
+                </p>
+                <p className="text-green-300 break-all text-sm">
+                  TX_HASH: <span className="text-green-400">{transactionState.txHash}</span>
+                </p>
+                {!demoMode && (
+                  <a
+                    href={`https://preprod.cardanoscan.io/transaction/${transactionState.txHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block bg-blue-400 text-black px-3 py-1 rounded text-sm font-bold hover:bg-blue-300 mt-2"
+                  >
+                    VIEW_ON_EXPLORER
+                  </a>
+                )}
+              </div>
+            )}
+
+            {transactionState.error && (
+              <div className="space-y-2">
+                <p className="text-red-400">
+                  STATUS: <span className="text-red-300">ERROR</span>
+                </p>
+                <p className="text-red-300 text-sm">{transactionState.error}</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="text-center text-green-300 text-sm border-t border-green-400 pt-4">
+          <p>PuckSwap v5 Governance Terminal</p>
+          <p>Powered by Aiken Smart Contracts + Lucid Evolution + Context7</p>
+          {demoMode && (
+            <p className="text-amber-400 mt-1">
+              Demo Mode Active - No Real Transactions
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

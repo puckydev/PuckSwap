@@ -1,0 +1,43 @@
+// Minimal swap validator for testing
+use aiken/transaction.{ScriptContext, Spend, OutputReference}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{PolicyId, AssetName}
+
+// Exact PoolDatum Structure from deployed contract
+pub type PoolDatum {
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_total_supply: Int,
+  fee_bps: Int,
+}
+
+// Simple swap redeemer
+pub type SwapRedeemer {
+  swap_in_token: Bool,
+  amount_in: Int,
+  min_out: Int,
+  deadline: Int,
+  recipient: Address,
+}
+
+// Minimal swap validator
+validator minimal_swap_validator(
+  ctx: ScriptContext,
+  datum: PoolDatum,
+  redeemer: SwapRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(_) -> {
+      // Basic validations
+      datum.ada_reserve > 0 &&
+      datum.token_reserve > 0 &&
+      redeemer.amount_in > 0 &&
+      redeemer.min_out >= 0
+    }
+    _ -> False
+  }
+}

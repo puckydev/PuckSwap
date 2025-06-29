@@ -1,0 +1,272 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, calculate_swap_output, calculate_lp_tokens_to_mint,
+  validate_deadline, min_ada, max_slippage_bps
+}
+
+// Import swap validator functions
+use puckswap_swap_validator.{
+  SwapRedeemer, validate_swap_deadline, get_amount_out
+}
+
+// Import min ADA utilities
+use lib/min_ada_utils.{
+  calculate_pool_min_ada, pool_min_ada, base_min_ada
+}
+
+// =============================================================================
+// COMPREHENSIVE INTEGRATION TESTS
+// =============================================================================
+
+// Mock data setup
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+fn create_comprehensive_pool_datum(ada_reserve: Int, token_reserve: Int) -> PoolDatum {
+  PoolDatum {
+    ada_reserve: ada_reserve,
+    token_reserve: token_reserve,
+    fee_bps: 30,
+    pool_nft_policy: #"1111111111111111111111111111111111111111111111111111111111111111",
+    pool_nft_name: #"504f4f4c",
+    token_policy: #"2222222222222222222222222222222222222222222222222222222222222222",
+    token_name: #"50554b4b59",
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+// =============================================================================
+// COMPREHENSIVE EDGE CASE INTEGRATION TESTS
+// =============================================================================
+
+test test_comprehensive_slippage_and_min_ada_integration() {
+  // Test that combines slippage protection with min ADA requirements
+  let ada_reserve = pool_min_ada + 1000_000_000  // Pool min ADA + 1000 ADA
+  let token_reserve = 1000_000_000  // 1000 tokens
+  let fee_bps = 30
+  
+  // Large swap that would cause high slippage
+  let large_input = 500_000_000  // 500 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, large_input, fee_bps)
+  
+  // Verify slippage is significant but pool maintains min ADA
+  let expected_no_slippage = large_input * token_reserve / ada_reserve
+  let slippage_bps = (expected_no_slippage - output_amount) * 10000 / expected_no_slippage
+  
+  expect slippage_bps > 1000  // High slippage due to large trade
+  expect new_ada_reserve >= pool_min_ada  // Pool maintains min ADA
+  expect new_token_reserve > 0  // Pool not drained
+  expect output_amount > 0  // Valid output
+  
+  True
+}
+
+test test_comprehensive_empty_pool_to_functional_pool() {
+  // Test complete lifecycle from empty pool to functional trading
+  
+  // Step 1: Empty pool
+  let empty_datum = create_comprehensive_pool_datum(0, 0)
+  expect empty_datum.ada_reserve == 0
+  expect empty_datum.token_reserve == 0
+  
+  // Step 2: Initial liquidity provision
+  let initial_ada = pool_min_ada + 1000_000_000  // Min ADA + 1000 ADA
+  let initial_token = 2000_000_000  // 2000 tokens
+  
+  let initial_lp = calculate_lp_tokens_to_mint(0, 0, initial_ada, initial_token, 0)
+  expect initial_lp > 0
+  
+  // Step 3: First trade after initialization
+  let trade_input = 100_000_000  // 100 ADA
+  let (trade_output, new_ada, new_token) = 
+    calculate_swap_output(initial_ada, initial_token, trade_input, 30)
+  
+  expect trade_output > 0
+  expect new_ada > initial_ada
+  expect new_token < initial_token
+  expect new_ada >= pool_min_ada  // Still above min ADA
+  
+  // Step 4: Additional liquidity provision
+  let add_ada = 500_000_000  // 500 ADA
+  let add_token = 1000_000_000  // 1000 tokens (proportional)
+  
+  let additional_lp = calculate_lp_tokens_to_mint(
+    new_ada, new_token, add_ada, add_token, initial_lp
+  )
+  expect additional_lp > 0
+  
+  True
+}
+
+test test_comprehensive_attack_resistance() {
+  // Test resistance to multiple attack vectors simultaneously
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 1000_000_000  // 1000 tokens
+  let fee_bps = 30
+  
+  // Simulate sandwich attack attempt
+  // Step 1: Large front-run trade
+  let frontrun_input = 200_000_000  // 200 ADA
+  let (_, ada_after_frontrun, token_after_frontrun) = 
+    calculate_swap_output(ada_reserve, token_reserve, frontrun_input, fee_bps)
+  
+  // Step 2: Victim trade (now at worse price)
+  let victim_input = 50_000_000  // 50 ADA
+  let (victim_output, ada_after_victim, token_after_victim) = 
+    calculate_swap_output(ada_after_frontrun, token_after_frontrun, victim_input, fee_bps)
+  
+  // Step 3: What victim would have gotten without front-running
+  let (victim_fair_output, _, _) = 
+    calculate_swap_output(ada_reserve, token_reserve, victim_input, fee_bps)
+  
+  // Verify attack impact is limited
+  let impact_bps = (victim_fair_output - victim_output) * 10000 / victim_fair_output
+  expect impact_bps < 2000  // Less than 20% impact
+  expect victim_output > 0  // Victim still gets output
+  
+  // Verify pool integrity maintained
+  expect ada_after_victim > ada_reserve  // ADA increased
+  expect token_after_victim < token_reserve  // Tokens decreased
+  expect token_after_victim > 0  // Pool not drained
+  
+  True
+}
+
+test test_comprehensive_mathematical_stress_test() {
+  // Stress test with multiple mathematical edge cases
+  let stress_scenarios = [
+    // (ada_reserve, token_reserve, input_amount, expected_behavior)
+    (pool_min_ada, 1, 1000),                    // Minimal pool, small trade
+    (1000_000_000_000, 1000, 1000_000),         // Large pool, asymmetric
+    (1000, 1000_000_000_000, 1000),             // Reverse asymmetric
+    (999_999_999, 1000_000_001, 500_000_000)    // Near-equal, large trade
+  ]
+  
+  list.all(stress_scenarios, fn(scenario) {
+    let (ada_reserve, token_reserve, input_amount) = scenario
+    let fee_bps = 30
+    
+    let (output_amount, new_ada_reserve, new_token_reserve) = 
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+    
+    // All scenarios should maintain basic invariants
+    output_amount >= 0 &&
+    new_ada_reserve >= ada_reserve &&
+    new_token_reserve <= token_reserve &&
+    new_token_reserve >= 0 &&
+    // Constant product should be maintained or increase
+    (new_ada_reserve * new_token_reserve) >= (ada_reserve * token_reserve)
+  })
+}
+
+test test_comprehensive_fee_and_slippage_interaction() {
+  // Test interaction between fees and slippage across different scenarios
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let input_amount = 100_000_000
+  
+  let fee_scenarios = [
+    (1, "minimal"),     // 0.01% fee
+    (30, "normal"),     // 0.3% fee
+    (100, "high"),      // 1% fee
+    (500, "extreme")    // 5% fee
+  ]
+  
+  list.all(fee_scenarios, fn(scenario) {
+    let (fee_bps, _) = scenario
+    
+    let (output_amount, new_ada_reserve, new_token_reserve) = 
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+    
+    // Calculate effective slippage (including fees)
+    let expected_no_fee = input_amount * token_reserve / ada_reserve
+    let total_slippage_bps = (expected_no_fee - output_amount) * 10000 / expected_no_fee
+    
+    // Higher fees should result in higher total slippage
+    output_amount > 0 &&
+    new_ada_reserve > ada_reserve &&
+    new_token_reserve < token_reserve &&
+    total_slippage_bps >= fee_bps  // Slippage should at least include fee
+  })
+}
+
+test test_comprehensive_liquidity_lifecycle() {
+  // Test complete liquidity lifecycle with edge cases
+  let initial_ada = pool_min_ada + 1000_000_000
+  let initial_token = 1000_000_000
+  
+  // Initial LP token calculation
+  let initial_lp = calculate_lp_tokens_to_mint(0, 0, initial_ada, initial_token, 0)
+  expect initial_lp > 0
+  
+  // Add more liquidity (different ratio to test proportional calculation)
+  let add_ada = 500_000_000
+  let add_token = 500_000_000  // Same ratio
+  let additional_lp = calculate_lp_tokens_to_mint(
+    initial_ada, initial_token, add_ada, add_token, initial_lp
+  )
+  expect additional_lp > 0
+  
+  // Calculate expected proportional LP tokens
+  let expected_lp = initial_lp * add_ada / initial_ada
+  let lp_diff = if additional_lp > expected_lp {
+    additional_lp - expected_lp
+  } else {
+    expected_lp - additional_lp
+  }
+  expect lp_diff < expected_lp / 100  // Within 1% of expected
+  
+  // Test with unbalanced liquidity addition
+  let unbalanced_ada = 1000_000_000
+  let unbalanced_token = 500_000_000  // Half the proportional amount
+  let total_ada = initial_ada + add_ada
+  let total_token = initial_token + add_token
+  let total_lp = initial_lp + additional_lp
+  
+  let unbalanced_lp = calculate_lp_tokens_to_mint(
+    total_ada, total_token, unbalanced_ada, unbalanced_token, total_lp
+  )
+  
+  // Should get LP tokens based on limiting factor (token in this case)
+  expect unbalanced_lp > 0
+  expect unbalanced_lp < total_lp  // Less than total existing LP
+  
+  True
+}
+
+test test_comprehensive_edge_case_combinations() {
+  // Test combinations of multiple edge cases
+  
+  // Scenario 1: Minimal pool + large trade + high fee
+  let (out1, _, _) = calculate_swap_output(pool_min_ada, 1000, 1000000, 1000)
+  expect out1 >= 0
+  
+  // Scenario 2: Large pool + tiny trade + minimal fee
+  let (out2, _, _) = calculate_swap_output(1000_000_000_000, 1000_000_000_000, 1, 1)
+  expect out2 >= 0
+  
+  // Scenario 3: Asymmetric pool + proportional trade
+  let (out3, _, _) = calculate_swap_output(1000_000_000, 100_000, 100_000, 30)
+  expect out3 >= 0
+  
+  // Scenario 4: Near-zero reserves + minimal trade
+  let (out4, _, _) = calculate_swap_output(1, 1, 1, 30)
+  expect out4 >= 0
+  
+  // All scenarios should produce valid results
+  True
+}

@@ -1,0 +1,288 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, calculate_swap_output, calculate_lp_tokens_to_mint,
+  validate_swap_operation, validate_add_liquidity, validate_remove_liquidity
+}
+
+// Import enhanced validator functions
+use puckswap_pool_validator_enhanced.{
+  EnhancedPoolDatum, validate_enhanced_swap_operation
+}
+
+// Import min ADA utilities
+use lib/min_ada_utils.{
+  validate_pool_operation_min_ada, validate_swap_min_ada_preservation,
+  calculate_pool_min_ada, base_min_ada, pool_min_ada
+}
+
+// =============================================================================
+// TEST DATA SETUP
+// =============================================================================
+
+// Mock addresses for testing
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+fn mock_script_address() -> Address {
+  Address {
+    payment_credential: ScriptCredential(#"fedcba0987654321fedcba0987654321fedcba0987654321fedcba09"),
+    staking_credential: None
+  }
+}
+
+// Mock policy IDs and asset names
+fn mock_pool_nft_policy() -> PolicyId {
+  #"1111111111111111111111111111111111111111111111111111111111111111"
+}
+
+fn mock_token_policy() -> PolicyId {
+  #"2222222222222222222222222222222222222222222222222222222222222222"
+}
+
+fn mock_pool_nft_name() -> AssetName {
+  #"504f4f4c" // "POOL" in hex
+}
+
+fn mock_token_name() -> AssetName {
+  #"50554b4b59" // "PUKKY" in hex
+}
+
+// Create test pool datum
+fn create_test_pool_datum(ada_reserve: Int, token_reserve: Int, fee_bps: Int) -> PoolDatum {
+  PoolDatum {
+    ada_reserve: ada_reserve,
+    token_reserve: token_reserve,
+    fee_bps: fee_bps,
+    pool_nft_policy: mock_pool_nft_policy(),
+    pool_nft_name: mock_pool_nft_name(),
+    token_policy: mock_token_policy(),
+    token_name: mock_token_name(),
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+// Create test enhanced pool datum
+fn create_enhanced_pool_datum(ada_reserve: Int, token_reserve: Int, fee_bps: Int) -> EnhancedPoolDatum {
+  EnhancedPoolDatum {
+    ada_reserve: ada_reserve,
+    token_reserve: token_reserve,
+    fee_bps: fee_bps,
+    pool_nft_policy: mock_pool_nft_policy(),
+    pool_nft_name: mock_pool_nft_name(),
+    token_policy: mock_token_policy(),
+    token_name: mock_token_name(),
+    total_lp_tokens: 0,
+    last_interaction: 0,
+    created_at: 0,
+    admin: mock_user_address(),
+    paused: False
+  }
+}
+
+// Create test value with pool assets
+fn create_pool_value(ada_amount: Int, token_amount: Int) -> Value {
+  let ada_value = from_lovelace(ada_amount)
+  let nft_value = tokens(mock_pool_nft_policy(), mock_pool_nft_name(), 1)
+  let token_value = tokens(mock_token_policy(), mock_token_name(), token_amount)
+  
+  merge(merge(ada_value, nft_value), token_value)
+}
+
+// =============================================================================
+// SLIPPAGE PROTECTION EDGE CASES
+// =============================================================================
+
+test test_maximum_slippage_protection() {
+  // Test swap that would exceed maximum allowed slippage
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 1000_000_000  // 1000 tokens (1:1 ratio)
+  let fee_bps = 30  // 0.3% fee
+  
+  // Large swap that would cause significant slippage
+  let input_amount = 500_000_000  // 500 ADA (50% of pool)
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Calculate actual slippage
+  let expected_output_no_slippage = input_amount  // 1:1 ratio
+  let slippage = (expected_output_no_slippage - output_amount) * 10000 / expected_output_no_slippage
+  
+  // Should have significant slippage due to large trade size
+  expect slippage > 1000  // More than 10% slippage
+  
+  // Verify constant product is maintained
+  let original_product = ada_reserve * token_reserve
+  let new_product = new_ada_reserve * new_token_reserve
+  expect new_product >= original_product  // Should be >= due to fees
+  
+  True
+}
+
+test test_minimum_output_validation() {
+  // Test that swaps fail when minimum output is not met
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (expected_output, _, _) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Set minimum output higher than expected
+  let unrealistic_min_output = expected_output + 1000000
+  
+  // This should fail in actual validator (we're testing the calculation here)
+  expect expected_output < unrealistic_min_output
+  
+  True
+}
+
+test test_price_impact_calculation() {
+  // Test price impact for various trade sizes
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000  // 1:1 ratio
+  let fee_bps = 30
+  
+  // Small trade (1% of pool)
+  let small_input = 10_000_000
+  let (small_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, small_input, fee_bps)
+  let small_price_impact = (small_input - small_output) * 10000 / small_input
+  
+  // Large trade (10% of pool)
+  let large_input = 100_000_000
+  let (large_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, large_input, fee_bps)
+  let large_price_impact = (large_input - large_output) * 10000 / large_input
+  
+  // Large trades should have higher price impact
+  expect large_price_impact > small_price_impact
+  
+  // Both should be positive (some slippage)
+  expect small_price_impact > 0
+  expect large_price_impact > 0
+  
+  True
+}
+
+// =============================================================================
+// EMPTY POOL EDGE CASES
+// =============================================================================
+
+test test_empty_pool_creation() {
+  // Test pool creation with minimal valid liquidity
+  let minimal_ada = pool_min_ada + 1000000  // Just above minimum
+  let minimal_token = 1000  // Minimal token amount
+  let fee_bps = 30
+  
+  let datum = create_test_pool_datum(minimal_ada, minimal_token, fee_bps)
+  
+  // Calculate initial LP tokens
+  let lp_tokens = calculate_lp_tokens_to_mint(0, 0, minimal_ada, minimal_token, 0)
+  
+  // Should be able to create pool with minimal liquidity
+  expect lp_tokens > 0
+  expect datum.ada_reserve == minimal_ada
+  expect datum.token_reserve == minimal_token
+  
+  True
+}
+
+test test_zero_reserve_protection() {
+  // Test that calculations handle zero reserves gracefully
+  let ada_reserve = 0
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  // This should fail or return zero (division by zero protection)
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Output should be zero when one reserve is zero
+  expect output_amount == 0
+  
+  True
+}
+
+test test_pool_drainage_attempt() {
+  // Test attempting to drain pool completely
+  let ada_reserve = 100_000_000  // 100 ADA
+  let token_reserve = 200_000_000  // 200 tokens
+  let fee_bps = 30
+  
+  // Try to swap more than available
+  let excessive_input = ada_reserve + 1000000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, excessive_input, fee_bps)
+  
+  // Should not be able to drain pool completely
+  expect new_token_reserve >= 0
+  expect output_amount <= token_reserve
+  
+  True
+}
+
+// =============================================================================
+// MATHEMATICAL EDGE CASES
+// =============================================================================
+
+test test_integer_overflow_protection() {
+  // Test with very large numbers that could cause overflow
+  let max_safe_int = 9223372036854775807  // Close to max int64
+  let ada_reserve = 1000_000_000_000_000  // 1 billion ADA
+  let token_reserve = 1000_000_000_000_000  // 1 billion tokens
+  let fee_bps = 30
+  let input_amount = 1000_000_000  // 1000 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle large numbers without overflow
+  expect output_amount > 0
+  expect new_ada_reserve > ada_reserve
+  expect new_token_reserve < token_reserve
+  
+  True
+}
+
+test test_precision_loss_in_small_amounts() {
+  // Test precision with very small amounts
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let tiny_input = 1000  // 0.001 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, tiny_input, fee_bps)
+  
+  // Should handle tiny amounts (might be zero due to fees)
+  expect output_amount >= 0
+  
+  True
+}
+
+test test_division_by_zero_protection() {
+  // Test edge cases that could cause division by zero
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 10000  // 100% fee (edge case)
+  let input_amount = 100_000_000
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // With 100% fee, output should be zero
+  expect output_amount == 0
+  
+  True
+}

@@ -1,0 +1,497 @@
+use aiken/transaction.{ScriptContext, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, from_lovelace, merge, negate, tokens, flatten
+}
+use aiken/list
+use aiken/math
+use aiken/cbor
+use aiken/bytearray
+
+// Import min ADA utilities
+use puckswap/lib/min_ada_utils.{
+  validate_pool_operation_min_ada, validate_swap_min_ada_preservation,
+  validate_liquidity_removal_min_ada, validate_transaction_comprehensive_min_ada,
+  calculate_pool_min_ada, estimate_datum_size,
+  PoolOperationType, SwapOperation, AddLiquidityOperation, RemoveLiquidityOperation, CreatePoolOperation
+}
+
+// Import redeemer parser
+use puckswap/lib/redeemer_parser.{
+  parse_pool_redeemer, PoolRedeemer, Success, Error, error_to_string
+}
+
+// Import value utilities
+use puckswap/lib/value_utils.{get_ada_quantity, validate_min_ada}
+
+// =============================================================================
+// ENHANCED POOL DATUM WITH MIN ADA TRACKING
+// =============================================================================
+
+// Enhanced pool datum that tracks min ADA requirements
+pub type EnhancedPoolDatum {
+  // Core pool data
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_total_supply: Int,
+  fee_bps: Int,
+  
+  // Min ADA tracking
+  min_ada_requirement: Int,
+  last_min_ada_check: Int, // Slot number of last validation
+  
+  // Pool configuration
+  is_paused: Bool,
+  admin: Address,
+  
+  // Statistics
+  total_swaps: Int,
+  total_volume_ada: Int,
+  created_at_slot: Int
+}
+
+// =============================================================================
+// ENHANCED POOL VALIDATOR WITH COMPREHENSIVE MIN ADA HANDLING
+// =============================================================================
+
+// Enhanced pool validator with comprehensive min ADA validation
+validator enhanced_pool_validator(
+  ctx: ScriptContext, 
+  datum: EnhancedPoolDatum, 
+  redeemer_data: Data
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Parse the redeemer using our parser
+      when parse_pool_redeemer(redeemer_data) is {
+        Success(redeemer) -> {
+          // Find pool input and output
+          expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+          expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+          
+          // Estimate datum size for min ADA calculations
+          let datum_size = estimate_datum_size(pool_output.datum)
+          
+          // Validate basic min ADA constraints first
+          expect validate_enhanced_basic_constraints(pool_input, pool_output, datum, datum_size, ctx)
+          
+          // Handle specific operations with enhanced min ADA validation
+          handle_enhanced_pool_operation(redeemer, pool_input, pool_output, datum, datum_size, ctx)
+        }
+        Error(error) -> {
+          trace "Failed to parse pool redeemer: " <> error_to_string(error)
+          False
+        }
+      }
+    }
+    _ -> False
+  }
+}
+
+// Enhanced basic constraints with comprehensive min ADA validation
+fn validate_enhanced_basic_constraints(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate pool NFT preservation
+  let input_nft_count = quantity_of(pool_input.output.value, datum.pool_nft_policy, datum.pool_nft_name)
+  let output_nft_count = quantity_of(pool_output.value, datum.pool_nft_policy, datum.pool_nft_name)
+  expect input_nft_count == 1 && output_nft_count == 1
+  
+  // Enhanced min ADA validation for pool UTxO
+  let pool_min_ada = calculate_pool_min_ada(pool_output.value, datum_size, True, 1)
+  let pool_output_ada = get_ada_quantity(pool_output.value)
+  expect pool_output_ada >= pool_min_ada
+  
+  // Validate comprehensive transaction min ADA requirements
+  expect validate_transaction_comprehensive_min_ada(ctx, datum_size, SwapOperation)
+  
+  // Validate pool is not paused (unless emergency operation)
+  expect !datum.is_paused
+  
+  True
+}
+
+// Handle enhanced pool operations with min ADA validation
+fn handle_enhanced_pool_operation(
+  redeemer: PoolRedeemer,
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  ctx: ScriptContext
+) -> Bool {
+  when redeemer is {
+    PoolRedeemer::Swap { input_amount, min_output, deadline, recipient } -> {
+      validate_enhanced_swap_operation(
+        pool_input, pool_output, datum, datum_size,
+        input_amount, min_output, deadline, recipient, ctx
+      )
+    }
+    
+    PoolRedeemer::AddLiquidity { ada_amount, token_amount, min_lp_tokens, deadline } -> {
+      validate_enhanced_add_liquidity_operation(
+        pool_input, pool_output, datum, datum_size,
+        ada_amount, token_amount, min_lp_tokens, deadline, ctx
+      )
+    }
+    
+    PoolRedeemer::RemoveLiquidity { lp_tokens, min_ada_out, min_token_out, deadline } -> {
+      validate_enhanced_remove_liquidity_operation(
+        pool_input, pool_output, datum, datum_size,
+        lp_tokens, min_ada_out, min_token_out, deadline, ctx
+      )
+    }
+    
+    PoolRedeemer::CreatePool { initial_ada, initial_token, fee_bps } -> {
+      validate_enhanced_pool_creation(
+        pool_input, pool_output, datum, datum_size,
+        initial_ada, initial_token, fee_bps, ctx
+      )
+    }
+    
+    PoolRedeemer::EmergencyPause -> {
+      validate_enhanced_emergency_pause(pool_input, pool_output, datum, ctx)
+    }
+    
+    PoolRedeemer::EmergencyUnpause -> {
+      validate_enhanced_emergency_unpause(pool_input, pool_output, datum, ctx)
+    }
+  }
+}
+
+// =============================================================================
+// ENHANCED OPERATION VALIDATORS
+// =============================================================================
+
+// Enhanced swap operation with comprehensive min ADA validation
+fn validate_enhanced_swap_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  input_amount: Int,
+  min_output: Int,
+  deadline: Int,
+  recipient: Address,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate deadline
+  expect validate_deadline(deadline, ctx)
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Calculate swap using constant product formula
+  let (expected_output, new_ada_reserve, new_token_reserve) =
+    calculate_swap_output(datum.ada_reserve, datum.token_reserve, input_amount, datum.fee_bps)
+  
+  // Validate minimum output
+  expect expected_output >= min_output
+  
+  // Enhanced min ADA validation for swap
+  expect validate_pool_operation_min_ada(
+    pool_input.output, pool_output, datum_size, SwapOperation
+  )
+  
+  // Validate swap doesn't drain pool below minimum ADA
+  expect validate_swap_min_ada_preservation(
+    datum.ada_reserve, new_ada_reserve, pool_output.value, datum_size
+  )
+  
+  // Validate reserves are updated correctly
+  expect new_pool_datum.ada_reserve == new_ada_reserve
+  expect new_pool_datum.token_reserve == new_token_reserve
+  
+  // Validate min ADA requirement is updated
+  let updated_min_ada = calculate_pool_min_ada(pool_output.value, datum_size, True, 1)
+  expect new_pool_datum.min_ada_requirement == updated_min_ada
+  
+  // Validate user receives correct output with min ADA
+  validate_enhanced_user_swap_output(expected_output, recipient, ctx)
+}
+
+// Enhanced add liquidity with min ADA validation
+fn validate_enhanced_add_liquidity_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  deadline: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate deadline
+  expect validate_deadline(deadline, ctx)
+  
+  // Validate amounts are positive
+  expect ada_amount > 0 && token_amount > 0 && min_lp_tokens >= 0
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Calculate LP tokens to mint
+  let lp_tokens_to_mint = calculate_lp_tokens_to_mint(
+    datum.ada_reserve, datum.token_reserve, datum.lp_total_supply,
+    ada_amount, token_amount
+  )
+  
+  // Validate minimum LP tokens
+  expect lp_tokens_to_mint >= min_lp_tokens
+  
+  // Enhanced min ADA validation for liquidity addition
+  expect validate_pool_operation_min_ada(
+    pool_input.output, pool_output, datum_size, AddLiquidityOperation
+  )
+  
+  // Validate reserves are updated correctly
+  expect new_pool_datum.ada_reserve == datum.ada_reserve + ada_amount
+  expect new_pool_datum.token_reserve == datum.token_reserve + token_amount
+  expect new_pool_datum.lp_total_supply == datum.lp_total_supply + lp_tokens_to_mint
+  
+  // Validate min ADA requirement is updated
+  let updated_min_ada = calculate_pool_min_ada(pool_output.value, datum_size, True, 1)
+  expect new_pool_datum.min_ada_requirement == updated_min_ada
+  
+  True
+}
+
+// Enhanced remove liquidity with min ADA validation
+fn validate_enhanced_remove_liquidity_operation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  lp_tokens: Int,
+  min_ada_out: Int,
+  min_token_out: Int,
+  deadline: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate deadline
+  expect validate_deadline(deadline, ctx)
+  
+  // Validate LP tokens amount
+  expect lp_tokens > 0 && lp_tokens <= datum.lp_total_supply
+  
+  // Calculate withdrawal amounts
+  let ada_to_withdraw = datum.ada_reserve * lp_tokens / datum.lp_total_supply
+  let token_to_withdraw = datum.token_reserve * lp_tokens / datum.lp_total_supply
+  
+  // Validate minimum outputs
+  expect ada_to_withdraw >= min_ada_out
+  expect token_to_withdraw >= min_token_out
+  
+  // Enhanced min ADA validation for liquidity removal
+  expect validate_pool_operation_min_ada(
+    pool_input.output, pool_output, datum_size, RemoveLiquidityOperation
+  )
+  
+  // Validate liquidity removal doesn't break min ADA requirements
+  expect validate_liquidity_removal_min_ada(
+    datum.ada_reserve, datum.ada_reserve - ada_to_withdraw,
+    ada_to_withdraw, pool_output.value, datum_size
+  )
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Validate reserves are updated correctly
+  expect new_pool_datum.ada_reserve == datum.ada_reserve - ada_to_withdraw
+  expect new_pool_datum.token_reserve == datum.token_reserve - token_to_withdraw
+  expect new_pool_datum.lp_total_supply == datum.lp_total_supply - lp_tokens
+  
+  // Validate min ADA requirement is updated
+  let updated_min_ada = calculate_pool_min_ada(pool_output.value, datum_size, True, 1)
+  expect new_pool_datum.min_ada_requirement == updated_min_ada
+  
+  True
+}
+
+// Enhanced pool creation with min ADA validation
+fn validate_enhanced_pool_creation(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  datum_size: Int,
+  initial_ada: Int,
+  initial_token: Int,
+  fee_bps: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate initial amounts
+  expect initial_ada > 0 && initial_token > 0
+  expect fee_bps >= 0 && fee_bps <= 10000
+  
+  // Enhanced min ADA validation for pool creation
+  expect validate_pool_operation_min_ada(
+    pool_input.output, pool_output, datum_size, CreatePoolOperation
+  )
+  
+  // Validate initial funding meets enhanced min ADA requirements
+  let required_min_ada = calculate_pool_min_ada(pool_output.value, datum_size, True, 1)
+  expect initial_ada >= required_min_ada
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Validate initial state
+  expect new_pool_datum.ada_reserve == initial_ada
+  expect new_pool_datum.token_reserve == initial_token
+  expect new_pool_datum.fee_bps == fee_bps
+  expect new_pool_datum.min_ada_requirement == required_min_ada
+  
+  True
+}
+
+// Enhanced emergency pause validation
+fn validate_enhanced_emergency_pause(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate admin signature
+  let admin_signed = when datum.admin.payment_credential is {
+    credential.VerificationKeyCredential(admin_pkh) -> 
+      list.has(ctx.transaction.extra_signatories, admin_pkh)
+    _ -> False
+  }
+  expect admin_signed
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Validate pause state
+  expect new_pool_datum.is_paused == True
+  
+  // Validate reserves and min ADA are preserved
+  expect new_pool_datum.ada_reserve == datum.ada_reserve
+  expect new_pool_datum.token_reserve == datum.token_reserve
+  expect new_pool_datum.min_ada_requirement == datum.min_ada_requirement
+  
+  True
+}
+
+// Enhanced emergency unpause validation
+fn validate_enhanced_emergency_unpause(
+  pool_input: transaction.Input,
+  pool_output: transaction.Output,
+  datum: EnhancedPoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate admin signature
+  let admin_signed = when datum.admin.payment_credential is {
+    credential.VerificationKeyCredential(admin_pkh) -> 
+      list.has(ctx.transaction.extra_signatories, admin_pkh)
+    _ -> False
+  }
+  expect admin_signed
+  
+  // Get new pool datum
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: EnhancedPoolDatum = output_datum_data
+  
+  // Validate unpause state
+  expect new_pool_datum.is_paused == False
+  
+  // Validate reserves and min ADA are preserved
+  expect new_pool_datum.ada_reserve == datum.ada_reserve
+  expect new_pool_datum.token_reserve == datum.token_reserve
+  expect new_pool_datum.min_ada_requirement == datum.min_ada_requirement
+  
+  True
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+// Validate deadline against transaction validity range
+fn validate_deadline(deadline: Int, ctx: ScriptContext) -> Bool {
+  when ctx.transaction.validity_range.upper_bound.bound_type is {
+    transaction.Finite(upper_bound) -> upper_bound <= deadline
+    transaction.PosInfinity -> True
+    _ -> False
+  }
+}
+
+// Calculate swap output using constant product formula
+fn calculate_swap_output(
+  ada_reserve: Int,
+  token_reserve: Int,
+  input_amount: Int,
+  fee_bps: Int
+) -> (Int, Int, Int) {
+  // Calculate fee
+  let fee_amount = input_amount * fee_bps / 10000
+  let input_after_fee = input_amount - fee_amount
+
+  // Apply constant product formula: (x + dx) * (y - dy) = x * y
+  let new_ada_reserve = ada_reserve + input_after_fee
+  let output_amount = token_reserve * input_after_fee / new_ada_reserve
+  let new_token_reserve = token_reserve - output_amount
+
+  (output_amount, new_ada_reserve, new_token_reserve)
+}
+
+// Calculate LP tokens to mint for liquidity addition
+fn calculate_lp_tokens_to_mint(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  ada_amount: Int,
+  token_amount: Int
+) -> Int {
+  if total_lp_supply == 0 {
+    // Initial liquidity - use geometric mean
+    math.sqrt(ada_amount * token_amount)
+  } else {
+    // Proportional to existing reserves
+    let ada_ratio = ada_amount * total_lp_supply / ada_reserve
+    let token_ratio = token_amount * total_lp_supply / token_reserve
+    math.min(ada_ratio, token_ratio)
+  }
+}
+
+// Validate user receives correct swap output with min ADA
+fn validate_enhanced_user_swap_output(
+  expected_output: Int,
+  recipient: Address,
+  ctx: ScriptContext
+) -> Bool {
+  // Find outputs to the recipient
+  let user_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == recipient
+  })
+
+  // Calculate total output to user
+  let total_user_output = list.fold(user_outputs, 0, fn(output, acc) {
+    // This is simplified - would need to check specific asset types
+    acc + get_ada_quantity(output.value)
+  })
+
+  // Validate user receives at least expected output
+  total_user_output >= expected_output &&
+  // Validate all user outputs meet min ADA requirements
+  list.all(user_outputs, fn(output) {
+    let ada_amount = get_ada_quantity(output.value)
+    let min_user_ada = calculate_user_output_min_ada(output.value, False)
+    ada_amount >= min_user_ada
+  })
+}

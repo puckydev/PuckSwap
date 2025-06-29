@@ -1,0 +1,442 @@
+// PuckSwap v4 Enterprise - Enhanced LP Minting Policy
+// LP token minting with bonding curve incentives and governance integration
+// CIP-68 compliant with comprehensive security measures
+
+use aiken/transaction.{ScriptContext, Mint, find_input, find_output}
+use aiken/transaction/credential.{Address, ScriptCredential, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, tokens, merge, from_lovelace, flatten}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/option
+use aiken/hash.{blake2b_256}
+
+// Import shared types and utilities
+use puckswap/lib/cip68_types.{CIP68Metadata, CIP68_REFERENCE_PREFIX, CIP68_USER_PREFIX}
+use puckswap/lib/min_ada_utils.{min_ada, validate_min_ada_output}
+use puckswap/lib/value_utils.{ada_policy_id, ada_asset_name}
+
+// Bonding curve parameters
+type BondingCurveParams {
+  initial_supply: Int,
+  curve_slope: Int,        // Multiplied by 1000 for precision
+  max_supply: Int,
+  incentive_multiplier: Int, // Bonus for early LPs
+  decay_factor: Int,       // How quickly incentives decay
+}
+
+// LP position with enhanced metadata
+type LPPosition {
+  pool_id: ByteArray,
+  lp_token_amount: Int,
+  ada_contributed: Int,
+  token_contributed: Int,
+  created_at_slot: Int,
+  bonding_curve_bonus: Int,
+  governance_weight: Int,
+  last_reward_claim_slot: Int,
+}
+
+// LP minting context
+type LPMintingContext {
+  operation_type: LPOperationType,
+  pool_address: Address,
+  pool_nft_policy: PolicyId,
+  pool_nft_name: AssetName,
+  bonding_curve_params: BondingCurveParams,
+  governance_address: Address,
+}
+
+type LPOperationType {
+  InitialMint {
+    initial_ada: Int,
+    initial_token: Int,
+    pool_creator: Address,
+  }
+  
+  AddLiquidity {
+    ada_amount: Int,
+    token_amount: Int,
+    min_lp_tokens: Int,
+    liquidity_provider: Address,
+  }
+  
+  RemoveLiquidity {
+    lp_tokens_to_burn: Int,
+    min_ada_out: Int,
+    min_token_out: Int,
+    liquidity_provider: Address,
+  }
+  
+  GovernanceReward {
+    reward_amount: Int,
+    recipient: Address,
+    proposal_id: Int,
+  }
+  
+  BondingCurveIncentive {
+    incentive_amount: Int,
+    recipient: Address,
+    curve_position: Int,
+  }
+}
+
+// Enhanced LP minting policy
+minting_policy lp_minting_policy_v4(
+  ctx: ScriptContext,
+  minting_context: LPMintingContext
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Validate minting context
+      expect validate_lp_minting_context(minting_context, ctx)
+      
+      // Get minted/burned tokens
+      let minted_tokens = flatten(ctx.transaction.mint)
+      let lp_tokens = filter_lp_tokens(minted_tokens, policy_id)
+      
+      // Handle different operation types
+      when minting_context.operation_type is {
+        InitialMint { initial_ada, initial_token, pool_creator } ->
+          validate_initial_lp_mint(
+            lp_tokens, initial_ada, initial_token, pool_creator, minting_context, ctx
+          )
+        
+        AddLiquidity { ada_amount, token_amount, min_lp_tokens, liquidity_provider } ->
+          validate_add_liquidity_mint(
+            lp_tokens, ada_amount, token_amount, min_lp_tokens, liquidity_provider, minting_context, ctx
+          )
+        
+        RemoveLiquidity { lp_tokens_to_burn, min_ada_out, min_token_out, liquidity_provider } ->
+          validate_remove_liquidity_burn(
+            lp_tokens, lp_tokens_to_burn, min_ada_out, min_token_out, liquidity_provider, minting_context, ctx
+          )
+        
+        GovernanceReward { reward_amount, recipient, proposal_id } ->
+          validate_governance_reward_mint(
+            lp_tokens, reward_amount, recipient, proposal_id, minting_context, ctx
+          )
+        
+        BondingCurveIncentive { incentive_amount, recipient, curve_position } ->
+          validate_bonding_curve_incentive_mint(
+            lp_tokens, incentive_amount, recipient, curve_position, minting_context, ctx
+          )
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate LP minting context
+fn validate_lp_minting_context(
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate pool address structure
+  expect validate_address_structure(minting_context.pool_address)
+  
+  // Validate pool NFT policy and name
+  expect bytearray.length(minting_context.pool_nft_policy) == 28
+  expect bytearray.length(minting_context.pool_nft_name) > 0
+  
+  // Validate bonding curve parameters
+  expect validate_bonding_curve_params(minting_context.bonding_curve_params)
+  
+  // Validate governance address
+  expect validate_address_structure(minting_context.governance_address)
+  
+  True
+}
+
+// Validate initial LP mint
+fn validate_initial_lp_mint(
+  lp_tokens: List<(AssetName, Int)>,
+  initial_ada: Int,
+  initial_token: Int,
+  pool_creator: Address,
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate initial liquidity amounts
+  expect initial_ada > 0 && initial_token > 0
+  expect initial_ada >= 1_000_000  // Minimum 1 ADA
+  
+  // Calculate initial LP token supply using bonding curve
+  let initial_lp_supply = calculate_initial_lp_supply(
+    initial_ada, initial_token, minting_context.bonding_curve_params
+  )
+  
+  // Validate LP tokens being minted
+  expect list.length(lp_tokens) == 1
+  expect Some((lp_token_name, lp_amount)) = list.head(lp_tokens)
+  expect lp_amount == initial_lp_supply
+  
+  // Validate pool creator receives LP tokens
+  expect validate_lp_token_recipient(ctx.transaction.outputs, pool_creator, lp_token_name, lp_amount)
+  
+  // Validate pool UTxO is created with proper liquidity
+  expect validate_pool_creation_output(ctx.transaction.outputs, minting_context, initial_ada, initial_token)
+  
+  True
+}
+
+// Validate add liquidity mint
+fn validate_add_liquidity_mint(
+  lp_tokens: List<(AssetName, Int)>,
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  liquidity_provider: Address,
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate liquidity amounts
+  expect ada_amount > 0 && token_amount > 0
+  expect min_lp_tokens > 0
+  
+  // Find pool input and output
+  expect Some(pool_input) = find_pool_input(ctx.transaction.inputs, minting_context.pool_address)
+  expect Some(pool_output) = find_pool_output(ctx.transaction.outputs, minting_context.pool_address)
+  
+  // Get current pool reserves
+  let (current_ada_reserve, current_token_reserve, current_lp_supply) = 
+    extract_pool_reserves(pool_input.output.value, pool_output.value)
+  
+  // Calculate LP tokens to mint with bonding curve bonus
+  let base_lp_tokens = calculate_lp_tokens_to_mint(
+    ada_amount, token_amount, current_ada_reserve, current_token_reserve, current_lp_supply
+  )
+  
+  let bonding_curve_bonus = calculate_bonding_curve_bonus(
+    current_lp_supply, minting_context.bonding_curve_params
+  )
+  
+  let total_lp_tokens = base_lp_tokens + bonding_curve_bonus
+  
+  // Validate minimum LP tokens requirement
+  expect total_lp_tokens >= min_lp_tokens
+  
+  // Validate LP tokens being minted
+  expect list.length(lp_tokens) == 1
+  expect Some((lp_token_name, lp_amount)) = list.head(lp_tokens)
+  expect lp_amount == total_lp_tokens
+  
+  // Validate liquidity provider receives LP tokens
+  expect validate_lp_token_recipient(ctx.transaction.outputs, liquidity_provider, lp_token_name, lp_amount)
+  
+  // Validate pool reserves are updated correctly
+  expect validate_pool_reserve_update(pool_input, pool_output, ada_amount, token_amount)
+  
+  True
+}
+
+// Validate remove liquidity burn
+fn validate_remove_liquidity_burn(
+  lp_tokens: List<(AssetName, Int)>,
+  lp_tokens_to_burn: Int,
+  min_ada_out: Int,
+  min_token_out: Int,
+  liquidity_provider: Address,
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate burn amount is positive
+  expect lp_tokens_to_burn > 0
+  expect min_ada_out > 0 && min_token_out > 0
+  
+  // Find pool input and output
+  expect Some(pool_input) = find_pool_input(ctx.transaction.inputs, minting_context.pool_address)
+  expect Some(pool_output) = find_pool_output(ctx.transaction.outputs, minting_context.pool_address)
+  
+  // Get current pool reserves
+  let (current_ada_reserve, current_token_reserve, current_lp_supply) = 
+    extract_pool_reserves(pool_input.output.value, pool_output.value)
+  
+  // Calculate ADA and token amounts to return
+  let ada_to_return = (lp_tokens_to_burn * current_ada_reserve) / current_lp_supply
+  let token_to_return = (lp_tokens_to_burn * current_token_reserve) / current_lp_supply
+  
+  // Validate minimum output requirements
+  expect ada_to_return >= min_ada_out
+  expect token_to_return >= min_token_out
+  
+  // Validate LP tokens being burned (negative amount)
+  expect list.length(lp_tokens) == 1
+  expect Some((lp_token_name, lp_amount)) = list.head(lp_tokens)
+  expect lp_amount == -lp_tokens_to_burn
+  
+  // Validate liquidity provider receives ADA and tokens
+  expect validate_liquidity_withdrawal_outputs(
+    ctx.transaction.outputs, liquidity_provider, ada_to_return, token_to_return
+  )
+  
+  // Validate pool reserves are updated correctly
+  expect validate_pool_reserve_reduction(pool_input, pool_output, ada_to_return, token_to_return)
+  
+  True
+}
+
+// Validate governance reward mint
+fn validate_governance_reward_mint(
+  lp_tokens: List<(AssetName, Int)>,
+  reward_amount: Int,
+  recipient: Address,
+  proposal_id: Int,
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate reward amount
+  expect reward_amount > 0
+  expect proposal_id > 0
+  
+  // Validate governance authorization
+  expect validate_governance_authorization(minting_context.governance_address, ctx)
+  
+  // Validate LP tokens being minted as reward
+  expect list.length(lp_tokens) == 1
+  expect Some((lp_token_name, lp_amount)) = list.head(lp_tokens)
+  expect lp_amount == reward_amount
+  
+  // Validate recipient receives reward tokens
+  expect validate_lp_token_recipient(ctx.transaction.outputs, recipient, lp_token_name, lp_amount)
+  
+  True
+}
+
+// Validate bonding curve incentive mint
+fn validate_bonding_curve_incentive_mint(
+  lp_tokens: List<(AssetName, Int)>,
+  incentive_amount: Int,
+  recipient: Address,
+  curve_position: Int,
+  minting_context: LPMintingContext,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate incentive parameters
+  expect incentive_amount > 0
+  expect curve_position >= 0
+  
+  // Calculate expected incentive based on bonding curve
+  let expected_incentive = calculate_bonding_curve_incentive(
+    curve_position, minting_context.bonding_curve_params
+  )
+  
+  expect incentive_amount <= expected_incentive
+  
+  // Validate LP tokens being minted as incentive
+  expect list.length(lp_tokens) == 1
+  expect Some((lp_token_name, lp_amount)) = list.head(lp_tokens)
+  expect lp_amount == incentive_amount
+  
+  // Validate recipient receives incentive tokens
+  expect validate_lp_token_recipient(ctx.transaction.outputs, recipient, lp_token_name, lp_amount)
+  
+  True
+}
+
+// Helper function to filter LP tokens from minted tokens
+fn filter_lp_tokens(
+  minted_tokens: List<(PolicyId, AssetName, Int)>,
+  lp_policy: PolicyId
+) -> List<(AssetName, Int)> {
+  when minted_tokens is {
+    [] -> []
+    [(policy, name, amount), ..tail] ->
+      if policy == lp_policy {
+        [(name, amount), ..filter_lp_tokens(tail, lp_policy)]
+      } else {
+        filter_lp_tokens(tail, lp_policy)
+      }
+  }
+}
+
+// Validate bonding curve parameters
+fn validate_bonding_curve_params(params: BondingCurveParams) -> Bool {
+  expect params.initial_supply > 0
+  expect params.curve_slope > 0
+  expect params.max_supply > params.initial_supply
+  expect params.incentive_multiplier >= 1000  // At least 1x multiplier
+  expect params.decay_factor > 0 && params.decay_factor <= 1000
+  
+  True
+}
+
+// Calculate initial LP supply using bonding curve
+fn calculate_initial_lp_supply(
+  initial_ada: Int,
+  initial_token: Int,
+  params: BondingCurveParams
+) -> Int {
+  // Use geometric mean for initial supply calculation
+  let geometric_mean = math.sqrt(initial_ada * initial_token)
+  
+  // Apply bonding curve formula
+  let base_supply = (geometric_mean * params.curve_slope) / 1000
+  
+  // Ensure minimum supply
+  if base_supply < params.initial_supply {
+    params.initial_supply
+  } else {
+    base_supply
+  }
+}
+
+// Calculate LP tokens to mint for liquidity addition
+fn calculate_lp_tokens_to_mint(
+  ada_amount: Int,
+  token_amount: Int,
+  ada_reserve: Int,
+  token_reserve: Int,
+  lp_supply: Int
+) -> Int {
+  // Use the minimum ratio to prevent manipulation
+  let ada_ratio = (ada_amount * lp_supply) / ada_reserve
+  let token_ratio = (token_amount * lp_supply) / token_reserve
+  
+  if ada_ratio < token_ratio {
+    ada_ratio
+  } else {
+    token_ratio
+  }
+}
+
+// Calculate bonding curve bonus
+fn calculate_bonding_curve_bonus(
+  current_lp_supply: Int,
+  params: BondingCurveParams
+) -> Int {
+  if current_lp_supply >= params.max_supply {
+    0
+  } else {
+    let supply_ratio = (current_lp_supply * 1000) / params.max_supply
+    let decay_multiplier = 1000 - ((supply_ratio * params.decay_factor) / 1000)
+    let bonus_base = (params.incentive_multiplier * decay_multiplier) / 1000
+    
+    // Calculate bonus amount (percentage of base LP tokens)
+    (current_lp_supply * bonus_base) / 10000
+  }
+}
+
+// Calculate bonding curve incentive
+fn calculate_bonding_curve_incentive(
+  curve_position: Int,
+  params: BondingCurveParams
+) -> Int {
+  if curve_position >= params.max_supply {
+    0
+  } else {
+    let position_ratio = (curve_position * 1000) / params.max_supply
+    let incentive_multiplier = params.incentive_multiplier - ((position_ratio * params.decay_factor) / 1000)
+    
+    // Calculate incentive amount
+    (params.initial_supply * incentive_multiplier) / 10000
+  }
+}
+
+// Validate address structure
+fn validate_address_structure(address: Address) -> Bool {
+  when address.payment_credential is {
+    ScriptCredential(_) -> True
+    VerificationKeyCredential(_) -> True
+  }
+}

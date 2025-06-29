@@ -1,0 +1,10 @@
+// Simple validator to test Aiken compilation
+
+use aiken/transaction.{ScriptContext, Spend}
+
+validator simple_validator(datum: Data, redeemer: Data, ctx: ScriptContext) -> Bool {
+  when ctx.purpose is {
+    Spend(_) -> True
+    _ -> False
+  }
+}

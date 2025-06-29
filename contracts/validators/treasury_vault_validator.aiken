@@ -1,0 +1,480 @@
+// PuckSwap v4 Enterprise - Treasury Vault Validator
+// Revenue collection and distribution system with DAO governance control
+// CIP-68 compliant with comprehensive fee management
+
+use aiken/transaction.{ScriptContext, Spend, find_input, find_output}
+use aiken/transaction/credential.{Address, ScriptCredential, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, quantity_of, tokens, merge, from_lovelace, flatten}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/option
+use aiken/hash.{blake2b_256}
+
+// Import shared types and utilities
+use puckswap/lib/cip68_types.{CIP68Metadata, CIP68_REFERENCE_PREFIX, CIP68_USER_PREFIX}
+use puckswap/lib/min_ada_utils.{min_ada, validate_min_ada_output}
+use puckswap/lib/value_utils.{ada_policy_id, ada_asset_name}
+
+// Revenue source tracking
+type RevenueSource {
+  SwapFees { pool_id: ByteArray, volume: Int }
+  RegistrationFees { pool_count: Int }
+  GovernanceFees { proposal_count: Int }
+  LiquidityIncentives { lp_rewards: Int }
+  Other { source_type: ByteArray, amount: Int }
+}
+
+// Distribution target
+type DistributionTarget {
+  LiquidityProviders { 
+    pool_id: ByteArray,
+    lp_addresses: List<Address>,
+    amounts: List<Int>,
+  }
+  
+  DevelopmentFund {
+    recipient: Address,
+    amount: Int,
+    purpose: ByteArray,
+  }
+  
+  GovernanceRewards {
+    voter_addresses: List<Address>,
+    amounts: List<Int>,
+  }
+  
+  ProtocolUpgrade {
+    upgrade_fund: Address,
+    amount: Int,
+    upgrade_id: ByteArray,
+  }
+  
+  CommunityGrants {
+    grant_recipients: List<Address>,
+    amounts: List<Int>,
+    grant_purposes: List<ByteArray>,
+  }
+}
+
+// Revenue record for tracking income
+type RevenueRecord {
+  source: RevenueSource,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  amount: Int,
+  received_at_slot: Int,
+  transaction_hash: ByteArray,
+}
+
+// Distribution record for tracking payouts
+type DistributionRecord {
+  target: DistributionTarget,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  total_amount: Int,
+  distributed_at_slot: Int,
+  transaction_hash: ByteArray,
+  governance_proposal_id: Option<Int>,
+}
+
+// CIP-68 compliant treasury datum
+type TreasuryDatum {
+  // CIP-68 metadata structure
+  metadata: CIP68Metadata,
+  version: Int,
+  
+  // Treasury state
+  total_revenue_collected: Int,
+  total_distributed: Int,
+  current_balance: Value,
+  
+  // Revenue tracking
+  revenue_records: List<RevenueRecord>,
+  distribution_records: List<DistributionRecord>,
+  
+  // Distribution configuration
+  lp_reward_percentage: Int,      // Basis points for LP rewards
+  development_percentage: Int,    // Basis points for development
+  governance_percentage: Int,     // Basis points for governance rewards
+  protocol_percentage: Int,       // Basis points for protocol upgrades
+  community_percentage: Int,      // Basis points for community grants
+  
+  // Governance integration
+  governance_address: Address,
+  auto_distribution_enabled: Bool,
+  distribution_threshold: Int,    // Minimum amount before auto-distribution
+  
+  // Administrative
+  admin_addresses: List<Address>,
+  emergency_admin: Address,
+  
+  // Security
+  paused: Bool,
+  max_single_distribution: Int,
+  daily_distribution_limit: Int,
+  last_distribution_slot: Int,
+  
+  // Supported assets
+  supported_assets: List<(PolicyId, AssetName)>,
+}
+
+// Treasury operations
+type TreasuryRedeemer {
+  // Revenue collection
+  CollectRevenue {
+    source: RevenueSource,
+    amount: Int,
+    token_policy: PolicyId,
+    token_name: AssetName,
+  }
+  
+  // Distribution operations
+  DistributeRevenue {
+    targets: List<DistributionTarget>,
+    governance_proposal_id: Option<Int>,
+  }
+  
+  AutoDistribute {
+    distribution_percentage: Int,
+  }
+  
+  // Configuration updates
+  UpdateDistributionConfig {
+    new_lp_percentage: Int,
+    new_development_percentage: Int,
+    new_governance_percentage: Int,
+    new_protocol_percentage: Int,
+    new_community_percentage: Int,
+  }
+  
+  UpdateOperationalConfig {
+    new_distribution_threshold: Int,
+    new_max_single_distribution: Int,
+    new_daily_limit: Int,
+    auto_distribution: Bool,
+  }
+  
+  // Asset management
+  AddSupportedAsset {
+    token_policy: PolicyId,
+    token_name: AssetName,
+  }
+  
+  RemoveSupportedAsset {
+    token_policy: PolicyId,
+    token_name: AssetName,
+  }
+  
+  // Administrative
+  UpdateAdmins {
+    new_admins: List<Address>,
+  }
+  
+  UpdateGovernanceAddress {
+    new_governance_address: Address,
+  }
+  
+  // Emergency operations
+  EmergencyPause
+  EmergencyUnpause
+  EmergencyWithdraw {
+    recipient: Address,
+    amount: Int,
+    token_policy: PolicyId,
+    token_name: AssetName,
+    reason: ByteArray,
+  }
+}
+
+// Main treasury vault validator
+validator treasury_vault_validator(
+  ctx: ScriptContext,
+  datum: TreasuryDatum,
+  redeemer: TreasuryRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find treasury input and output
+      expect Some(treasury_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(treasury_output) = find_output(ctx.transaction.outputs, treasury_input.output.address)
+      
+      // Validate basic constraints
+      expect validate_treasury_basic_constraints(treasury_input, treasury_output, datum, ctx)
+      
+      // Handle specific operations
+      when redeemer is {
+        CollectRevenue { source, amount, token_policy, token_name } ->
+          validate_revenue_collection(treasury_input, treasury_output, datum, source, amount, token_policy, token_name, ctx)
+        
+        DistributeRevenue { targets, governance_proposal_id } ->
+          validate_revenue_distribution(treasury_input, treasury_output, datum, targets, governance_proposal_id, ctx)
+        
+        AutoDistribute { distribution_percentage } ->
+          validate_auto_distribution(treasury_input, treasury_output, datum, distribution_percentage, ctx)
+        
+        UpdateDistributionConfig { new_lp_percentage, new_development_percentage, new_governance_percentage, new_protocol_percentage, new_community_percentage } ->
+          validate_distribution_config_update(
+            treasury_input, treasury_output, datum,
+            new_lp_percentage, new_development_percentage, new_governance_percentage, 
+            new_protocol_percentage, new_community_percentage, ctx
+          )
+        
+        UpdateOperationalConfig { new_distribution_threshold, new_max_single_distribution, new_daily_limit, auto_distribution } ->
+          validate_operational_config_update(
+            treasury_input, treasury_output, datum,
+            new_distribution_threshold, new_max_single_distribution, new_daily_limit, auto_distribution, ctx
+          )
+        
+        AddSupportedAsset { token_policy, token_name } ->
+          validate_add_supported_asset(treasury_input, treasury_output, datum, token_policy, token_name, ctx)
+        
+        RemoveSupportedAsset { token_policy, token_name } ->
+          validate_remove_supported_asset(treasury_input, treasury_output, datum, token_policy, token_name, ctx)
+        
+        UpdateAdmins { new_admins } ->
+          validate_admin_update(treasury_input, treasury_output, datum, new_admins, ctx)
+        
+        UpdateGovernanceAddress { new_governance_address } ->
+          validate_governance_address_update(treasury_input, treasury_output, datum, new_governance_address, ctx)
+        
+        EmergencyPause ->
+          validate_emergency_pause(treasury_input, treasury_output, datum, ctx)
+        
+        EmergencyUnpause ->
+          validate_emergency_unpause(treasury_input, treasury_output, datum, ctx)
+        
+        EmergencyWithdraw { recipient, amount, token_policy, token_name, reason } ->
+          validate_emergency_withdraw(treasury_input, treasury_output, datum, recipient, amount, token_policy, token_name, reason, ctx)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate basic treasury constraints
+fn validate_treasury_basic_constraints(
+  treasury_input: transaction.Input,
+  treasury_output: transaction.Output,
+  datum: TreasuryDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate CIP-68 structure
+  expect validate_cip68_metadata_structure(datum.metadata)
+  
+  // Ensure treasury NFT is preserved
+  let treasury_nft_policy = datum.metadata.policy_id
+  let treasury_nft_name = datum.metadata.asset_name
+  
+  expect quantity_of(treasury_input.output.value, treasury_nft_policy, treasury_nft_name) == 1
+  expect quantity_of(treasury_output.value, treasury_nft_policy, treasury_nft_name) == 1
+  
+  // Validate minimum ADA requirements
+  expect validate_min_ada_output(treasury_output)
+  
+  // Ensure datum is properly attached
+  expect Some(_) = treasury_output.datum
+  
+  True
+}
+
+// Validate revenue collection
+fn validate_revenue_collection(
+  treasury_input: transaction.Input,
+  treasury_output: transaction.Output,
+  datum: TreasuryDatum,
+  source: RevenueSource,
+  amount: Int,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  ctx: ScriptContext
+) -> Bool {
+  // Check treasury is not paused
+  expect !datum.paused
+  
+  // Validate amount is positive
+  expect amount > 0
+  
+  // Validate asset is supported
+  expect is_supported_asset(datum.supported_assets, token_policy, token_name)
+  
+  // Validate revenue source
+  expect validate_revenue_source(source)
+  
+  // Calculate expected treasury balance increase
+  let input_amount = quantity_of(treasury_input.output.value, token_policy, token_name)
+  let output_amount = quantity_of(treasury_output.value, token_policy, token_name)
+  
+  expect output_amount >= input_amount + amount
+  
+  // Get updated datum
+  expect Some(output_datum_data) = treasury_output.datum
+  expect updated_datum: TreasuryDatum = output_datum_data
+  
+  // Validate updated state
+  expect updated_datum.total_revenue_collected >= datum.total_revenue_collected + amount
+  expect list.length(updated_datum.revenue_records) == list.length(datum.revenue_records) + 1
+  
+  // Validate new revenue record
+  expect validate_new_revenue_record(updated_datum.revenue_records, source, amount, token_policy, token_name, ctx)
+  
+  True
+}
+
+// Validate revenue distribution
+fn validate_revenue_distribution(
+  treasury_input: transaction.Input,
+  treasury_output: transaction.Output,
+  datum: TreasuryDatum,
+  targets: List<DistributionTarget>,
+  governance_proposal_id: Option<Int>,
+  ctx: ScriptContext
+) -> Bool {
+  // Check treasury is not paused
+  expect !datum.paused
+  
+  // Validate distribution targets
+  expect list.length(targets) > 0
+  expect validate_distribution_targets(targets)
+  
+  // Calculate total distribution amount
+  let total_distribution = calculate_total_distribution_amount(targets)
+  
+  // Validate distribution limits
+  expect total_distribution <= datum.max_single_distribution
+  expect validate_daily_distribution_limit(datum, total_distribution, ctx)
+  
+  // Validate governance approval if required
+  expect validate_governance_approval(governance_proposal_id, total_distribution, datum, ctx)
+  
+  // Validate treasury has sufficient balance
+  expect validate_sufficient_treasury_balance(treasury_input, targets)
+  
+  // Validate distribution outputs in transaction
+  expect validate_distribution_outputs(ctx.transaction.outputs, targets)
+  
+  // Get updated datum
+  expect Some(output_datum_data) = treasury_output.datum
+  expect updated_datum: TreasuryDatum = output_datum_data
+  
+  // Validate updated state
+  expect updated_datum.total_distributed >= datum.total_distributed + total_distribution
+  expect list.length(updated_datum.distribution_records) == list.length(datum.distribution_records) + 1
+  
+  True
+}
+
+// Helper function to check if asset is supported
+fn is_supported_asset(
+  supported_assets: List<(PolicyId, AssetName)>,
+  token_policy: PolicyId,
+  token_name: AssetName
+) -> Bool {
+  when supported_assets is {
+    [] -> False
+    [(policy, name), ..tail] ->
+      if policy == token_policy && name == token_name {
+        True
+      } else {
+        is_supported_asset(tail, token_policy, token_name)
+      }
+  }
+}
+
+// Validate revenue source
+fn validate_revenue_source(source: RevenueSource) -> Bool {
+  when source is {
+    SwapFees { pool_id, volume } ->
+      bytearray.length(pool_id) == 32 && volume > 0
+    
+    RegistrationFees { pool_count } ->
+      pool_count > 0
+    
+    GovernanceFees { proposal_count } ->
+      proposal_count > 0
+    
+    LiquidityIncentives { lp_rewards } ->
+      lp_rewards > 0
+    
+    Other { source_type, amount } ->
+      bytearray.length(source_type) > 0 && amount > 0
+  }
+}
+
+// Validate distribution targets
+fn validate_distribution_targets(targets: List<DistributionTarget>) -> Bool {
+  when targets is {
+    [] -> True
+    [head, ..tail] ->
+      validate_single_distribution_target(head) && validate_distribution_targets(tail)
+  }
+}
+
+// Validate single distribution target
+fn validate_single_distribution_target(target: DistributionTarget) -> Bool {
+  when target is {
+    LiquidityProviders { pool_id, lp_addresses, amounts } ->
+      bytearray.length(pool_id) == 32 &&
+      list.length(lp_addresses) == list.length(amounts) &&
+      list.length(lp_addresses) > 0 &&
+      all_amounts_positive(amounts)
+    
+    DevelopmentFund { recipient, amount, purpose } ->
+      validate_address_structure(recipient) &&
+      amount > 0 &&
+      bytearray.length(purpose) > 0
+    
+    GovernanceRewards { voter_addresses, amounts } ->
+      list.length(voter_addresses) == list.length(amounts) &&
+      list.length(voter_addresses) > 0 &&
+      all_amounts_positive(amounts)
+    
+    ProtocolUpgrade { upgrade_fund, amount, upgrade_id } ->
+      validate_address_structure(upgrade_fund) &&
+      amount > 0 &&
+      bytearray.length(upgrade_id) > 0
+    
+    CommunityGrants { grant_recipients, amounts, grant_purposes } ->
+      list.length(grant_recipients) == list.length(amounts) &&
+      list.length(amounts) == list.length(grant_purposes) &&
+      list.length(grant_recipients) > 0 &&
+      all_amounts_positive(amounts)
+  }
+}
+
+// Helper function to check all amounts are positive
+fn all_amounts_positive(amounts: List<Int>) -> Bool {
+  when amounts is {
+    [] -> True
+    [head, ..tail] ->
+      if head > 0 {
+        all_amounts_positive(tail)
+      } else {
+        False
+      }
+  }
+}
+
+// Validate address structure
+fn validate_address_structure(address: Address) -> Bool {
+  when address.payment_credential is {
+    ScriptCredential(_) -> True
+    VerificationKeyCredential(_) -> True
+  }
+}
+
+// Validate CIP-68 metadata structure
+fn validate_cip68_metadata_structure(metadata: CIP68Metadata) -> Bool {
+  // Validate policy ID length
+  expect bytearray.length(metadata.policy_id) == 28
+  
+  // Validate asset name has proper CIP-68 prefix
+  let asset_name_bytes = metadata.asset_name
+  expect bytearray.length(asset_name_bytes) >= 4
+  
+  // Check for reference token prefix (000643b0) or user token prefix (001bc280)
+  let prefix = bytearray.take(asset_name_bytes, 4)
+  expect prefix == CIP68_REFERENCE_PREFIX || prefix == CIP68_USER_PREFIX
+  
+  True
+}

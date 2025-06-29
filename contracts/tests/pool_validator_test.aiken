@@ -1,0 +1,126 @@
+use aiken/list
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output}
+use aiken/transaction/credential.{Address, ScriptCredential}
+use aiken/transaction/value.{Value, ada_policy_id, ada_asset_name, from_lovelace}
+use puckswap/pool_validator.{PoolDatum, PoolRedeemer, calculate_swap_output, calculate_lp_tokens_to_mint}
+
+// Test the core AMM calculation
+test test_swap_calculation() {
+  // Initial pool state: 1000 ADA, 2000 tokens
+  let ada_reserve = 1000_000_000  // 1000 ADA in lovelace
+  let token_reserve = 2000_000_000  // 2000 tokens
+  let fee_bps = 30  // 0.3% fee
+  
+  // Swap 100 ADA for tokens
+  let input_amount = 100_000_000  // 100 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Verify constant product is maintained (approximately)
+  let original_product = ada_reserve * token_reserve
+  let new_product = new_ada_reserve * new_token_reserve
+  
+  // Allow for small rounding differences
+  let product_diff = if new_product > original_product {
+    new_product - original_product
+  } else {
+    original_product - new_product
+  }
+  
+  // Product should be maintained within reasonable bounds
+  expect product_diff < original_product / 1000  // Less than 0.1% difference
+  
+  // Output should be positive
+  expect output_amount > 0
+  
+  // New reserves should be updated correctly
+  expect new_ada_reserve > ada_reserve
+  expect new_token_reserve < token_reserve
+  
+  True
+}
+
+// Test LP token calculation for initial liquidity
+test test_initial_lp_tokens() {
+  let ada_amount = 1000_000_000  // 1000 ADA
+  let token_amount = 2000_000_000  // 2000 tokens
+  let total_lp_supply = 0  // Initial liquidity
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(
+    0, 0, ada_amount, token_amount, total_lp_supply
+  )
+  
+  // For initial liquidity, should be geometric mean
+  let expected = 1414_213_562  // sqrt(1000 * 2000) * 1_000_000
+  
+  // Allow for rounding differences
+  let diff = if lp_tokens > expected {
+    lp_tokens - expected
+  } else {
+    expected - lp_tokens
+  }
+  
+  expect diff < expected / 100  // Within 1%
+  
+  True
+}
+
+// Test proportional LP token calculation
+test test_proportional_lp_tokens() {
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 2000_000_000  // 2000 tokens
+  let ada_amount = 100_000_000  // 100 ADA (10% of reserve)
+  let token_amount = 200_000_000  // 200 tokens (10% of reserve)
+  let total_lp_supply = 1000_000_000  // 1000 LP tokens
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(
+    ada_reserve, token_reserve, ada_amount, token_amount, total_lp_supply
+  )
+  
+  // Should get 10% of total supply = 100 LP tokens
+  let expected = 100_000_000
+  
+  expect lp_tokens == expected
+  
+  True
+}
+
+// Test edge case: zero input
+test test_zero_input_swap() {
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000
+  let fee_bps = 30
+  let input_amount = 0
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Zero input should result in zero output and unchanged reserves
+  expect output_amount == 0
+  expect new_ada_reserve == ada_reserve
+  expect new_token_reserve == token_reserve
+  
+  True
+}
+
+// Test high fee scenario
+test test_high_fee_swap() {
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000
+  let fee_bps = 1000  // 10% fee
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // With 10% fee, effective input is 90 ADA
+  let effective_input = 90_000_000
+  let expected_new_ada = ada_reserve + effective_input
+  
+  expect new_ada_reserve == expected_new_ada
+  expect output_amount > 0
+  expect output_amount < token_reserve  // Sanity check
+  
+  True
+}

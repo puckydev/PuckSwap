@@ -1,0 +1,95 @@
+{
+  "network": "preprod",
+  "deployedAt": "2025-06-24T02:45:49.369Z",
+  "validators": {
+    "swap": "addr_test1wzgcaxmervmczuv0xhz7l6q5dm8cph5y2ea3h62vsvvzwpcj6t98g",
+    "liquidityProvision": "addr_test1wrjkmckqj5gm4znvrysj7w222a33ppdszz5nr6vwlmwpf0gxnc3pj",
+    "withdrawal": "addr_test1wz40wpmp2f6s92dpk80rmceryal2stws5em76k7fgxvm43qtdgz00",
+    "governance": "addr_test1wqqymmd8h2sshq42npx62579slyaglmrtw20mex86a559jc2xghhv",
+    "staking": "addr_test1wpjtepk6gptg6a7w8qpq89dp2rvmjjqv52ezxmnv2wr9nagan5xqk",
+    "registry": "addr_test1wqaunl2zy0luwtq0w3gvj4zw6sv86j36fnufvl09rxexasqdraqns",
+    "crossChainRouter": "addr_test1wqrmczgy3s4eztn3s5k6lr7wzx6q2xrr8ufft5h594xrkesdrt4ay"
+  },
+  "policies": {
+    "lpMinting": "ad524e5497fdf1f924de936f9f7ec31d460c02267e8acce544a5a09e",
+    "pADAMinting": "eb031002fa1dbc400bbb5314a63741c8bf8524106fe7b50cafbcc113"
+  },
+  "addresses": {
+    "swap_validator": "addr_test1wzgcaxmervmczuv0xhz7l6q5dm8cph5y2ea3h62vsvvzwpcj6t98g",
+    "liquidity_provision_validator": "addr_test1wrjkmckqj5gm4znvrysj7w222a33ppdszz5nr6vwlmwpf0gxnc3pj",
+    "withdrawal_validator": "addr_test1wz40wpmp2f6s92dpk80rmceryal2stws5em76k7fgxvm43qtdgz00",
+    "governance_validator": "addr_test1wqqymmd8h2sshq42npx62579slyaglmrtw20mex86a559jc2xghhv",
+    "pool_registry_validator": "addr_test1wqaunl2zy0luwtq0w3gvj4zw6sv86j36fnufvl09rxexasqdraqns",
+    "liquid_staking_validator": "addr_test1wpjtepk6gptg6a7w8qpq89dp2rvmjjqv52ezxmnv2wr9nagan5xqk",
+    "cross_chain_router_validator": "addr_test1wqrmczgy3s4eztn3s5k6lr7wzx6q2xrr8ufft5h594xrkesdrt4ay"
+  },
+  "policyIds": {
+    "lp_minting_policy": "ad524e5497fdf1f924de936f9f7ec31d460c02267e8acce544a5a09e",
+    "pADA_minting_policy": "eb031002fa1dbc400bbb5314a63741c8bf8524106fe7b50cafbcc113"
+  },
+  "contracts": {
+    "swap_validator": {
+      "contractName": "swap_validator",
+      "type": "validator",
+      "scriptHash": "918e9b791b3781718f35c5efe8146ecf80de84567b1be94c83182707",
+      "address": "addr_test1wzgcaxmervmczuv0xhz7l6q5dm8cph5y2ea3h62vsvvzwpcj6t98g",
+      "computedAt": "2025-06-24T02:45:49.364Z"
+    },
+    "liquidity_provision_validator": {
+      "contractName": "liquidity_provision_validator",
+      "type": "validator",
+      "scriptHash": "e56de2c09511ba8a6c19212f394a57631085b010a931e98efedc14bd",
+      "address": "addr_test1wrjkmckqj5gm4znvrysj7w222a33ppdszz5nr6vwlmwpf0gxnc3pj",
+      "computedAt": "2025-06-24T02:45:49.365Z"
+    },
+    "withdrawal_validator": {
+      "contractName": "withdrawal_validator",
+      "type": "validator",
+      "scriptHash": "aaf70761527502a9a1b1de3de323277ea82dd0a677ed5bc94199bac4",
+      "address": "addr_test1wz40wpmp2f6s92dpk80rmceryal2stws5em76k7fgxvm43qtdgz00",
+      "computedAt": "2025-06-24T02:45:49.366Z"
+    },
+    "governance_validator": {
+      "contractName": "governance_validator",
+      "type": "validator",
+      "scriptHash": "004deda7baa10b82aa984da553c587c9d47f635b94fde4c7d76942cb",
+      "address": "addr_test1wqqymmd8h2sshq42npx62579slyaglmrtw20mex86a559jc2xghhv",
+      "computedAt": "2025-06-24T02:45:49.366Z"
+    },
+    "pool_registry_validator": {
+      "contractName": "pool_registry_validator",
+      "type": "validator",
+      "scriptHash": "3bc9fd4223ffc72c0f7450c9544ed4187d4a3a4cf8967de519b26ec0",
+      "address": "addr_test1wqaunl2zy0luwtq0w3gvj4zw6sv86j36fnufvl09rxexasqdraqns",
+      "computedAt": "2025-06-24T02:45:49.367Z"
+    },
+    "liquid_staking_validator": {
+      "contractName": "liquid_staking_validator",
+      "type": "validator",
+      "scriptHash": "64bc86da40568d77ce38020395a150d9b9480ca2b2236e6c538659f5",
+      "address": "addr_test1wpjtepk6gptg6a7w8qpq89dp2rvmjjqv52ezxmnv2wr9nagan5xqk",
+      "computedAt": "2025-06-24T02:45:49.367Z"
+    },
+    "cross_chain_router_validator": {
+      "contractName": "cross_chain_router_validator",
+      "type": "validator",
+      "scriptHash": "07bc09048c2b912e71852daf8fce11b40518633f1295d2f42d4c3b66",
+      "address": "addr_test1wqrmczgy3s4eztn3s5k6lr7wzx6q2xrr8ufft5h594xrkesdrt4ay",
+      "computedAt": "2025-06-24T02:45:49.368Z"
+    },
+    "lp_minting_policy": {
+      "contractName": "lp_minting_policy",
+      "type": "policy",
+      "scriptHash": "ad524e5497fdf1f924de936f9f7ec31d460c02267e8acce544a5a09e",
+      "policyId": "ad524e5497fdf1f924de936f9f7ec31d460c02267e8acce544a5a09e",
+      "computedAt": "2025-06-24T02:45:49.368Z"
+    },
+    "pADA_minting_policy": {
+      "contractName": "pADA_minting_policy",
+      "type": "policy",
+      "scriptHash": "eb031002fa1dbc400bbb5314a63741c8bf8524106fe7b50cafbcc113",
+      "policyId": "eb031002fa1dbc400bbb5314a63741c8bf8524106fe7b50cafbcc113",
+      "computedAt": "2025-06-24T02:45:49.368Z"
+    }
+  }
+}

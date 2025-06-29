@@ -1,0 +1,649 @@
+// PuckSwap v4 Enterprise - Governance Dashboard
+// Comprehensive DAO governance interface with proposal management and voting
+// Retro terminal aesthetic with professional DEX functionality
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { PuckSwapGovernanceV4, Proposal, VoteRecord, GovernanceAction } from '../lucid/governance-v4';
+import { GovernanceMonitor, GovernanceState, ProposalState } from '../context7/governance-monitor';
+import { formatADA, formatToken, formatPercentage, formatTimeRemaining } from '../lib/format-utils';
+
+// Governance interfaces
+interface GovernanceDashboardProps {
+  governance?: PuckSwapGovernanceV4;
+  monitor?: GovernanceMonitor;
+  isDemoMode?: boolean;
+}
+
+interface ProposalFormData {
+  title: string;
+  description: string;
+  actionType: string;
+  parameters: any;
+  proposalDeposit: string;
+}
+
+interface VoteFormData {
+  proposalId: number;
+  voteType: 'For' | 'Against' | 'Abstain';
+  votingPower: string;
+}
+
+export default function GovernanceDashboard({
+  governance,
+  monitor,
+  isDemoMode = false
+}: GovernanceDashboardProps) {
+  // State management
+  const [governanceState, setGovernanceState] = useState<GovernanceState | null>(null);
+  const [proposals, setProposals] = useState<ProposalState[]>([]);
+  const [activeTab, setActiveTab] = useState<'overview' | 'proposals' | 'voting' | 'create' | 'analytics'>('overview');
+  const [selectedProposal, setSelectedProposal] = useState<ProposalState | null>(null);
+  const [userVotingPower, setUserVotingPower] = useState<bigint>(0n);
+  const [userVoteHistory, setUserVoteHistory] = useState<VoteRecord[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isCreatingProposal, setIsCreatingProposal] = useState(false);
+  const [isVoting, setIsVoting] = useState(false);
+
+  // Form states
+  const [proposalForm, setProposalForm] = useState<ProposalFormData>({
+    title: '',
+    description: '',
+    actionType: 'UpdateProtocolFee',
+    parameters: {},
+    proposalDeposit: '100'
+  });
+
+  const [voteForm, setVoteForm] = useState<VoteFormData>({
+    proposalId: 0,
+    voteType: 'For',
+    votingPower: '0'
+  });
+
+  // Load governance state
+  const loadGovernanceState = useCallback(async () => {
+    if (isDemoMode) {
+      // Demo data
+      const demoState: GovernanceState = {
+        totalProposals: 15,
+        activeProposals: 3,
+        proposals: [
+          {
+            proposalId: 1,
+            proposer: 'addr1_demo_proposer_1',
+            action: {
+              type: 'UpdateProtocolFee',
+              parameters: { newFeeBps: 25 },
+              estimatedImpact: 'Reduce protocol fee from 0.3% to 0.25%',
+              riskLevel: 'Low'
+            },
+            title: 'Reduce Protocol Fee to 0.25%',
+            description: 'Proposal to reduce the protocol fee from 0.3% to 0.25% to increase competitiveness and trading volume.',
+            votesFor: 15000000n,
+            votesAgainst: 3000000n,
+            votesAbstain: 1000000n,
+            totalVotingPower: 50000000n,
+            createdAtSlot: 1000000,
+            votingStartSlot: 1000100,
+            votingEndSlot: 1604900,
+            executionSlot: 1777700,
+            status: 'Active',
+            executed: false,
+            executionTxHash: '',
+            participationRate: 38,
+            approvalRate: 78.9,
+            timeRemaining: 432000, // 5 days
+            canExecute: false,
+            voterCount: 156
+          },
+          {
+            proposalId: 2,
+            proposer: 'addr1_demo_proposer_2',
+            action: {
+              type: 'TreasuryPayout',
+              parameters: {
+                recipient: 'addr1_demo_dev_fund',
+                amount: 50000000000n,
+                reason: 'Development fund allocation for Q2 2024'
+              },
+              estimatedImpact: 'Allocate 50,000 ADA to development fund',
+              riskLevel: 'Medium'
+            },
+            title: 'Q2 2024 Development Fund Allocation',
+            description: 'Allocate 50,000 ADA from treasury to development fund for continued protocol development and improvements.',
+            votesFor: 8000000n,
+            votesAgainst: 12000000n,
+            votesAbstain: 2000000n,
+            totalVotingPower: 50000000n,
+            createdAtSlot: 950000,
+            votingStartSlot: 950100,
+            votingEndSlot: 1554900,
+            executionSlot: 1727700,
+            status: 'Active',
+            executed: false,
+            executionTxHash: '',
+            participationRate: 44,
+            approvalRate: 36.4,
+            timeRemaining: 172800, // 2 days
+            canExecute: false,
+            voterCount: 203
+          },
+          {
+            proposalId: 3,
+            proposer: 'addr1_demo_proposer_3',
+            action: {
+              type: 'UpdateVotingParameters',
+              parameters: {
+                newVotingPeriod: 518400, // 6 days
+                newExecutionDelay: 259200, // 3 days
+                newQuorumThreshold: 1500, // 15%
+                newApprovalThreshold: 5500 // 55%
+              },
+              estimatedImpact: 'Extend voting period and increase thresholds',
+              riskLevel: 'High'
+            },
+            title: 'Update Governance Parameters',
+            description: 'Proposal to extend voting period to 6 days, execution delay to 3 days, and increase quorum to 15% and approval threshold to 55%.',
+            votesFor: 5000000n,
+            votesAgainst: 8000000n,
+            votesAbstain: 3000000n,
+            totalVotingPower: 50000000n,
+            createdAtSlot: 900000,
+            votingStartSlot: 900100,
+            votingEndSlot: 1504900,
+            executionSlot: 1677700,
+            status: 'Active',
+            executed: false,
+            executionTxHash: '',
+            participationRate: 32,
+            approvalRate: 31.25,
+            timeRemaining: 86400, // 1 day
+            canExecute: false,
+            voterCount: 89
+          }
+        ],
+        voteRecords: [],
+        governanceTokenPolicy: 'demo_gov_policy',
+        governanceTokenName: 'PUCKY_GOV',
+        treasuryAddress: 'addr1_demo_treasury',
+        votingPeriodSlots: 604800,
+        executionDelaySlots: 172800,
+        quorumThresholdBps: 1000,
+        approvalThresholdBps: 5000,
+        adminAddresses: [],
+        proposalDeposit: 100000000n,
+        minVotingPower: 1000000n,
+        paused: false,
+        emergencyAdmin: 'addr1_demo_emergency',
+        lastUpdatedSlot: 1000000
+      };
+
+      setGovernanceState(demoState);
+      setProposals(demoState.proposals);
+      setUserVotingPower(5000000n); // 5M governance tokens
+      return;
+    }
+
+    if (!governance || !monitor) return;
+
+    try {
+      setIsLoading(true);
+
+      const state = monitor.getCurrentState();
+      if (state) {
+        setGovernanceState(state);
+        setProposals(state.proposals);
+      }
+
+      const votingPower = await governance.getUserVotingPower();
+      setUserVotingPower(votingPower);
+
+      const voteHistory = await governance.getUserVoteHistory();
+      setUserVoteHistory(voteHistory);
+
+    } catch (error) {
+      console.error('Error loading governance state:', error);
+      toast.error('Failed to load governance data');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [governance, monitor, isDemoMode]);
+
+  // Load data on component mount
+  useEffect(() => {
+    loadGovernanceState();
+  }, [loadGovernanceState]);
+
+  // Set up real-time updates
+  useEffect(() => {
+    if (!monitor || isDemoMode) return;
+
+    const handleGovernanceUpdate = () => {
+      loadGovernanceState();
+    };
+
+    monitor.addEventListener('*', handleGovernanceUpdate);
+
+    return () => {
+      monitor.removeEventListener('*', handleGovernanceUpdate);
+    };
+  }, [monitor, isDemoMode, loadGovernanceState]);
+
+  // Create proposal
+  const handleCreateProposal = async () => {
+    if (!governance && !isDemoMode) {
+      toast.error('Governance system not connected');
+      return;
+    }
+
+    if (!proposalForm.title || !proposalForm.description) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+
+    try {
+      setIsCreatingProposal(true);
+
+      if (isDemoMode) {
+        // Simulate proposal creation
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        toast.success('Demo proposal created successfully!', {
+          duration: 5000,
+          icon: '🗳️'
+        });
+
+        // Reset form
+        setProposalForm({
+          title: '',
+          description: '',
+          actionType: 'UpdateProtocolFee',
+          parameters: {},
+          proposalDeposit: '100'
+        });
+        setActiveTab('proposals');
+      } else if (governance) {
+        const action: GovernanceAction = {
+          type: proposalForm.actionType as any,
+          parameters: proposalForm.parameters
+        };
+
+        const txHash = await governance.createProposal({
+          action,
+          title: proposalForm.title,
+          description: proposalForm.description,
+          proposalDeposit: BigInt(Math.floor(parseFloat(proposalForm.proposalDeposit) * 1_000_000))
+        });
+
+        toast.success(`Proposal created! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '🗳️'
+        });
+
+        // Reset form and reload data
+        setProposalForm({
+          title: '',
+          description: '',
+          actionType: 'UpdateProtocolFee',
+          parameters: {},
+          proposalDeposit: '100'
+        });
+        setActiveTab('proposals');
+        await loadGovernanceState();
+      }
+    } catch (error) {
+      console.error('Error creating proposal:', error);
+      toast.error('Failed to create proposal');
+    } finally {
+      setIsCreatingProposal(false);
+    }
+  };
+
+  // Cast vote
+  const handleCastVote = async (proposalId: number, voteType: 'For' | 'Against' | 'Abstain') => {
+    if (!governance && !isDemoMode) {
+      toast.error('Governance system not connected');
+      return;
+    }
+
+    try {
+      setIsVoting(true);
+
+      if (isDemoMode) {
+        // Simulate voting
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        toast.success(`Demo vote cast: ${voteType} on proposal ${proposalId}`, {
+          duration: 5000,
+          icon: '✅'
+        });
+      } else if (governance) {
+        const txHash = await governance.castVote({
+          proposalId,
+          voteType,
+          votingPower: userVotingPower
+        });
+
+        toast.success(`Vote cast: ${voteType}! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '✅'
+        });
+
+        await loadGovernanceState();
+      }
+    } catch (error) {
+      console.error('Error casting vote:', error);
+      toast.error('Failed to cast vote');
+    } finally {
+      setIsVoting(false);
+    }
+  };
+
+  // Execute proposal
+  const handleExecuteProposal = async (proposalId: number) => {
+    if (!governance && !isDemoMode) {
+      toast.error('Governance system not connected');
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+
+      if (isDemoMode) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        toast.success(`Demo proposal ${proposalId} executed successfully!`, {
+          duration: 5000,
+          icon: '⚡'
+        });
+      } else if (governance) {
+        const txHash = await governance.executeProposal(proposalId);
+        toast.success(`Proposal executed! TX: ${txHash.slice(0, 8)}...`, {
+          duration: 10000,
+          icon: '⚡'
+        });
+
+        await loadGovernanceState();
+      }
+    } catch (error) {
+      console.error('Error executing proposal:', error);
+      toast.error('Failed to execute proposal');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Memoized calculations
+  const governanceStats = useMemo(() => {
+    if (!governanceState) return null;
+
+    const activeProposals = proposals.filter(p => p.status === 'Active');
+    const succeededProposals = proposals.filter(p => p.status === 'Succeeded');
+    const executedProposals = proposals.filter(p => p.status === 'Executed');
+
+    const totalParticipation = proposals.length > 0 ?
+      proposals.reduce((sum, p) => sum + p.participationRate, 0) / proposals.length : 0;
+
+    const successRate = governanceState.totalProposals > 0 ?
+      (executedProposals.length / governanceState.totalProposals) * 100 : 0;
+
+    return {
+      totalProposals: governanceState.totalProposals,
+      activeProposals: activeProposals.length,
+      succeededProposals: succeededProposals.length,
+      executedProposals: executedProposals.length,
+      averageParticipation: totalParticipation,
+      successRate,
+      userVotingPower: Number(userVotingPower) / 1_000_000, // Convert to millions
+      userVotingPercentage: governanceState.totalProposals > 0 ?
+        Number(userVotingPower * 100n / BigInt(50_000_000)) : 0 // Assuming 50M total supply
+    };
+  }, [governanceState, proposals, userVotingPower]);
+
+  return (
+    <div className="min-h-screen bg-terminal-black text-terminal-green font-mono">
+      {/* Header */}
+      <div className="border-b border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-glow">
+                GOVERNANCE_DASHBOARD.exe
+              </h1>
+              <p className="text-terminal-green/70 text-sm mt-1">
+                DAO Governance • Proposal Management • Voting System
+              </p>
+            </div>
+
+            {governanceStats && (
+              <div className="flex items-center space-x-6 text-sm">
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {governanceStats.userVotingPower.toFixed(1)}M
+                  </div>
+                  <div className="text-terminal-green/70">Voting Power</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {governanceStats.activeProposals}
+                  </div>
+                  <div className="text-terminal-green/70">Active</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-terminal-amber font-bold">
+                    {governanceStats.successRate.toFixed(1)}%
+                  </div>
+                  <div className="text-terminal-green/70">Success Rate</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Navigation Tabs */}
+      <div className="max-w-7xl mx-auto px-4 py-4">
+        <div className="flex space-x-1 bg-terminal-gray/10 p-1 rounded border border-terminal-green/30">
+          {[
+            { id: 'overview', label: 'OVERVIEW', icon: '📊' },
+            { id: 'proposals', label: 'PROPOSALS', icon: '📋' },
+            { id: 'voting', label: 'MY_VOTES', icon: '🗳️' },
+            { id: 'create', label: 'CREATE', icon: '✏️' },
+            { id: 'analytics', label: 'ANALYTICS', icon: '📈' }
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`flex-1 py-3 px-4 text-sm font-bold transition-all duration-300 rounded ${
+                activeTab === tab.id
+                  ? 'bg-terminal-green text-terminal-black'
+                  : 'text-terminal-green hover:bg-terminal-green/10'
+              }`}
+            >
+              <span className="mr-2">{tab.icon}</span>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto px-4 pb-8">
+        <AnimatePresence mode="wait">
+          {activeTab === 'overview' && (
+            <motion.div
+              key="overview"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <GovernanceOverview
+                stats={governanceStats}
+                proposals={proposals}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'proposals' && (
+            <motion.div
+              key="proposals"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <ProposalsList
+                proposals={proposals}
+                onVote={handleCastVote}
+                onExecute={handleExecuteProposal}
+                onSelect={setSelectedProposal}
+                userVotingPower={userVotingPower}
+                isLoading={isLoading}
+                isVoting={isVoting}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'voting' && (
+            <motion.div
+              key="voting"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <VotingHistory
+                voteHistory={userVoteHistory}
+                proposals={proposals}
+                userVotingPower={userVotingPower}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'create' && (
+            <motion.div
+              key="create"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <CreateProposal
+                proposalForm={proposalForm}
+                setProposalForm={setProposalForm}
+                onSubmit={handleCreateProposal}
+                isCreating={isCreatingProposal}
+                userVotingPower={userVotingPower}
+                minVotingPower={governanceState?.minVotingPower || 1000000n}
+              />
+            </motion.div>
+          )}
+
+          {activeTab === 'analytics' && (
+            <motion.div
+              key="analytics"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <GovernanceAnalytics
+                governanceState={governanceState}
+                proposals={proposals}
+                monitor={monitor}
+                isLoading={isLoading}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Proposal Detail Modal */}
+      <AnimatePresence>
+        {selectedProposal && (
+          <ProposalDetailModal
+            proposal={selectedProposal}
+            onClose={() => setSelectedProposal(null)}
+            onVote={handleCastVote}
+            onExecute={handleExecuteProposal}
+            userVotingPower={userVotingPower}
+            isVoting={isVoting}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// Governance Overview Component
+interface GovernanceOverviewProps {
+  stats: any;
+  proposals: ProposalState[];
+  isLoading: boolean;
+}
+
+function GovernanceOverview({ stats, proposals, isLoading }: GovernanceOverviewProps) {
+  if (isLoading || !stats) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="w-8 h-8 border-2 border-terminal-green border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <div className="text-terminal-green/70">Loading governance data...</div>
+        </div>
+      </div>
+    );
+  }
+
+  const activeProposals = proposals.filter(p => p.status === 'Active');
+  const urgentProposals = activeProposals.filter(p =>
+    p.timeRemaining < 86400 || p.action.riskLevel === 'High' || p.action.riskLevel === 'Critical'
+  );
+
+  return (
+    <div className="space-y-6">
+      {/* Stats Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="terminal-card p-4">
+          <div className="text-terminal-amber text-2xl font-bold">
+            {stats.totalProposals}
+          </div>
+          <div className="text-terminal-green/70 text-sm">Total Proposals</div>
+          <div className="text-xs text-terminal-green/50 mt-1">
+            {stats.executedProposals} executed
+          </div>
+        </div>
+
+        <div className="terminal-card p-4">
+          <div className="text-terminal-amber text-2xl font-bold">
+            {stats.activeProposals}
+          </div>
+          <div className="text-terminal-green/70 text-sm">Active Proposals</div>
+          <div className="text-xs text-terminal-green/50 mt-1">
+            {urgentProposals.length} urgent
+          </div>
+        </div>
+
+        <div className="terminal-card p-4">
+          <div className="text-terminal-amber text-2xl font-bold">
+            {stats.averageParticipation.toFixed(1)}%
+          </div>
+          <div className="text-terminal-green/70 text-sm">Avg Participation</div>
+          <div className="text-xs text-terminal-green/50 mt-1">
+            Last 10 proposals
+          </div>
+        </div>
+
+        <div className="terminal-card p-4">
+          <div className="text-terminal-amber text-2xl font-bold">
+            {stats.userVotingPower.toFixed(1)}M
+          </div>
+          <div className="text-terminal-green/70 text-sm">Your Voting Power</div>
+          <div className="text-xs text-terminal-green/50 mt-1">
+            {stats.userVotingPercentage.toFixed(2)}% of total
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

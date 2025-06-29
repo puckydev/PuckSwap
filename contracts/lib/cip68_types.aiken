@@ -1,0 +1,233 @@
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{PolicyId, AssetName}
+use aiken/dict.{Dict}
+use aiken/bytearray
+
+// CIP-68 Standard Datum Structure
+// Reference: https://github.com/cardano-foundation/CIPs/tree/master/CIP-0068
+
+// CIP-68 Metadata Map (key-value pairs)
+pub type CIP68Metadata = Dict<ByteArray, Data>
+
+// CIP-68 Version for compatibility tracking
+pub type CIP68Version = Int
+
+// CIP-68 Extra field for extensibility
+pub type CIP68Extra = Data
+
+// Base CIP-68 Datum Structure
+pub type CIP68Datum {
+  metadata: CIP68Metadata,
+  version: CIP68Version,
+  extra: CIP68Extra,
+}
+
+// Pool-specific CIP-68 Datum following the standard
+pub type PoolCIP68Datum {
+  // Standard CIP-68 fields
+  metadata: CIP68Metadata,
+  version: CIP68Version,
+  extra: CIP68Extra,
+  
+  // Pool-specific core data
+  pool_state: PoolState,
+  pool_config: PoolConfig,
+  pool_stats: PoolStats,
+}
+
+// Core pool state data
+pub type PoolState {
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  last_interaction_slot: Int,
+  pool_nft_name: AssetName,
+}
+
+// Pool configuration parameters
+pub type PoolConfig {
+  token_policy: PolicyId,
+  token_name: AssetName,
+  lp_token_policy: PolicyId,
+  lp_token_name: AssetName,
+  fee_bps: Int,
+  protocol_fee_bps: Int,
+  creator: Address,
+  admin: Address,
+  is_paused: Bool,
+}
+
+// Pool statistics and analytics
+pub type PoolStats {
+  total_volume_ada: Int,
+  total_volume_token: Int,
+  total_fees_collected: Int,
+  swap_count: Int,
+  liquidity_providers_count: Int,
+  created_at_slot: Int,
+  last_price_ada_per_token: Int, // Scaled by 1e6
+  price_history_hash: ByteArray, // Hash of recent price data
+}
+
+// LP Token CIP-68 Datum
+pub type LPTokenCIP68Datum {
+  // Standard CIP-68 fields
+  metadata: CIP68Metadata,
+  version: CIP68Version,
+  extra: CIP68Extra,
+  
+  // LP Token specific data
+  lp_data: LPTokenData,
+}
+
+// LP Token specific data
+pub type LPTokenData {
+  pool_nft_name: AssetName,
+  pool_policy: PolicyId,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  lp_amount: Int,
+  share_percentage: Int, // Scaled by 1e6 (1000000 = 100%)
+  created_at_slot: Int,
+  last_claim_slot: Int,
+}
+
+// Swap Order CIP-68 Datum (for order book style swaps)
+pub type SwapOrderCIP68Datum {
+  // Standard CIP-68 fields
+  metadata: CIP68Metadata,
+  version: CIP68Version,
+  extra: CIP68Extra,
+  
+  // Swap order specific data
+  order_data: SwapOrderData,
+}
+
+// Swap order data
+pub type SwapOrderData {
+  user: Address,
+  input_policy: PolicyId,
+  input_name: AssetName,
+  input_amount: Int,
+  output_policy: PolicyId,
+  output_name: AssetName,
+  min_output: Int,
+  deadline_slot: Int,
+  order_type: OrderType,
+  partial_fill_allowed: Bool,
+  filled_amount: Int,
+}
+
+// Order types
+pub type OrderType {
+  Market
+  Limit { price: Int }
+  StopLoss { trigger_price: Int }
+}
+
+// CIP-68 Metadata Keys (standardized)
+pub const metadata_key_name: ByteArray = "name"
+pub const metadata_key_description: ByteArray = "description"
+pub const metadata_key_image: ByteArray = "image"
+pub const metadata_key_decimals: ByteArray = "decimals"
+pub const metadata_key_ticker: ByteArray = "ticker"
+pub const metadata_key_url: ByteArray = "url"
+pub const metadata_key_logo: ByteArray = "logo"
+pub const metadata_key_pool_type: ByteArray = "pool_type"
+pub const metadata_key_created_by: ByteArray = "created_by"
+pub const metadata_key_version: ByteArray = "version"
+
+// Pool-specific metadata keys
+pub const metadata_key_pool_fee: ByteArray = "pool_fee"
+pub const metadata_key_total_liquidity: ByteArray = "total_liquidity"
+pub const metadata_key_price_oracle: ByteArray = "price_oracle"
+pub const metadata_key_audit_report: ByteArray = "audit_report"
+
+// Helper functions for CIP-68 operations
+
+// Create base CIP-68 metadata for pools
+pub fn create_pool_metadata(
+  name: ByteArray,
+  description: ByteArray,
+  pool_type: ByteArray,
+  fee_bps: Int
+) -> CIP68Metadata {
+  dict.new()
+    |> dict.insert(metadata_key_name, name)
+    |> dict.insert(metadata_key_description, description)
+    |> dict.insert(metadata_key_pool_type, pool_type)
+    |> dict.insert(metadata_key_pool_fee, fee_bps)
+    |> dict.insert(metadata_key_version, 1)
+}
+
+// Create LP token metadata
+pub fn create_lp_token_metadata(
+  pool_name: ByteArray,
+  token_a_symbol: ByteArray,
+  token_b_symbol: ByteArray,
+  decimals: Int
+) -> CIP68Metadata {
+  let lp_name = bytearray.concat(
+    bytearray.concat(token_a_symbol, "-"),
+    bytearray.concat(token_b_symbol, " LP")
+  )
+  let lp_description = bytearray.concat(
+    "Liquidity Provider token for ",
+    bytearray.concat(token_a_symbol, bytearray.concat("/", token_b_symbol))
+  )
+  
+  dict.new()
+    |> dict.insert(metadata_key_name, lp_name)
+    |> dict.insert(metadata_key_description, lp_description)
+    |> dict.insert(metadata_key_decimals, decimals)
+    |> dict.insert(metadata_key_ticker, lp_name)
+}
+
+// Get metadata value safely
+pub fn get_metadata_value(metadata: CIP68Metadata, key: ByteArray) -> Option<Data> {
+  dict.get(metadata, key)
+}
+
+// Validate CIP-68 datum structure
+pub fn validate_cip68_structure(datum: CIP68Datum) -> Bool {
+  // Version should be positive
+  datum.version > 0 &&
+  // Metadata should contain at least name
+  dict.has_key(datum.metadata, metadata_key_name)
+}
+
+// Update pool statistics
+pub fn update_pool_stats(
+  current_stats: PoolStats,
+  swap_ada_amount: Int,
+  swap_token_amount: Int,
+  fee_collected: Int,
+  new_price: Int,
+  current_slot: Int
+) -> PoolStats {
+  PoolStats {
+    total_volume_ada: current_stats.total_volume_ada + swap_ada_amount,
+    total_volume_token: current_stats.total_volume_token + swap_token_amount,
+    total_fees_collected: current_stats.total_fees_collected + fee_collected,
+    swap_count: current_stats.swap_count + 1,
+    liquidity_providers_count: current_stats.liquidity_providers_count,
+    created_at_slot: current_stats.created_at_slot,
+    last_price_ada_per_token: new_price,
+    price_history_hash: current_stats.price_history_hash, // Would update with new price
+  }
+}
+
+// Calculate LP token share percentage
+pub fn calculate_lp_share_percentage(lp_amount: Int, total_lp_supply: Int) -> Int {
+  if total_lp_supply == 0 {
+    0
+  } else {
+    // Return percentage scaled by 1e6 (1000000 = 100%)
+    lp_amount * 1_000_000 / total_lp_supply
+  }
+}
+
+// Validate datum version compatibility
+pub fn is_compatible_version(datum_version: CIP68Version, required_version: CIP68Version) -> Bool {
+  datum_version >= required_version
+}

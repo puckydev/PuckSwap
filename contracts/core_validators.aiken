@@ -1,0 +1,57 @@
+// PuckSwap Core Validators - Production Ready Export
+// Main entry point for core AMM validators for Preprod testnet deployment
+
+use aiken/transaction.{ScriptContext}
+use lib/cip68_types.{PoolCIP68Datum}
+
+// Import core validators
+use validators/core_amm_swap_validator.{core_amm_swap_validator, CoreSwapRedeemer}
+use validators/core_liquidity_provision_validator.{core_liquidity_provision_validator, CoreLiquidityRedeemer}
+use validators/core_liquidity_withdrawal_validator.{core_liquidity_withdrawal_validator, CoreWithdrawalRedeemer}
+
+// Import core minting policy
+use policies/core_lp_minting_policy.{core_lp_minting_policy, CoreLPMintingRedeemer}
+
+// =============================================================================
+// VALIDATOR EXPORTS FOR COMPILATION
+// =============================================================================
+
+// Core AMM swap validator for ADA ↔ PUCKY swaps
+validator core_swap_validator(
+  datum: PoolCIP68Datum,
+  redeemer: CoreSwapRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  core_amm_swap_validator(ctx, datum, redeemer)
+}
+
+// Core liquidity provision validator for ADA + PUCKY deposits
+validator core_liquidity_provision_validator_export(
+  datum: PoolCIP68Datum,
+  redeemer: CoreLiquidityRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  core_liquidity_provision_validator(ctx, datum, redeemer)
+}
+
+// Core liquidity withdrawal validator for LP token burning
+validator core_liquidity_withdrawal_validator_export(
+  datum: PoolCIP68Datum,
+  redeemer: CoreWithdrawalRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  core_liquidity_withdrawal_validator(ctx, datum, redeemer)
+}
+
+// =============================================================================
+// MINTING POLICY EXPORTS FOR COMPILATION
+// =============================================================================
+
+// Core LP minting policy for LP token control
+minting_policy core_lp_minting_policy_export(
+  authorized_validators: List<ByteArray>,
+  redeemer: CoreLPMintingRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  core_lp_minting_policy(authorized_validators, ctx, redeemer)
+}

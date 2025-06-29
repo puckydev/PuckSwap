@@ -1,0 +1,23 @@
+name = "puckswap/puckswap-contracts"
+version = "1.0.0"
+license = "MIT"
+description = "PuckSwap DEX smart contracts for Cardano - ADA ↔ PUCKY AMM"
+
+[repository]
+user = "puckswap"
+project = "puckswap-contracts"
+platform = "github"
+
+[[dependencies]]
+name = "aiken-lang/stdlib"
+version = "2.0.0"
+source = "github"
+
+[config.default]
+network_id = 0  # Preprod testnet (default for development)
+
+[config.preprod]
+network_id = 0  # Preprod testnet
+
+[config.mainnet]
+network_id = 1  # Mainnet (for future production deployment)

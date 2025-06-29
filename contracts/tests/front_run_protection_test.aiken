@@ -1,0 +1,381 @@
+use aiken/transaction.{
+  ScriptContext, Spend, Transaction, Input, Output, OutputReference,
+  ValidityRange, Bound, BoundType, Finite, PosInfinity, NegInfinity
+}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import swap validator functions
+use puckswap_swap_validator.{
+  SwapRedeemer, validate_swap_deadline, validate_cip68_swap_operation
+}
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, validate_deadline
+}
+
+// =============================================================================
+// FRONT-RUN PROTECTION COMPREHENSIVE TESTS
+// =============================================================================
+
+// Mock data setup
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+fn create_swap_redeemer(
+  swap_in_token: Bool,
+  amount_in: Int,
+  min_out: Int,
+  deadline_slot: Int
+) -> SwapRedeemer {
+  SwapRedeemer {
+    swap_in_token: swap_in_token,
+    amount_in: amount_in,
+    min_out: min_out,
+    deadline_slot: deadline_slot,
+    user_address: mock_user_address()
+  }
+}
+
+fn create_pool_redeemer_swap(
+  input_amount: Int,
+  min_output: Int,
+  deadline: Int
+) -> PoolRedeemer {
+  PoolRedeemer::Swap {
+    input_amount: input_amount,
+    min_output: min_output,
+    deadline: deadline,
+    recipient: mock_user_address()
+  }
+}
+
+// Create mock script context with validity range
+fn create_mock_context(lower_bound: Int, upper_bound: Int) -> ScriptContext {
+  let validity_range = ValidityRange {
+    lower_bound: Bound { bound_type: Finite(lower_bound), is_inclusive: True },
+    upper_bound: Bound { bound_type: Finite(upper_bound), is_inclusive: True }
+  }
+  
+  ScriptContext {
+    transaction: Transaction {
+      inputs: [],
+      reference_inputs: [],
+      outputs: [],
+      fee: from_lovelace(200000),
+      mint: from_lovelace(0),
+      certificates: [],
+      withdrawals: [],
+      validity_range: validity_range,
+      extra_signatories: [],
+      redeemers: [],
+      datums: [],
+      id: #"0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    purpose: Spend(OutputReference {
+      transaction_id: #"1111111111111111111111111111111111111111111111111111111111111111",
+      output_index: 0
+    })
+  }
+}
+
+// =============================================================================
+// DEADLINE VALIDATION TESTS
+// =============================================================================
+
+test test_valid_deadline_within_range() {
+  // Test that valid deadlines are accepted
+  let current_slot = 1000
+  let deadline_slot = 1100  // 100 slots in the future
+  let ctx = create_mock_context(current_slot, current_slot + 50)
+  
+  // Deadline validation should pass when deadline is in the future
+  let is_valid = validate_swap_deadline(deadline_slot, ctx)
+  expect is_valid
+  
+  True
+}
+
+test test_expired_deadline_rejection() {
+  // Test that expired deadlines are rejected
+  let current_slot = 1000
+  let deadline_slot = 900   // 100 slots in the past
+  let ctx = create_mock_context(current_slot, current_slot + 50)
+  
+  // Deadline validation should fail when deadline has passed
+  let is_valid = validate_swap_deadline(deadline_slot, ctx)
+  expect !is_valid
+  
+  True
+}
+
+test test_deadline_exactly_at_upper_bound() {
+  // Test edge case where deadline equals transaction upper bound
+  let current_slot = 1000
+  let deadline_slot = 1050
+  let ctx = create_mock_context(current_slot, deadline_slot)
+  
+  // Should be valid when deadline equals upper bound
+  let is_valid = validate_swap_deadline(deadline_slot, ctx)
+  expect is_valid
+  
+  True
+}
+
+test test_deadline_beyond_upper_bound() {
+  // Test case where deadline is beyond transaction validity
+  let current_slot = 1000
+  let deadline_slot = 1100
+  let ctx = create_mock_context(current_slot, current_slot + 50)  // Upper bound at 1050
+  
+  // Should fail when deadline is beyond transaction validity
+  let is_valid = validate_swap_deadline(deadline_slot, ctx)
+  expect !is_valid
+  
+  True
+}
+
+test test_infinite_validity_range() {
+  // Test with infinite validity range
+  let deadline_slot = 2000
+  
+  // Create context with infinite upper bound
+  let validity_range = ValidityRange {
+    lower_bound: Bound { bound_type: Finite(1000), is_inclusive: True },
+    upper_bound: Bound { bound_type: PosInfinity, is_inclusive: True }
+  }
+  
+  let ctx = ScriptContext {
+    transaction: Transaction {
+      inputs: [],
+      reference_inputs: [],
+      outputs: [],
+      fee: from_lovelace(200000),
+      mint: from_lovelace(0),
+      certificates: [],
+      withdrawals: [],
+      validity_range: validity_range,
+      extra_signatories: [],
+      redeemers: [],
+      datums: [],
+      id: #"0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    purpose: Spend(OutputReference {
+      transaction_id: #"1111111111111111111111111111111111111111111111111111111111111111",
+      output_index: 0
+    })
+  }
+  
+  // Should be valid with infinite upper bound
+  let is_valid = validate_swap_deadline(deadline_slot, ctx)
+  expect is_valid
+  
+  True
+}
+
+// =============================================================================
+// MEV PROTECTION TESTS
+// =============================================================================
+
+test test_short_deadline_mev_protection() {
+  // Test that short deadlines provide MEV protection
+  let current_slot = 1000
+  let short_deadline = current_slot + 5  // Only 5 slots
+  let ctx = create_mock_context(current_slot, current_slot + 3)
+  
+  // Short deadline should still be valid if within tx validity
+  let is_valid = validate_swap_deadline(short_deadline, ctx)
+  expect !is_valid  // Should fail because deadline > tx upper bound
+  
+  // Test with deadline within tx validity
+  let valid_short_deadline = current_slot + 2
+  let is_valid_short = validate_swap_deadline(valid_short_deadline, ctx)
+  expect is_valid_short
+  
+  True
+}
+
+test test_reasonable_deadline_window() {
+  // Test reasonable deadline windows for different scenarios
+  let current_slot = 1000
+  
+  // Short-term trade (5 minutes ≈ 60 slots)
+  let short_term_deadline = current_slot + 60
+  let ctx_short = create_mock_context(current_slot, current_slot + 30)
+  let is_valid_short = validate_swap_deadline(short_term_deadline, ctx_short)
+  expect !is_valid_short  // Should fail as deadline > tx validity
+  
+  // Medium-term trade (30 minutes ≈ 360 slots)
+  let medium_term_deadline = current_slot + 360
+  let ctx_medium = create_mock_context(current_slot, current_slot + 300)
+  let is_valid_medium = validate_swap_deadline(medium_term_deadline, ctx_medium)
+  expect !is_valid_medium  // Should fail as deadline > tx validity
+  
+  // Valid case where deadline is within tx validity
+  let valid_deadline = current_slot + 20
+  let ctx_valid = create_mock_context(current_slot, current_slot + 30)
+  let is_valid = validate_swap_deadline(valid_deadline, ctx_valid)
+  expect is_valid
+  
+  True
+}
+
+// =============================================================================
+// TRANSACTION ORDERING PROTECTION TESTS
+// =============================================================================
+
+test test_transaction_ordering_attack_simulation() {
+  // Simulate transaction ordering attack scenario
+  let base_slot = 1000
+  
+  // Attacker's front-running transaction
+  let frontrun_deadline = base_slot + 100
+  let frontrun_ctx = create_mock_context(base_slot, base_slot + 50)
+  
+  // Victim's transaction with similar deadline
+  let victim_deadline = base_slot + 95
+  let victim_ctx = create_mock_context(base_slot + 1, base_slot + 51)  // Slightly later
+  
+  // Both should be valid in their respective contexts
+  let frontrun_valid = validate_swap_deadline(frontrun_deadline, frontrun_ctx)
+  let victim_valid = validate_swap_deadline(victim_deadline, victim_ctx)
+  
+  expect !frontrun_valid  // Should fail as deadline > tx validity
+  expect !victim_valid    // Should fail as deadline > tx validity
+  
+  // Test with valid deadlines
+  let valid_frontrun_deadline = base_slot + 40
+  let valid_victim_deadline = base_slot + 45
+  
+  let frontrun_valid_corrected = validate_swap_deadline(valid_frontrun_deadline, frontrun_ctx)
+  let victim_valid_corrected = validate_swap_deadline(valid_victim_deadline, victim_ctx)
+  
+  expect frontrun_valid_corrected
+  expect victim_valid_corrected
+  
+  True
+}
+
+test test_deadline_granularity_protection() {
+  // Test that deadline granularity provides protection
+  let current_slot = 1000
+  
+  // Test different deadline granularities
+  let precise_deadline = current_slot + 1   // Very precise (1 slot)
+  let loose_deadline = current_slot + 1000  // Very loose (1000 slots)
+  
+  let ctx_precise = create_mock_context(current_slot, current_slot + 2)
+  let ctx_loose = create_mock_context(current_slot, current_slot + 500)
+  
+  let precise_valid = validate_swap_deadline(precise_deadline, ctx_precise)
+  let loose_valid = validate_swap_deadline(loose_deadline, ctx_loose)
+  
+  expect precise_valid   // Should be valid
+  expect !loose_valid    // Should fail as deadline > tx validity
+  
+  True
+}
+
+// =============================================================================
+// TIME-BASED VALIDATION TESTS
+// =============================================================================
+
+test test_slot_time_consistency() {
+  // Test that slot-based deadlines are consistent
+  let base_slot = 1000
+  let deadline_offset = 50
+  
+  // Test multiple contexts with same deadline
+  let deadline = base_slot + deadline_offset
+  
+  let ctx1 = create_mock_context(base_slot, base_slot + 60)
+  let ctx2 = create_mock_context(base_slot + 10, base_slot + 70)
+  let ctx3 = create_mock_context(base_slot + 20, base_slot + 80)
+  
+  let valid1 = validate_swap_deadline(deadline, ctx1)
+  let valid2 = validate_swap_deadline(deadline, ctx2)
+  let valid3 = validate_swap_deadline(deadline, ctx3)
+  
+  // All should be valid as deadline is within their respective ranges
+  expect valid1
+  expect valid2
+  expect valid3
+  
+  True
+}
+
+test test_deadline_edge_cases() {
+  // Test various edge cases for deadline validation
+  let current_slot = 1000
+  
+  // Test with zero deadline
+  let zero_deadline = 0
+  let ctx = create_mock_context(current_slot, current_slot + 50)
+  let zero_valid = validate_swap_deadline(zero_deadline, ctx)
+  expect !zero_valid  // Should fail as deadline is in the past
+  
+  // Test with maximum possible deadline
+  let max_deadline = 9223372036854775807  // Max int64
+  let max_valid = validate_swap_deadline(max_deadline, ctx)
+  expect !max_valid  // Should fail as deadline > tx validity
+  
+  // Test with negative deadline
+  let negative_deadline = -100
+  let negative_valid = validate_swap_deadline(negative_deadline, ctx)
+  expect !negative_valid  // Should fail as deadline is negative
+  
+  True
+}
+
+// =============================================================================
+// INTEGRATION TESTS WITH POOL OPERATIONS
+// =============================================================================
+
+test test_deadline_integration_with_swap() {
+  // Test deadline validation integrated with swap operations
+  let current_slot = 1000
+  let deadline = current_slot + 30
+  let ctx = create_mock_context(current_slot, current_slot + 50)
+  
+  // Create a swap redeemer with deadline
+  let swap_redeemer = create_pool_redeemer_swap(100_000_000, 95_000_000, deadline)
+  
+  // Test deadline validation (this would be part of larger validation)
+  when swap_redeemer is {
+    PoolRedeemer::Swap { deadline: swap_deadline, .. } -> {
+      let is_valid = validate_deadline(swap_deadline, ctx)
+      expect is_valid
+      True
+    }
+    _ -> False
+  }
+}
+
+test test_multiple_deadline_validations() {
+  // Test multiple operations with different deadlines
+  let current_slot = 1000
+  let ctx = create_mock_context(current_slot, current_slot + 100)
+  
+  // Different operations with different deadlines
+  let swap_deadline = current_slot + 50
+  let liquidity_deadline = current_slot + 80
+  let expired_deadline = current_slot - 10
+  
+  let swap_valid = validate_deadline(swap_deadline, ctx)
+  let liquidity_valid = validate_deadline(liquidity_deadline, ctx)
+  let expired_valid = validate_deadline(expired_deadline, ctx)
+  
+  expect swap_valid
+  expect liquidity_valid
+  expect !expired_valid
+  
+  True
+}

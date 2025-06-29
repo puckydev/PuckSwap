@@ -1,0 +1,420 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, calculate_swap_output, max_slippage_bps
+}
+
+// Import swap validator functions
+use puckswap_swap_validator.{get_amount_out, get_amount_out_with_fees}
+
+// =============================================================================
+// SLIPPAGE PROTECTION COMPREHENSIVE TESTS
+// =============================================================================
+
+// Mock data setup
+fn mock_pool_datum(ada_reserve: Int, token_reserve: Int, fee_bps: Int) -> PoolDatum {
+  PoolDatum {
+    ada_reserve: ada_reserve,
+    token_reserve: token_reserve,
+    fee_bps: fee_bps,
+    pool_nft_policy: #"1111111111111111111111111111111111111111111111111111111111111111",
+    pool_nft_name: #"504f4f4c",
+    token_policy: #"2222222222222222222222222222222222222222222222222222222222222222",
+    token_name: #"50554b4b59",
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+// Calculate slippage percentage in basis points
+fn calculate_slippage_bps(expected_no_slippage: Int, actual_output: Int) -> Int {
+  if expected_no_slippage == 0 {
+    0
+  } else {
+    (expected_no_slippage - actual_output) * 10000 / expected_no_slippage
+  }
+}
+
+// =============================================================================
+// BASIC SLIPPAGE TESTS
+// =============================================================================
+
+test test_minimal_slippage_small_trade() {
+  // Test that small trades have minimal slippage
+  let ada_reserve = 1000_000_000_000  // 1M ADA (large pool)
+  let token_reserve = 1000_000_000_000  // 1M tokens
+  let fee_bps = 30  // 0.3% fee
+  
+  // Small trade: 0.1% of pool
+  let input_amount = 1_000_000_000  // 1000 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Expected output without slippage (1:1 ratio minus fees)
+  let fee_amount = input_amount * fee_bps / 10000
+  let expected_no_slippage = input_amount - fee_amount
+  
+  let slippage_bps = calculate_slippage_bps(expected_no_slippage, output_amount)
+  
+  // Small trades should have very low slippage (< 1%)
+  expect slippage_bps < 100
+  
+  True
+}
+
+test test_moderate_slippage_medium_trade() {
+  // Test moderate slippage for medium-sized trades
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 1000_000_000  // 1000 tokens
+  let fee_bps = 30
+  
+  // Medium trade: 10% of pool
+  let input_amount = 100_000_000  // 100 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Calculate slippage
+  let fee_amount = input_amount * fee_bps / 10000
+  let expected_no_slippage = input_amount - fee_amount
+  let slippage_bps = calculate_slippage_bps(expected_no_slippage, output_amount)
+  
+  // Medium trades should have moderate slippage (1-5%)
+  expect slippage_bps > 100 && slippage_bps < 500
+  
+  True
+}
+
+test test_high_slippage_large_trade() {
+  // Test high slippage for large trades
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 1000_000_000  // 1000 tokens
+  let fee_bps = 30
+  
+  // Large trade: 50% of pool
+  let input_amount = 500_000_000  // 500 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Calculate slippage
+  let fee_amount = input_amount * fee_bps / 10000
+  let expected_no_slippage = input_amount - fee_amount
+  let slippage_bps = calculate_slippage_bps(expected_no_slippage, output_amount)
+  
+  // Large trades should have high slippage (>10%)
+  expect slippage_bps > 1000
+  
+  True
+}
+
+// =============================================================================
+// SLIPPAGE LIMIT ENFORCEMENT TESTS
+// =============================================================================
+
+test test_slippage_within_acceptable_range() {
+  // Test that calculated slippage is within acceptable range
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000  // 2:1 ratio
+  let fee_bps = 30
+  let input_amount = 50_000_000  // 50 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Calculate expected output at current price (2:1 ratio)
+  let current_price = token_reserve / ada_reserve  // 2 tokens per ADA
+  let fee_amount = input_amount * fee_bps / 10000
+  let input_after_fee = input_amount - fee_amount
+  let expected_at_current_price = input_after_fee * current_price
+  
+  let slippage_bps = calculate_slippage_bps(expected_at_current_price, output_amount)
+  
+  // Should be within reasonable slippage bounds
+  expect slippage_bps < max_slippage_bps  // Less than 10%
+  
+  True
+}
+
+test test_extreme_slippage_protection() {
+  // Test protection against extreme slippage scenarios
+  let ada_reserve = 100_000_000  // Small pool: 100 ADA
+  let token_reserve = 100_000_000  // 100 tokens
+  let fee_bps = 30
+  
+  // Extremely large trade relative to pool size
+  let input_amount = 90_000_000  // 90 ADA (90% of pool)
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should not drain the pool completely
+  expect new_token_reserve > 0
+  expect output_amount < token_reserve
+  
+  // Verify constant product is maintained
+  let original_product = ada_reserve * token_reserve
+  let new_product = new_ada_reserve * new_token_reserve
+  expect new_product >= original_product
+  
+  True
+}
+
+// =============================================================================
+// SANDWICH ATTACK SIMULATION TESTS
+// =============================================================================
+
+test test_sandwich_attack_simulation() {
+  // Simulate a sandwich attack scenario
+  let initial_ada_reserve = 1000_000_000  // 1000 ADA
+  let initial_token_reserve = 1000_000_000  // 1000 tokens
+  let fee_bps = 30
+  
+  // Step 1: Front-running trade (large buy)
+  let frontrun_amount = 200_000_000  // 200 ADA
+  let (_, ada_after_frontrun, token_after_frontrun) = 
+    calculate_swap_output(initial_ada_reserve, initial_token_reserve, frontrun_amount, fee_bps)
+  
+  // Step 2: Victim's trade (normal size)
+  let victim_amount = 50_000_000  // 50 ADA
+  let (victim_output, ada_after_victim, token_after_victim) = 
+    calculate_swap_output(ada_after_frontrun, token_after_frontrun, victim_amount, fee_bps)
+  
+  // Step 3: Back-running trade (sell)
+  // This would be a token->ADA swap, but we'll simulate the impact
+  
+  // Calculate what victim would have gotten without front-running
+  let (victim_output_no_frontrun, _, _) = 
+    calculate_swap_output(initial_ada_reserve, initial_token_reserve, victim_amount, fee_bps)
+  
+  // Victim should get less due to front-running
+  expect victim_output < victim_output_no_frontrun
+  
+  // Calculate the impact
+  let impact_bps = (victim_output_no_frontrun - victim_output) * 10000 / victim_output_no_frontrun
+  
+  // Impact should be measurable but not extreme
+  expect impact_bps > 0
+  expect impact_bps < 2000  // Less than 20% impact
+  
+  True
+}
+
+// =============================================================================
+// PRICE IMPACT ANALYSIS TESTS
+// =============================================================================
+
+test test_price_impact_scaling() {
+  // Test that price impact scales appropriately with trade size
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  
+  // Test different trade sizes
+  let small_trade = 10_000_000   // 1% of pool
+  let medium_trade = 50_000_000  // 5% of pool
+  let large_trade = 100_000_000  // 10% of pool
+  
+  let (small_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, small_trade, fee_bps)
+  let (medium_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, medium_trade, fee_bps)
+  let (large_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, large_trade, fee_bps)
+  
+  // Calculate price impact for each
+  let small_impact = calculate_slippage_bps(small_trade, small_output)
+  let medium_impact = calculate_slippage_bps(medium_trade, medium_output)
+  let large_impact = calculate_slippage_bps(large_trade, large_output)
+  
+  // Price impact should increase with trade size
+  expect small_impact < medium_impact
+  expect medium_impact < large_impact
+  
+  // All should be positive
+  expect small_impact >= 0
+  expect medium_impact > 0
+  expect large_impact > 0
+  
+  True
+}
+
+test test_asymmetric_pool_slippage() {
+  // Test slippage in asymmetric pools (different ratios)
+  let ada_reserve = 1000_000_000  // 1000 ADA
+  let token_reserve = 500_000_000  // 500 tokens (2:1 ratio)
+  let fee_bps = 30
+  let input_amount = 100_000_000  // 100 ADA
+  
+  let (output_amount, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Expected at current ratio (0.5 tokens per ADA)
+  let current_ratio = token_reserve / ada_reserve
+  let fee_amount = input_amount * fee_bps / 10000
+  let input_after_fee = input_amount - fee_amount
+  let expected_at_ratio = input_after_fee * current_ratio
+  
+  let slippage_bps = calculate_slippage_bps(expected_at_ratio, output_amount)
+  
+  // Should have reasonable slippage even in asymmetric pools
+  expect slippage_bps > 0
+  expect slippage_bps < 1500  // Less than 15%
+  
+  True
+}
+
+// =============================================================================
+// MINIMUM OUTPUT VALIDATION TESTS
+// =============================================================================
+
+test test_minimum_output_enforcement() {
+  // Test that minimum output requirements are properly calculated
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (expected_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Set minimum output with 5% slippage tolerance
+  let slippage_tolerance_bps = 500  // 5%
+  let min_output = expected_output * (10000 - slippage_tolerance_bps) / 10000
+  
+  // Expected output should meet minimum requirement
+  expect expected_output >= min_output
+  
+  // Test with unrealistic minimum (should fail in real validator)
+  let unrealistic_min = expected_output + 1000000
+  expect expected_output < unrealistic_min
+  
+  True
+}
+
+test test_zero_minimum_output_edge_case() {
+  // Test edge case where minimum output is zero
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  let min_output = 0
+
+  let (expected_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+  // Any positive output should satisfy zero minimum
+  expect expected_output >= min_output
+  expect expected_output > 0
+
+  True
+}
+
+// =============================================================================
+// ADVANCED SLIPPAGE SCENARIOS
+// =============================================================================
+
+test test_cascading_slippage_multiple_swaps() {
+  // Test slippage accumulation across multiple sequential swaps
+  let initial_ada_reserve = 1000_000_000
+  let initial_token_reserve = 1000_000_000
+  let fee_bps = 30
+  let swap_amount = 50_000_000  // 5% of pool each time
+
+  // First swap
+  let (output1, ada_after_1, token_after_1) =
+    calculate_swap_output(initial_ada_reserve, initial_token_reserve, swap_amount, fee_bps)
+
+  // Second swap (same size)
+  let (output2, ada_after_2, token_after_2) =
+    calculate_swap_output(ada_after_1, token_after_1, swap_amount, fee_bps)
+
+  // Third swap (same size)
+  let (output3, _, _) =
+    calculate_swap_output(ada_after_2, token_after_2, swap_amount, fee_bps)
+
+  // Each subsequent swap should have higher slippage
+  expect output1 > output2
+  expect output2 > output3
+
+  // All outputs should be positive
+  expect output1 > 0
+  expect output2 > 0
+  expect output3 > 0
+
+  True
+}
+
+test test_slippage_in_depleted_pool() {
+  // Test slippage when pool is heavily depleted
+  let ada_reserve = 100_000_000  // Small pool
+  let token_reserve = 50_000_000  // Very small token reserve
+  let fee_bps = 30
+  let input_amount = 10_000_000  // 10% of ADA reserve
+
+  let (output_amount, new_ada_reserve, new_token_reserve) =
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+  // Calculate slippage in depleted pool
+  let expected_at_ratio = input_amount * token_reserve / ada_reserve
+  let slippage_bps = calculate_slippage_bps(expected_at_ratio, output_amount)
+
+  // Depleted pools should have higher slippage
+  expect slippage_bps > 500  // More than 5%
+  expect output_amount > 0
+  expect new_token_reserve >= 0
+
+  True
+}
+
+test test_slippage_with_extreme_fees() {
+  // Test slippage calculation with various extreme fee scenarios
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let input_amount = 100_000_000
+
+  // Test with very high fee (5%)
+  let high_fee_bps = 500
+  let (high_fee_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, high_fee_bps)
+
+  // Test with normal fee (0.3%)
+  let normal_fee_bps = 30
+  let (normal_fee_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, normal_fee_bps)
+
+  // Test with minimal fee (0.01%)
+  let minimal_fee_bps = 1
+  let (minimal_fee_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, minimal_fee_bps)
+
+  // Higher fees should result in lower output
+  expect minimal_fee_output > normal_fee_output
+  expect normal_fee_output > high_fee_output
+
+  // All should be positive
+  expect high_fee_output > 0
+  expect normal_fee_output > 0
+  expect minimal_fee_output > 0
+
+  True
+}
+
+test test_slippage_tolerance_boundaries() {
+  // Test slippage at various tolerance boundaries
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+
+  let (expected_output, _, _) = calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+  // Test different slippage tolerances
+  let tolerance_1_percent = expected_output * 99 / 100    // 1% slippage
+  let tolerance_5_percent = expected_output * 95 / 100    // 5% slippage
+  let tolerance_10_percent = expected_output * 90 / 100   // 10% slippage
+
+  // Expected output should meet all reasonable tolerances
+  expect expected_output >= tolerance_1_percent
+  expect expected_output >= tolerance_5_percent
+  expect expected_output >= tolerance_10_percent
+
+  // But should be less than input (due to slippage and fees)
+  expect expected_output < input_amount
+
+  True
+}

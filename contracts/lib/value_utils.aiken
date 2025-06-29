@@ -1,0 +1,197 @@
+use aiken/transaction.{Input, Output, OutputReference}
+use aiken/transaction/credential.{Address}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  quantity_of, from_lovelace, merge, negate, flatten, tokens, to_minted_value
+}
+use aiken/list
+use aiken/dict.{Dict}
+use aiken/option
+use aiken/bytearray
+
+// Enhanced value operations for multi-asset handling
+
+// Get all assets in a value as a list of (PolicyId, AssetName, Int) tuples
+pub fn value_to_asset_list(value: Value) -> List<(PolicyId, AssetName, Int)> {
+  let flattened = flatten(value)
+  list.map(flattened, fn(asset) {
+    let (policy_id, asset_name, quantity) = asset
+    (policy_id, asset_name, quantity)
+  })
+}
+
+// Get total quantity of a specific asset across all UTxOs
+pub fn get_asset_quantity(value: Value, policy: PolicyId, name: AssetName) -> Int {
+  quantity_of(value, policy, name)
+}
+
+// Get ADA quantity (lovelace)
+pub fn get_ada_quantity(value: Value) -> Int {
+  quantity_of(value, ada_policy_id, ada_asset_name)
+}
+
+// Check if value contains specific asset
+pub fn contains_asset(value: Value, policy: PolicyId, name: AssetName) -> Bool {
+  get_asset_quantity(value, policy, name) > 0
+}
+
+// Get all non-ADA assets in a value
+pub fn get_native_assets(value: Value) -> List<(PolicyId, AssetName, Int)> {
+  let all_assets = value_to_asset_list(value)
+  list.filter(all_assets, fn(asset) {
+    let (policy_id, _, _) = asset
+    policy_id != ada_policy_id
+  })
+}
+
+// Calculate value difference (value_a - value_b)
+pub fn value_difference(value_a: Value, value_b: Value) -> Value {
+  merge(value_a, negate(value_b))
+}
+
+// Check if value_a >= value_b (all assets)
+pub fn value_geq(value_a: Value, value_b: Value) -> Bool {
+  let assets_b = value_to_asset_list(value_b)
+  list.all(assets_b, fn(asset) {
+    let (policy_id, asset_name, quantity_b) = asset
+    let quantity_a = get_asset_quantity(value_a, policy_id, asset_name)
+    quantity_a >= quantity_b
+  })
+}
+
+// Validate that a value contains exactly the expected assets
+pub fn validate_exact_assets(
+  value: Value,
+  expected_assets: List<(PolicyId, AssetName, Int)>
+) -> Bool {
+  let actual_assets = value_to_asset_list(value)
+  
+  // Check same number of assets
+  list.length(actual_assets) == list.length(expected_assets) &&
+  // Check each expected asset is present with correct quantity
+  list.all(expected_assets, fn(expected) {
+    let (policy_id, asset_name, expected_quantity) = expected
+    let actual_quantity = get_asset_quantity(value, policy_id, asset_name)
+    actual_quantity == expected_quantity
+  })
+}
+
+// Create value from asset list
+pub fn value_from_asset_list(assets: List<(PolicyId, AssetName, Int)>) -> Value {
+  list.foldr(assets, from_lovelace(0), fn(asset, acc_value) {
+    let (policy_id, asset_name, quantity) = asset
+    if policy_id == ada_policy_id {
+      merge(acc_value, from_lovelace(quantity))
+    } else {
+      let asset_value = value.from_asset(policy_id, asset_name, quantity)
+      merge(acc_value, asset_value)
+    }
+  })
+}
+
+// Get the "primary" token in a pool (largest non-ADA asset)
+pub fn get_primary_token(value: Value) -> Option<(PolicyId, AssetName, Int)> {
+  let native_assets = get_native_assets(value)
+  
+  when native_assets is {
+    [] -> None
+    [single_asset] -> Some(single_asset)
+    multiple_assets -> {
+      // Find asset with largest quantity
+      let max_asset = list.foldr(multiple_assets, None, fn(asset, acc) {
+        let (_, _, quantity) = asset
+        when acc is {
+          None -> Some(asset)
+          Some(current_max) -> {
+            let (_, _, max_quantity) = current_max
+            if quantity > max_quantity {
+              Some(asset)
+            } else {
+              Some(current_max)
+            }
+          }
+        }
+      })
+      max_asset
+    }
+  }
+}
+
+// Validate minimum ADA requirement
+pub fn validate_min_ada(value: Value, min_ada: Int) -> Bool {
+  get_ada_quantity(value) >= min_ada
+}
+
+// Calculate total value in ADA equivalent (simplified pricing)
+pub fn calculate_total_value_ada(
+  value: Value,
+  token_to_ada_rate: Dict<(PolicyId, AssetName), Int>
+) -> Int {
+  let ada_amount = get_ada_quantity(value)
+  let native_assets = get_native_assets(value)
+  
+  let native_value_ada = list.fold(native_assets, 0, fn(asset, acc) {
+    let (policy_id, asset_name, quantity) = asset
+    let rate = dict.get(token_to_ada_rate, (policy_id, asset_name))
+    when rate is {
+      Some(ada_rate) -> acc + (quantity * ada_rate / 1_000_000) // Assuming 6 decimal places
+      None -> acc // Unknown token, ignore for now
+    }
+  })
+  
+  ada_amount + native_value_ada
+}
+
+// Validate that value contains only expected token types
+pub fn validate_allowed_tokens(
+  value: Value,
+  allowed_policies: List<PolicyId>
+) -> Bool {
+  let native_assets = get_native_assets(value)
+  list.all(native_assets, fn(asset) {
+    let (policy_id, _, _) = asset
+    list.has(allowed_policies, policy_id)
+  })
+}
+
+// Extract specific assets from value
+pub fn extract_assets(
+  value: Value,
+  assets_to_extract: List<(PolicyId, AssetName)>
+) -> List<(PolicyId, AssetName, Int)> {
+  list.map(assets_to_extract, fn(asset_id) {
+    let (policy_id, asset_name) = asset_id
+    let quantity = get_asset_quantity(value, policy_id, asset_name)
+    (policy_id, asset_name, quantity)
+  })
+}
+
+// Check if value is "dust" (only contains minimal ADA)
+pub fn is_dust_value(value: Value, dust_threshold: Int) -> Bool {
+  let ada_amount = get_ada_quantity(value)
+  let native_assets = get_native_assets(value)
+  
+  ada_amount <= dust_threshold && list.is_empty(native_assets)
+}
+
+// Merge multiple values efficiently
+pub fn merge_values(values: List<Value>) -> Value {
+  list.foldr(values, from_lovelace(0), merge)
+}
+
+// Split value into ADA and non-ADA components
+pub fn split_value(value: Value) -> (Int, List<(PolicyId, AssetName, Int)>) {
+  let ada_amount = get_ada_quantity(value)
+  let native_assets = get_native_assets(value)
+  (ada_amount, native_assets)
+}
+
+// Find input by output reference
+pub fn find_input(inputs: List<Input>, output_ref: OutputReference) -> Option<Input> {
+  list.find(inputs, fn(input) { input.output_reference == output_ref })
+}
+
+// Find output by address
+pub fn find_output(outputs: List<Output>, address: Address) -> Option<Output> {
+  list.find(outputs, fn(output) { output.address == address })
+}

@@ -1,0 +1,530 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference, Finite, PosInfinity}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, quantity_of, to_dict}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/dict
+use aiken/cbor
+
+// Import shared utilities
+use puckswap/lib/min_ada_utils.{validate_min_ada_output, calculate_pool_min_ada}
+use puckswap/lib/value_utils.{get_ada_quantity, get_asset_quantity, find_input, find_output}
+
+// =============================================================================
+// LIQUIDITY WITHDRAWAL VALIDATOR V5 - CANONICAL SCHEMA IMPLEMENTATION
+// =============================================================================
+// 
+// Features:
+// - Proportional LP token burning and asset withdrawal
+// - Canonical PoolDatum structure (PuckSwap_v5_MasterSchema.md)
+// - LP burn amount validation equals withdrawal claim
+// - Pool draining and partial update attack prevention
+// - Comprehensive security validations
+// - Minimum liquidity preservation
+// - Strict adherence to canonical schema
+// =============================================================================
+
+// CANONICAL POOL DATUM - EXACT MATCH TO MASTER SCHEMA
+pub type PoolDatum {
+  ada_reserve: Int,
+  token_reserve: Int,
+  fee_basis_points: Int,
+  lp_token_policy: PolicyId,
+  lp_token_name: AssetName,
+}
+
+// Liquidity withdrawal redeemer
+pub type WithdrawalRedeemer {
+  lp_tokens_to_burn: Int,       // LP tokens to burn
+  min_ada_out: Int,             // Minimum ADA to receive (slippage protection)
+  min_token_out: Int,           // Minimum tokens to receive (slippage protection)
+  user_address: Address,        // User address for validation
+}
+
+// Withdrawal calculation result
+pub type WithdrawalResult {
+  ada_to_withdraw: Int,
+  token_to_withdraw: Int,
+  new_ada_reserve: Int,
+  new_token_reserve: Int,
+  withdrawal_share_percentage: Int,
+}
+
+// =============================================================================
+// MAIN VALIDATOR
+// =============================================================================
+
+// Main liquidity withdrawal validator with canonical schema
+validator withdrawal_validator(
+  datum: PoolDatum,
+  redeemer: WithdrawalRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      // Find pool input and output UTxOs
+      expect Some(pool_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(pool_output) = find_output(ctx.transaction.outputs, pool_input.output.address)
+
+      // Validate the withdrawal operation
+      validate_liquidity_withdrawal_operation(pool_input, pool_output, datum, redeemer, ctx)
+    }
+    _ -> False
+  }
+}
+
+// =============================================================================
+// CORE WITHDRAWAL VALIDATION
+// =============================================================================
+
+// Validate liquidity withdrawal operation with all security checks
+fn validate_liquidity_withdrawal_operation(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum,
+  redeemer: WithdrawalRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Validate redeemer parameters
+  expect validate_redeemer_parameters(redeemer)
+
+  // Validate transaction security (prevent dust attacks, etc.)
+  expect validate_transaction_security(redeemer, ctx)
+
+  // Get current pool reserves from UTxO values
+  let (current_ada_reserve, current_token_reserve) =
+    extract_pool_reserves(pool_input.output.value, datum)
+
+  // Validate reserves match datum
+  expect current_ada_reserve == datum.ada_reserve
+  expect current_token_reserve == datum.token_reserve
+
+  // Calculate total LP supply from current UTxO
+  let current_lp_supply = get_asset_quantity(
+    pool_input.output.value,
+    datum.lp_token_policy,
+    datum.lp_token_name
+  )
+
+  // Validate sufficient LP tokens exist for burning
+  expect current_lp_supply >= redeemer.lp_tokens_to_burn
+
+  // Calculate withdrawal amounts
+  let withdrawal_result = calculate_withdrawal_amounts(
+    current_ada_reserve,
+    current_token_reserve,
+    current_lp_supply,
+    redeemer.lp_tokens_to_burn
+  )
+
+  // Validate minimum output requirements (slippage protection)
+  expect withdrawal_result.ada_to_withdraw >= redeemer.min_ada_out
+  expect withdrawal_result.token_to_withdraw >= redeemer.min_token_out
+
+  // Validate withdrawal doesn't drain the pool
+  expect validate_pool_draining_protection(withdrawal_result)
+
+  // Validate minimum liquidity preservation
+  expect validate_minimum_liquidity_preservation(
+    withdrawal_result,
+    current_lp_supply,
+    redeemer.lp_tokens_to_burn
+  )
+
+  // Validate withdrawal ratios are correct (prevent under/over withdrawal)
+  expect validate_withdrawal_ratios(
+    datum,
+    withdrawal_result,
+    redeemer.lp_tokens_to_burn,
+    current_lp_supply
+  )
+
+  // Get new pool state from output
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: PoolDatum = output_datum_data
+
+  // Validate reserves are updated correctly
+  expect new_pool_datum.ada_reserve == withdrawal_result.new_ada_reserve
+  expect new_pool_datum.token_reserve == withdrawal_result.new_token_reserve
+
+  // Validate other datum fields remain unchanged
+  expect new_pool_datum.fee_basis_points == datum.fee_basis_points
+  expect new_pool_datum.lp_token_policy == datum.lp_token_policy
+  expect new_pool_datum.lp_token_name == datum.lp_token_name
+
+  // Validate pool reserves in output UTxO match calculated values
+  let (output_ada_reserve, output_token_reserve) =
+    extract_pool_reserves(pool_output.value, new_pool_datum)
+
+  expect output_ada_reserve == withdrawal_result.new_ada_reserve
+  expect output_token_reserve == withdrawal_result.new_token_reserve
+
+  // Validate against manipulation attacks
+  expect validate_manipulation_protection(pool_input, pool_output, datum, withdrawal_result)
+
+  // Validate minimum ADA requirements are met
+  expect validate_min_ada_compliance(pool_output)
+
+  // Validate LP token burning
+  expect validate_lp_token_burning(redeemer.lp_tokens_to_burn, datum, ctx)
+
+  // Validate user receives correct withdrawal amounts
+  expect validate_user_withdrawal_output(redeemer, withdrawal_result, ctx)
+
+  // Validate user authorization
+  expect validate_user_authorization(redeemer.user_address, ctx)
+
+  True
+}
+
+// =============================================================================
+// WITHDRAWAL CALCULATION
+// =============================================================================
+
+// Calculate proportional withdrawal amounts
+fn calculate_withdrawal_amounts(
+  ada_reserve: Int,
+  token_reserve: Int,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int
+) -> WithdrawalResult {
+  // Validate input parameters
+  expect ada_reserve > 0
+  expect token_reserve > 0
+  expect total_lp_supply > 0
+  expect lp_tokens_to_burn > 0
+  expect lp_tokens_to_burn <= total_lp_supply
+
+  // Calculate proportional withdrawal amounts
+  let ada_to_withdraw = ada_reserve * lp_tokens_to_burn / total_lp_supply
+  let token_to_withdraw = token_reserve * lp_tokens_to_burn / total_lp_supply
+
+  // Calculate new reserves after withdrawal
+  let new_ada_reserve = ada_reserve - ada_to_withdraw
+  let new_token_reserve = token_reserve - token_to_withdraw
+
+  // Calculate withdrawal share percentage (scaled by 10000 for basis points)
+  let withdrawal_share_percentage = lp_tokens_to_burn * 10000 / total_lp_supply
+
+  WithdrawalResult {
+    ada_to_withdraw: ada_to_withdraw,
+    token_to_withdraw: token_to_withdraw,
+    new_ada_reserve: new_ada_reserve,
+    new_token_reserve: new_token_reserve,
+    withdrawal_share_percentage: withdrawal_share_percentage,
+  }
+}
+
+// =============================================================================
+// VALIDATION FUNCTIONS
+// =============================================================================
+
+// Validate redeemer parameters
+fn validate_redeemer_parameters(redeemer: WithdrawalRedeemer) -> Bool {
+  // Validate amounts
+  expect redeemer.lp_tokens_to_burn > 0
+  expect redeemer.min_ada_out >= 0
+  expect redeemer.min_token_out >= 0
+
+  True
+}
+
+// Extract pool reserves from UTxO value
+fn extract_pool_reserves(pool_value: Value, datum: PoolDatum) -> (Int, Int) {
+  let ada_amount = get_ada_quantity(pool_value)
+  
+  // Calculate token amount by finding the non-ADA, non-LP token asset
+  let token_amount = list.foldr(
+    to_dict(pool_value),
+    0,
+    fn(asset_entry, acc) {
+      let (policy_id, asset_dict) = asset_entry
+      if policy_id == ada_policy_id() || policy_id == datum.lp_token_policy {
+        acc
+      } else {
+        // Sum all tokens from this policy (should be just one for our pool)
+        dict.foldr(asset_dict, acc, fn(_, quantity, inner_acc) { inner_acc + quantity })
+      }
+    }
+  )
+
+  // Validate reserves are positive
+  expect ada_amount >= 0
+  expect token_amount >= 0
+
+  (ada_amount, token_amount)
+}
+
+// Validate pool draining protection
+fn validate_pool_draining_protection(withdrawal_result: WithdrawalResult) -> Bool {
+  // Define minimum liquidity that must remain in pool
+  let min_ada_reserve = 10_000_000   // 10 ADA minimum
+  let min_token_reserve = 1_000_000  // 1 token minimum (assuming 6 decimals)
+
+  expect withdrawal_result.new_ada_reserve >= min_ada_reserve
+  expect withdrawal_result.new_token_reserve >= min_token_reserve
+
+  // Validate withdrawal doesn't exceed maximum percentage (90%)
+  expect withdrawal_result.withdrawal_share_percentage <= 9000  // 90% in basis points
+
+  True
+}
+
+// Validate user authorization
+fn validate_user_authorization(user_address: Address, ctx: ScriptContext) -> Bool {
+  let user_signed = list.any(ctx.transaction.extra_signatories, fn(signature) {
+    when user_address.payment_credential is {
+      VerificationKeyCredential(pkh) -> signature == pkh
+      _ -> False
+    }
+  })
+
+  expect user_signed
+  True
+}
+
+// Validate minimum ADA compliance
+fn validate_min_ada_compliance(pool_output: Output) -> Bool {
+  let actual_ada = get_ada_quantity(pool_output.value)
+  let required_min_ada = 2_000_000  // 2 ADA minimum for pool UTxO
+
+  expect actual_ada >= required_min_ada
+  True
+}
+
+// Validate LP token burning
+fn validate_lp_token_burning(
+  lp_tokens_to_burn: Int,
+  datum: PoolDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Get burned tokens from this transaction (negative mint)
+  let mint_value = ctx.transaction.mint
+  let lp_token_amount = get_asset_quantity(mint_value, datum.lp_token_policy, datum.lp_token_name)
+
+  // Validate correct amount of LP tokens are being burned (negative amount)
+  expect lp_token_amount == -lp_tokens_to_burn
+  expect lp_tokens_to_burn > 0
+
+  True
+}
+
+// Validate user receives correct withdrawal amounts
+fn validate_user_withdrawal_output(
+  redeemer: WithdrawalRedeemer,
+  withdrawal_result: WithdrawalResult,
+  ctx: ScriptContext
+) -> Bool {
+  // Find user outputs in transaction
+  let user_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address == redeemer.user_address
+  })
+
+  // Validate user receives at least one output
+  expect list.length(user_outputs) >= 1
+
+  // Calculate total ADA user receives
+  let total_user_ada = list.foldr(user_outputs, 0, fn(output, acc) {
+    acc + get_ada_quantity(output.value)
+  })
+
+  // Calculate total tokens user receives (non-ADA, non-LP tokens)
+  let total_user_tokens = list.foldr(user_outputs, 0, fn(output, acc) {
+    let token_amount = list.foldr(
+      to_dict(output.value),
+      0,
+      fn(asset_entry, inner_acc) {
+        let (policy_id, asset_dict) = asset_entry
+        if policy_id == ada_policy_id() {
+          inner_acc
+        } else {
+          dict.foldr(asset_dict, inner_acc, fn(_, quantity, token_acc) {
+            token_acc + quantity
+          })
+        }
+      }
+    )
+    acc + token_amount
+  })
+
+  // Validate user receives at least the withdrawal amounts
+  expect total_user_ada >= withdrawal_result.ada_to_withdraw
+  expect total_user_tokens >= withdrawal_result.token_to_withdraw
+
+  True
+}
+
+// =============================================================================
+// ADDITIONAL SECURITY VALIDATIONS
+// =============================================================================
+
+// Validate against manipulation attacks
+fn validate_manipulation_protection(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum,
+  withdrawal_result: WithdrawalResult
+) -> Bool {
+  // Validate pool NFT is preserved (if using pool NFT pattern)
+  // This would be implemented if pools use unique NFTs for identification
+
+  // Validate no unauthorized changes to pool configuration
+  expect Some(output_datum_data) = pool_output.datum
+  expect new_pool_datum: PoolDatum = output_datum_data
+
+  expect new_pool_datum.fee_basis_points == datum.fee_basis_points
+  expect new_pool_datum.lp_token_policy == datum.lp_token_policy
+  expect new_pool_datum.lp_token_name == datum.lp_token_name
+
+  // Validate reserves decrease correctly
+  expect new_pool_datum.ada_reserve < datum.ada_reserve
+  expect new_pool_datum.token_reserve < datum.token_reserve
+
+  // Validate the decrease matches withdrawal amounts exactly
+  expect datum.ada_reserve - new_pool_datum.ada_reserve == withdrawal_result.ada_to_withdraw
+  expect datum.token_reserve - new_pool_datum.token_reserve == withdrawal_result.token_to_withdraw
+
+  True
+}
+
+// Validate transaction structure and prevent dust attacks
+fn validate_transaction_security(
+  redeemer: WithdrawalRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  let tx = ctx.transaction
+
+  // Validate fee is reasonable (prevent excessive fee attacks)
+  expect tx.fee <= 10_000_000  // Max 10 ADA fee
+
+  // Validate minimum withdrawal amounts to prevent dust attacks
+  let min_lp_tokens = 1000  // Minimum LP tokens to burn
+  expect redeemer.lp_tokens_to_burn >= min_lp_tokens
+
+  // Validate reasonable number of outputs (prevent spam)
+  expect list.length(tx.outputs) <= 20
+
+  // Validate reasonable number of inputs (prevent complex manipulation)
+  expect list.length(tx.inputs) <= 10
+
+  True
+}
+
+// Validate withdrawal ratios are correct (prevent under/over withdrawal)
+fn validate_withdrawal_ratios(
+  datum: PoolDatum,
+  withdrawal_result: WithdrawalResult,
+  lp_tokens_to_burn: Int,
+  total_lp_supply: Int
+) -> Bool {
+  // Calculate expected ratios
+  let expected_ada_ratio = lp_tokens_to_burn * 10000 / total_lp_supply
+  let expected_token_ratio = lp_tokens_to_burn * 10000 / total_lp_supply
+
+  // Calculate actual ratios
+  let actual_ada_ratio = withdrawal_result.ada_to_withdraw * 10000 / datum.ada_reserve
+  let actual_token_ratio = withdrawal_result.token_to_withdraw * 10000 / datum.token_reserve
+
+  // Allow small rounding differences (1 basis point tolerance)
+  let tolerance = 1
+
+  expect math.abs(actual_ada_ratio - expected_ada_ratio) <= tolerance
+  expect math.abs(actual_token_ratio - expected_token_ratio) <= tolerance
+
+  True
+}
+
+// =============================================================================
+// ERROR HANDLING AND GRACEFUL FAILURES
+// =============================================================================
+
+// Comprehensive validation with clear error paths
+fn validate_withdrawal_comprehensive(
+  pool_input: Input,
+  pool_output: Output,
+  datum: PoolDatum,
+  redeemer: WithdrawalRedeemer,
+  ctx: ScriptContext
+) -> Bool {
+  // Basic parameter validation
+  if !validate_redeemer_parameters(redeemer) {
+    // Fail: Invalid redeemer parameters
+    False
+  } else if datum.ada_reserve <= 0 || datum.token_reserve <= 0 {
+    // Fail: Invalid pool state
+    False
+  } else {
+    // Continue with full validation
+    validate_liquidity_withdrawal_operation(pool_input, pool_output, datum, redeemer, ctx)
+  }
+}
+
+// Validate minimum liquidity preservation
+fn validate_minimum_liquidity_preservation(
+  withdrawal_result: WithdrawalResult,
+  total_lp_supply: Int,
+  lp_tokens_to_burn: Int
+) -> Bool {
+  // Ensure some liquidity always remains (prevent total pool draining)
+  let remaining_lp_supply = total_lp_supply - lp_tokens_to_burn
+  let min_remaining_lp = 1000  // Minimum LP tokens that must remain
+
+  expect remaining_lp_supply >= min_remaining_lp
+
+  // Ensure minimum reserves remain
+  expect withdrawal_result.new_ada_reserve >= 10_000_000   // 10 ADA
+  expect withdrawal_result.new_token_reserve >= 1_000_000  // 1 token (6 decimals)
+
+  True
+}
+
+// =============================================================================
+// DOCUMENTATION AND USAGE NOTES
+// =============================================================================
+
+// VALIDATOR USAGE:
+// ================
+// This validator ensures secure liquidity withdrawal from AMM pools using the
+// canonical PoolDatum structure defined in PuckSwap_v5_MasterSchema.md.
+//
+// SECURITY FEATURES:
+// ==================
+// 1. Proportional Withdrawal: LP tokens burned proportionally to pool reserves
+// 2. Slippage Protection: min_ada_out and min_token_out prevent sandwich attacks
+// 3. Pool Draining Protection: Minimum reserves must remain in pool
+// 4. Manipulation Protection: Validates exact reserve decreases
+// 5. User Authorization: Requires user signature for withdrawal
+// 6. LP Token Burning: Validates correct LP token burning via minting policy
+// 7. Minimum ADA Compliance: Ensures pool UTxO meets minimum ADA requirements
+// 8. Dust Attack Prevention: Minimum withdrawal amounts enforced
+//
+// VALIDATION FLOW:
+// ================
+// 1. Validate redeemer parameters and transaction structure
+// 2. Extract and validate current pool reserves
+// 3. Calculate proportional withdrawal amounts
+// 4. Validate slippage protection and pool draining limits
+// 5. Verify output datum updates correctly
+// 6. Validate LP token burning and user outputs
+// 7. Ensure user authorization and minimum ADA compliance
+//
+// ERROR CONDITIONS:
+// =================
+// - Invalid redeemer parameters (negative amounts, etc.)
+// - Insufficient LP tokens for burning
+// - Pool reserves don't match datum
+// - Withdrawal would drain pool below minimum thresholds
+// - Slippage protection triggered (output below minimum)
+// - Incorrect LP token burning amount
+// - User not authorized (missing signature)
+// - Minimum ADA requirements not met
+// - Manipulation detected (incorrect reserve updates)
+//
+// INTEGRATION NOTES:
+// ==================
+// - Must be used with corresponding LP minting policy for token burning
+// - Requires proper UTxO selection to include pool input/output
+// - User must sign transaction for authorization
+// - Pool datum must follow canonical schema exactly
+// - Compatible with CIP-68 standards and Cardano protocol requirements

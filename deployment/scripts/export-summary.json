@@ -1,0 +1,46 @@
+{
+  "exportedAt": "2025-06-26T13:01:02.167Z",
+  "blueprint": {
+    "title": "puckswap/puckswap-contracts",
+    "description": "PuckSwap DEX smart contracts for Cardano - ADA ↔ PUCKY AMM",
+    "version": "1.0.0",
+    "plutusVersion": "v3",
+    "compiler": {
+      "name": "Aiken",
+      "version": "v1.1.17+c3a7fba"
+    },
+    "license": "MIT"
+  },
+  "validators": [
+    {
+      "title": "liquidity.liquidity.spend",
+      "hash": "b8237fa4e09ff49169b56f8fd48ac7d23c3f5d67065ee474de5b5d2b",
+      "file": "liquidity_liquidity_spend.plutus"
+    },
+    {
+      "title": "liquidity.liquidity.else",
+      "hash": "b8237fa4e09ff49169b56f8fd48ac7d23c3f5d67065ee474de5b5d2b",
+      "file": "liquidity_liquidity_else.plutus"
+    },
+    {
+      "title": "simple.simple.spend",
+      "hash": "d27ccc13fab5b782984a3d1f99353197ca1a81be069941ffc003ee75",
+      "file": "simple_simple_spend.plutus"
+    },
+    {
+      "title": "simple.simple.else",
+      "hash": "d27ccc13fab5b782984a3d1f99353197ca1a81be069941ffc003ee75",
+      "file": "simple_simple_else.plutus"
+    },
+    {
+      "title": "swap.swap.spend",
+      "hash": "e0d1f5e6ce18bdd173e8e450ebece5a5e0e9d0b0354bb34e7dc33f6c",
+      "file": "swap_swap_spend.plutus"
+    },
+    {
+      "title": "swap.swap.else",
+      "hash": "e0d1f5e6ce18bdd173e8e450ebece5a5e0e9d0b0354bb34e7dc33f6c",
+      "file": "swap_swap_else.plutus"
+    }
+  ]
+}

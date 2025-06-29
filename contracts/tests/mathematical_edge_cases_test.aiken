@@ -1,0 +1,532 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+
+// Import pool validator functions
+use puckswap_pool_validator.{
+  PoolDatum, PoolRedeemer, calculate_swap_output, calculate_lp_tokens_to_mint
+}
+
+// Import swap validator functions
+use puckswap_swap_validator.{get_amount_out, get_amount_out_with_fees}
+
+// =============================================================================
+// MATHEMATICAL EDGE CASES AND PRECISION TESTS
+// =============================================================================
+
+// Constants for testing
+const max_safe_int: Int = 9223372036854775807  // Max int64
+const min_safe_int: Int = -9223372036854775808  // Min int64
+
+// Mock data setup
+fn create_test_pool_datum(ada_reserve: Int, token_reserve: Int, fee_bps: Int) -> PoolDatum {
+  PoolDatum {
+    ada_reserve: ada_reserve,
+    token_reserve: token_reserve,
+    fee_bps: fee_bps,
+    pool_nft_policy: #"1111111111111111111111111111111111111111111111111111111111111111",
+    pool_nft_name: #"504f4f4c",
+    token_policy: #"2222222222222222222222222222222222222222222222222222222222222222",
+    token_name: #"50554b4b59",
+    total_lp_tokens: 0,
+    last_interaction: 0
+  }
+}
+
+// =============================================================================
+// INTEGER OVERFLOW/UNDERFLOW PROTECTION TESTS
+// =============================================================================
+
+test test_large_number_multiplication_safety() {
+  // Test multiplication with large numbers that could overflow
+  let large_reserve = 1000_000_000_000_000  // 1 billion ADA
+  let large_input = 1000_000_000_000  // 1 million ADA
+  let fee_bps = 30
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(large_reserve, large_reserve, large_input, fee_bps)
+  
+  // Should handle large numbers without overflow
+  expect output_amount > 0
+  expect new_ada_reserve > large_reserve
+  expect new_token_reserve < large_reserve
+  expect new_ada_reserve < max_safe_int
+  expect new_token_reserve > 0
+  
+  True
+}
+
+test test_maximum_safe_integer_handling() {
+  // Test with numbers approaching maximum safe integer
+  let large_reserve = 1000_000_000_000_000  // Large but safe
+  let token_reserve = 1000_000_000_000_000
+  let fee_bps = 30
+  let input_amount = 1000_000_000  // Relatively small input
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(large_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Verify no overflow occurred
+  expect output_amount >= 0
+  expect new_ada_reserve > large_reserve
+  expect new_token_reserve < token_reserve
+  expect new_ada_reserve < max_safe_int
+  
+  True
+}
+
+test test_product_calculation_overflow_protection() {
+  // Test constant product calculation with large numbers
+  let ada_reserve = 100_000_000_000_000  // 100M ADA
+  let token_reserve = 100_000_000_000_000  // 100M tokens
+  let fee_bps = 30
+  let input_amount = 1_000_000_000  // 1000 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Verify constant product is maintained (approximately)
+  let original_product = ada_reserve * token_reserve
+  let new_product = new_ada_reserve * new_token_reserve
+  
+  // Product should increase due to fees
+  expect new_product >= original_product
+  
+  // Verify no overflow in product calculation
+  expect original_product > 0
+  expect new_product > 0
+  
+  True
+}
+
+// =============================================================================
+// DIVISION BY ZERO PROTECTION TESTS
+// =============================================================================
+
+test test_zero_denominator_protection() {
+  // Test division by zero protection in AMM formula
+  let ada_reserve = 0  // Zero reserve
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle zero denominator gracefully
+  expect output_amount == 0  // No output when reserve is zero
+  expect new_ada_reserve >= 0
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+test test_zero_input_amount() {
+  // Test with zero input amount
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  let input_amount = 0
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Zero input should result in zero output and unchanged reserves
+  expect output_amount == 0
+  expect new_ada_reserve == ada_reserve
+  expect new_token_reserve == token_reserve
+  
+  True
+}
+
+test test_100_percent_fee_edge_case() {
+  // Test with 100% fee (edge case)
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 10000  // 100% fee
+  let input_amount = 100_000_000
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // With 100% fee, all input goes to fees, no output
+  expect output_amount == 0
+  expect new_ada_reserve == ada_reserve  // No change since no effective input
+  expect new_token_reserve == token_reserve
+  
+  True
+}
+
+// =============================================================================
+// PRECISION LOSS AND ROUNDING TESTS
+// =============================================================================
+
+test test_small_amount_precision() {
+  // Test precision with very small amounts
+  let ada_reserve = 1000_000_000_000  // Large pool
+  let token_reserve = 1000_000_000_000
+  let fee_bps = 30
+  let tiny_input = 100  // 0.0001 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, tiny_input, fee_bps)
+  
+  // Should handle tiny amounts (might be zero due to fees and rounding)
+  expect output_amount >= 0
+  expect new_ada_reserve >= ada_reserve
+  expect new_token_reserve <= token_reserve
+  
+  True
+}
+
+test test_rounding_consistency() {
+  // Test that rounding is consistent across similar calculations
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+  
+  // Test with amounts that might cause rounding issues
+  let input1 = 333_333_333  // 1/3 of 1000 ADA
+  let input2 = 333_333_334  // Slightly different
+  
+  let (output1, _, _) = calculate_swap_output(ada_reserve, token_reserve, input1, fee_bps)
+  let (output2, _, _) = calculate_swap_output(ada_reserve, token_reserve, input2, fee_bps)
+  
+  // Outputs should be close but output2 should be slightly higher
+  expect output2 >= output1
+  expect output1 > 0
+  expect output2 > 0
+  
+  True
+}
+
+test test_fee_calculation_precision() {
+  // Test precision in fee calculations
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let input_amount = 100_000_000
+  
+  // Test different fee rates
+  let fee_rates = [1, 10, 30, 100, 1000]  // 0.01%, 0.1%, 0.3%, 1%, 10%
+  
+  list.all(fee_rates, fn(fee_bps) {
+    let (output_amount, new_ada_reserve, new_token_reserve) = 
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+    
+    // Higher fees should result in lower output
+    output_amount >= 0 && 
+    new_ada_reserve > ada_reserve &&
+    new_token_reserve < token_reserve
+  })
+}
+
+// =============================================================================
+// EXTREME VALUE TESTS
+// =============================================================================
+
+test test_single_unit_calculations() {
+  // Test calculations with single units
+  let ada_reserve = 1
+  let token_reserve = 1
+  let fee_bps = 30
+  let input_amount = 1
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle single unit amounts
+  expect output_amount >= 0
+  expect new_ada_reserve >= 1
+  expect new_token_reserve >= 0
+  
+  True
+}
+
+test test_highly_asymmetric_pools() {
+  // Test with highly asymmetric pool ratios
+  let ada_reserve = 1000_000_000_000  // 1M ADA
+  let token_reserve = 1000  // 1000 tokens (1M:1 ratio)
+  let fee_bps = 30
+  let input_amount = 1_000_000  // 1 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle extreme ratios
+  expect output_amount >= 0
+  expect new_ada_reserve > ada_reserve
+  expect new_token_reserve <= token_reserve
+  
+  True
+}
+
+test test_reverse_asymmetric_pools() {
+  // Test with reverse asymmetric ratio
+  let ada_reserve = 1000  // 1000 ADA
+  let token_reserve = 1000_000_000_000  // 1M tokens (1:1M ratio)
+  let fee_bps = 30
+  let input_amount = 100  // 0.1 ADA
+  
+  let (output_amount, new_ada_reserve, new_token_reserve) = 
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+  
+  // Should handle reverse extreme ratios
+  expect output_amount >= 0
+  expect new_ada_reserve > ada_reserve
+  expect new_token_reserve <= token_reserve
+  
+  True
+}
+
+// =============================================================================
+// LP TOKEN CALCULATION EDGE CASES
+// =============================================================================
+
+test test_lp_token_geometric_mean_precision() {
+  // Test geometric mean calculation precision for LP tokens
+  let ada_amount = 1000_000_000  // 1000 ADA
+  let token_amount = 4000_000_000  // 4000 tokens
+  let total_lp_supply = 0  // Initial liquidity
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(0, 0, ada_amount, token_amount, total_lp_supply)
+  
+  // Geometric mean: sqrt(1000 * 4000) = sqrt(4,000,000) = 2000
+  let expected = 2000_000_000  // 2000 * 1_000_000
+  
+  // Allow for rounding differences
+  let diff = if lp_tokens > expected {
+    lp_tokens - expected
+  } else {
+    expected - lp_tokens
+  }
+  
+  expect diff < expected / 100  // Within 1%
+  expect lp_tokens > 0
+  
+  True
+}
+
+test test_lp_token_proportional_calculation() {
+  // Test proportional LP token calculation precision
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000
+  let ada_amount = 100_000_000  // 10% of reserve
+  let token_amount = 200_000_000  // 10% of reserve
+  let total_lp_supply = 1000_000_000  // 1000 LP tokens
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(
+    ada_reserve, token_reserve, ada_amount, token_amount, total_lp_supply
+  )
+  
+  // Should get 10% of total supply = 100 LP tokens
+  let expected = 100_000_000
+  expect lp_tokens == expected
+  
+  True
+}
+
+test test_lp_token_minimum_calculation() {
+  // Test LP token calculation with minimum amounts
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let ada_amount = 1  // Minimum ADA
+  let token_amount = 1  // Minimum token
+  let total_lp_supply = 1000_000_000
+  
+  let lp_tokens = calculate_lp_tokens_to_mint(
+    ada_reserve, token_reserve, ada_amount, token_amount, total_lp_supply
+  )
+  
+  // Should handle minimum amounts (might be zero due to rounding)
+  expect lp_tokens >= 0
+  
+  True
+}
+
+// =============================================================================
+// CONSTANT PRODUCT INVARIANT TESTS
+// =============================================================================
+
+test test_constant_product_maintenance() {
+  // Test that constant product is maintained across various scenarios
+  let ada_reserve = 1000_000_000
+  let token_reserve = 2000_000_000
+  let fee_bps = 30
+
+  let test_inputs = [
+    10_000_000,   // 1% of ADA reserve
+    50_000_000,   // 5% of ADA reserve
+    100_000_000,  // 10% of ADA reserve
+    200_000_000   // 20% of ADA reserve
+  ]
+
+  let original_product = ada_reserve * token_reserve
+
+  list.all(test_inputs, fn(input_amount) {
+    let (output_amount, new_ada_reserve, new_token_reserve) =
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+    let new_product = new_ada_reserve * new_token_reserve
+
+    // Product should be maintained or increase (due to fees)
+    new_product >= original_product &&
+    output_amount > 0 &&
+    new_ada_reserve > ada_reserve &&
+    new_token_reserve < token_reserve
+  })
+}
+
+// =============================================================================
+// ADVANCED MATHEMATICAL EDGE CASES
+// =============================================================================
+
+test test_floating_point_precision_simulation() {
+  // Test precision issues that might occur in floating point calculations
+  // Using integer arithmetic to simulate potential precision problems
+  let ada_reserve = 1000_000_000_000_000  // Very large pool
+  let token_reserve = 3  // Very small token amount
+  let fee_bps = 30
+  let input_amount = 1  // Minimal input
+
+  let (output_amount, new_ada_reserve, new_token_reserve) =
+    calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+  // Should handle extreme precision scenarios
+  expect output_amount >= 0
+  expect new_ada_reserve >= ada_reserve
+  expect new_token_reserve <= token_reserve
+
+  True
+}
+
+test test_mathematical_invariant_stress_test() {
+  // Stress test mathematical invariants with extreme scenarios
+  let scenarios = [
+    (1000_000_000, 1, 1000),           // Extreme ratio 1
+    (1, 1000_000_000, 1),              // Extreme ratio 2
+    (1000_000_000_000, 1000_000_000_000, 1000_000_000),  // Large numbers
+    (1000, 1000, 1),                   // Small numbers
+    (999_999_999, 1000_000_001, 500_000_000)  // Near-equal reserves
+  ]
+
+  list.all(scenarios, fn(scenario) {
+    let (ada_reserve, token_reserve, input_amount) = scenario
+    let fee_bps = 30
+
+    let (output_amount, new_ada_reserve, new_token_reserve) =
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+    // Basic invariants should hold
+    output_amount >= 0 &&
+    new_ada_reserve >= ada_reserve &&
+    new_token_reserve <= token_reserve &&
+    new_token_reserve >= 0
+  })
+}
+
+test test_fee_calculation_edge_cases() {
+  // Test fee calculations at various edge cases
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let input_amount = 100_000_000
+
+  // Test edge fee values
+  let fee_scenarios = [
+    0,      // No fee
+    1,      // Minimal fee (0.01%)
+    9999,   // Near maximum fee (99.99%)
+    10000   // Maximum fee (100%)
+  ]
+
+  list.all(fee_scenarios, fn(fee_bps) {
+    let (output_amount, new_ada_reserve, new_token_reserve) =
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+    // Validate fee calculation results
+    if fee_bps == 10000 {
+      // 100% fee should result in zero output
+      output_amount == 0
+    } else {
+      // Other fees should allow some output
+      output_amount >= 0 &&
+      new_ada_reserve >= ada_reserve &&
+      new_token_reserve <= token_reserve
+    }
+  })
+}
+
+test test_integer_boundary_calculations() {
+  // Test calculations at integer boundaries
+  let max_safe = 1000_000_000_000_000  // Large but safe number
+  let scenarios = [
+    (max_safe, max_safe, 1000_000),     // Large reserves, small input
+    (max_safe, 1000_000, 1000),        // Large ADA, small token
+    (1000_000, max_safe, 1000),        // Small ADA, large token
+    (1, 1, 1)                          // Minimal everything
+  ]
+
+  list.all(scenarios, fn(scenario) {
+    let (ada_reserve, token_reserve, input_amount) = scenario
+    let fee_bps = 30
+
+    let (output_amount, new_ada_reserve, new_token_reserve) =
+      calculate_swap_output(ada_reserve, token_reserve, input_amount, fee_bps)
+
+    // Should handle boundary cases without overflow
+    output_amount >= 0 &&
+    new_ada_reserve >= ada_reserve &&
+    new_token_reserve <= token_reserve &&
+    new_ada_reserve < 9223372036854775807 &&  // No overflow
+    new_token_reserve >= 0
+  })
+}
+
+test test_geometric_mean_edge_cases() {
+  // Test geometric mean calculation for LP tokens with edge cases
+  let scenarios = [
+    (1, 1),                           // Minimal amounts
+    (1000_000_000_000, 1),            // Extreme ratio 1
+    (1, 1000_000_000_000),            // Extreme ratio 2
+    (1000_000_000, 1000_000_000),     // Equal amounts
+    (999_999_999, 1000_000_001)       // Nearly equal
+  ]
+
+  list.all(scenarios, fn(scenario) {
+    let (ada_amount, token_amount) = scenario
+    let total_lp_supply = 0  // Initial liquidity
+
+    let lp_tokens = calculate_lp_tokens_to_mint(0, 0, ada_amount, token_amount, total_lp_supply)
+
+    // Geometric mean should always be positive for positive inputs
+    lp_tokens > 0
+  })
+}
+
+test test_rounding_error_accumulation() {
+  // Test that rounding errors don't accumulate dangerously
+  let ada_reserve = 1000_000_000
+  let token_reserve = 1000_000_000
+  let fee_bps = 30
+
+  // Perform many small swaps
+  let small_input = 1000  // Very small amount
+  let iterations = 100
+
+  // Simulate multiple small swaps (we can't loop, so test a few manually)
+  let (out1, ada1, token1) = calculate_swap_output(ada_reserve, token_reserve, small_input, fee_bps)
+  let (out2, ada2, token2) = calculate_swap_output(ada1, token1, small_input, fee_bps)
+  let (out3, ada3, token3) = calculate_swap_output(ada2, token2, small_input, fee_bps)
+  let (out4, ada4, token4) = calculate_swap_output(ada3, token3, small_input, fee_bps)
+  let (out5, ada5, token5) = calculate_swap_output(ada4, token4, small_input, fee_bps)
+
+  // Each swap should maintain basic invariants
+  expect out1 >= 0 && out2 >= 0 && out3 >= 0 && out4 >= 0 && out5 >= 0
+  expect ada5 > ada_reserve  // ADA should increase
+  expect token5 < token_reserve  // Tokens should decrease
+  expect token5 >= 0  // Should not go negative
+
+  True
+}

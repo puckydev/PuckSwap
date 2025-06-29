@@ -1,0 +1,9 @@
+{
+  "network": "preprod",
+  "deployedAt": "2025-06-26T20:06:23.769Z",
+  "validators": {},
+  "policies": {
+    "authentication": "f78cda912365edd6b6c8d29424fcb7dfbf8ef59b96c62636a5c52334",
+    "lpMinting": "67d57ba00801f0038eed3c45ec548f578b622882584578a80022f729"
+  }
+}

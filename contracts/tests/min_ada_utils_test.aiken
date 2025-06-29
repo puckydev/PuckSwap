@@ -1,0 +1,345 @@
+use aiken/transaction.{ScriptContext, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name,
+  from_lovelace, merge, tokens
+}
+use aiken/list
+use aiken/bytearray
+
+// Import min ADA utilities
+use puckswap/lib/min_ada_utils.{
+  calculate_min_ada_for_utxo, calculate_pool_min_ada, calculate_user_output_min_ada,
+  calculate_factory_min_ada, calculate_lp_token_min_ada,
+  validate_utxo_min_ada, validate_pool_operation_min_ada,
+  validate_swap_min_ada_preservation, validate_liquidity_removal_min_ada,
+  UTxOType, PoolUTxO, FactoryUTxO, LPTokenUTxO, UserUTxO, GenericUTxO,
+  PoolOperationType, SwapOperation, AddLiquidityOperation, RemoveLiquidityOperation, CreatePoolOperation,
+  base_min_ada, script_min_ada, pool_min_ada, factory_min_ada, lp_token_min_ada,
+  ada_per_asset, ada_per_datum_byte
+}
+
+// Import value utilities
+use puckswap/lib/value_utils.{get_ada_quantity}
+
+// =============================================================================
+// TEST DATA SETUP
+// =============================================================================
+
+// Mock address for testing
+fn mock_user_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None
+  }
+}
+
+// Mock script address for testing
+fn mock_script_address() -> Address {
+  Address {
+    payment_credential: credential.ScriptCredential(#"fedcba0987654321fedcba0987654321fedcba0987654321fedcba09"),
+    staking_credential: None
+  }
+}
+
+// Mock policy ID for testing
+fn mock_policy_id() -> PolicyId {
+  #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+}
+
+// Mock asset name for testing
+fn mock_asset_name() -> AssetName {
+  #"50554b4b59" // "PUKKY" in hex
+}
+
+// Create test value with ADA only
+fn create_ada_only_value(ada_amount: Int) -> Value {
+  from_lovelace(ada_amount)
+}
+
+// Create test value with ADA and one native asset
+fn create_value_with_asset(ada_amount: Int, asset_amount: Int) -> Value {
+  let ada_value = from_lovelace(ada_amount)
+  let asset_value = tokens(mock_policy_id(), mock_asset_name(), asset_amount)
+  merge(ada_value, asset_value)
+}
+
+// Create test output
+fn create_test_output(value: Value, address: Address) -> Output {
+  Output {
+    address: address,
+    value: value,
+    datum: None,
+    reference_script: None
+  }
+}
+
+// =============================================================================
+// MIN ADA CALCULATION TESTS
+// =============================================================================
+
+test test_calculate_min_ada_for_utxo_basic() {
+  // Test basic UTxO with only ADA at user address
+  let value = create_ada_only_value(1_000_000)
+  let min_ada = calculate_min_ada_for_utxo(value, 0, False)
+  
+  // Should be base minimum ADA
+  min_ada == base_min_ada
+}
+
+test test_calculate_min_ada_for_utxo_script_address() {
+  // Test UTxO at script address
+  let value = create_ada_only_value(2_000_000)
+  let min_ada = calculate_min_ada_for_utxo(value, 0, True)
+  
+  // Should be script minimum ADA
+  min_ada == script_min_ada
+}
+
+test test_calculate_min_ada_for_utxo_with_assets() {
+  // Test UTxO with native assets
+  let value = create_value_with_asset(2_000_000, 1000)
+  let min_ada = calculate_min_ada_for_utxo(value, 0, False)
+  
+  // Should be base minimum + asset cost
+  let expected = base_min_ada + ada_per_asset
+  min_ada == expected
+}
+
+test test_calculate_min_ada_for_utxo_with_datum() {
+  // Test UTxO with datum
+  let value = create_ada_only_value(2_000_000)
+  let datum_size = 100
+  let min_ada = calculate_min_ada_for_utxo(value, datum_size, False)
+  
+  // Should be base minimum + datum cost
+  let expected = base_min_ada + (datum_size * ada_per_datum_byte)
+  min_ada == expected
+}
+
+test test_calculate_pool_min_ada() {
+  // Test pool UTxO min ADA calculation
+  let pool_value = create_value_with_asset(3_000_000, 1000)
+  let datum_size = 200
+  let min_ada = calculate_pool_min_ada(pool_value, datum_size, True, 1)
+  
+  // Should be pool minimum + NFT cost + token cost + datum cost + buffer
+  let base_cost = pool_min_ada
+  let nft_cost = ada_per_asset
+  let token_cost = ada_per_asset
+  let datum_cost = datum_size * ada_per_datum_byte
+  let expected_before_buffer = base_cost + nft_cost + token_cost + datum_cost
+  let expected = expected_before_buffer + (expected_before_buffer / 10) // 10% buffer
+  
+  min_ada == expected
+}
+
+test test_calculate_user_output_min_ada() {
+  // Test user output min ADA calculation
+  let user_value = create_value_with_asset(1_500_000, 500)
+  let min_ada = calculate_user_output_min_ada(user_value, False)
+  
+  // Should be base minimum + asset cost
+  let expected = base_min_ada + ada_per_asset
+  min_ada == expected
+}
+
+test test_calculate_user_output_min_ada_with_datum() {
+  // Test user output with datum
+  let user_value = create_ada_only_value(1_500_000)
+  let min_ada = calculate_user_output_min_ada(user_value, True)
+  
+  // Should be base minimum + small datum cost
+  let expected = base_min_ada + (50 * ada_per_datum_byte)
+  min_ada == expected
+}
+
+test test_calculate_factory_min_ada() {
+  // Test factory UTxO min ADA calculation
+  let factory_value = create_ada_only_value(2_500_000)
+  let datum_size = 150
+  let min_ada = calculate_factory_min_ada(factory_value, datum_size)
+  
+  // Should be factory minimum + datum cost + buffer
+  let base_cost = factory_min_ada + (datum_size * ada_per_datum_byte)
+  let expected = base_cost + (factory_min_ada / 20) // 5% buffer
+  min_ada == expected
+}
+
+test test_calculate_lp_token_min_ada() {
+  // Test LP token UTxO min ADA calculation
+  let lp_value = create_ada_only_value(2_000_000)
+  let metadata_size = 100
+  let min_ada = calculate_lp_token_min_ada(lp_value, metadata_size)
+  
+  // Should be LP token minimum + metadata cost
+  let expected = lp_token_min_ada + (metadata_size * ada_per_datum_byte)
+  min_ada == expected
+}
+
+// =============================================================================
+// UTxO VALIDATION TESTS
+// =============================================================================
+
+test test_validate_utxo_min_ada_valid() {
+  // Test valid UTxO
+  let value = create_ada_only_value(2_000_000)
+  let output = create_test_output(value, mock_user_address())
+  let is_valid = validate_utxo_min_ada(output, 0, GenericUTxO)
+  
+  is_valid
+}
+
+test test_validate_utxo_min_ada_invalid() {
+  // Test invalid UTxO (insufficient ADA)
+  let value = create_ada_only_value(500_000) // Less than base minimum
+  let output = create_test_output(value, mock_user_address())
+  let is_valid = validate_utxo_min_ada(output, 0, GenericUTxO)
+  
+  !is_valid
+}
+
+test test_validate_utxo_min_ada_pool() {
+  // Test pool UTxO validation
+  let pool_value = create_value_with_asset(4_000_000, 1000)
+  let pool_output = create_test_output(pool_value, mock_script_address())
+  let is_valid = validate_utxo_min_ada(pool_output, 200, PoolUTxO { has_nft: True, token_count: 1 })
+  
+  is_valid
+}
+
+test test_validate_utxo_min_ada_pool_insufficient() {
+  // Test pool UTxO with insufficient ADA
+  let pool_value = create_value_with_asset(2_000_000, 1000) // Too low for pool
+  let pool_output = create_test_output(pool_value, mock_script_address())
+  let is_valid = validate_utxo_min_ada(pool_output, 200, PoolUTxO { has_nft: True, token_count: 1 })
+  
+  !is_valid
+}
+
+test test_validate_utxo_min_ada_factory() {
+  // Test factory UTxO validation
+  let factory_value = create_ada_only_value(3_000_000)
+  let factory_output = create_test_output(factory_value, mock_script_address())
+  let is_valid = validate_utxo_min_ada(factory_output, 150, FactoryUTxO)
+  
+  is_valid
+}
+
+test test_validate_utxo_min_ada_lp_token() {
+  // Test LP token UTxO validation
+  let lp_value = create_ada_only_value(2_500_000)
+  let lp_output = create_test_output(lp_value, mock_script_address())
+  let is_valid = validate_utxo_min_ada(lp_output, 100, LPTokenUTxO { metadata_size: 100 })
+  
+  is_valid
+}
+
+test test_validate_utxo_min_ada_user() {
+  // Test user UTxO validation
+  let user_value = create_value_with_asset(1_500_000, 500)
+  let user_output = create_test_output(user_value, mock_user_address())
+  let is_valid = validate_utxo_min_ada(user_output, 0, UserUTxO { has_datum: False })
+  
+  is_valid
+}
+
+// =============================================================================
+// POOL OPERATION VALIDATION TESTS
+// =============================================================================
+
+test test_validate_swap_min_ada_preservation() {
+  // Test swap preserves minimum ADA
+  let initial_ada = 5_000_000
+  let final_ada = 4_500_000
+  let pool_value = create_value_with_asset(final_ada, 1000)
+  let datum_size = 200
+  
+  let is_valid = validate_swap_min_ada_preservation(
+    initial_ada, final_ada, pool_value, datum_size
+  )
+  
+  is_valid
+}
+
+test test_validate_swap_min_ada_preservation_invalid() {
+  // Test swap that would drain pool below minimum
+  let initial_ada = 3_000_000
+  let final_ada = 1_000_000 // Too low
+  let pool_value = create_value_with_asset(final_ada, 1000)
+  let datum_size = 200
+  
+  let is_valid = validate_swap_min_ada_preservation(
+    initial_ada, final_ada, pool_value, datum_size
+  )
+  
+  !is_valid
+}
+
+test test_validate_liquidity_removal_min_ada() {
+  // Test valid liquidity removal
+  let initial_ada = 10_000_000
+  let final_ada = 8_000_000
+  let ada_to_withdraw = 2_000_000
+  let pool_value = create_value_with_asset(final_ada, 1000)
+  let datum_size = 200
+  
+  let is_valid = validate_liquidity_removal_min_ada(
+    initial_ada, final_ada, ada_to_withdraw, pool_value, datum_size
+  )
+  
+  is_valid
+}
+
+test test_validate_liquidity_removal_min_ada_invalid() {
+  // Test liquidity removal that would leave insufficient ADA
+  let initial_ada = 5_000_000
+  let final_ada = 1_000_000 // Too low
+  let ada_to_withdraw = 4_000_000
+  let pool_value = create_value_with_asset(final_ada, 1000)
+  let datum_size = 200
+  
+  let is_valid = validate_liquidity_removal_min_ada(
+    initial_ada, final_ada, ada_to_withdraw, pool_value, datum_size
+  )
+  
+  !is_valid
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+test test_min_ada_with_multiple_assets() {
+  // Test UTxO with multiple native assets
+  let ada_value = from_lovelace(3_000_000)
+  let asset1 = tokens(mock_policy_id(), mock_asset_name(), 1000)
+  let asset2 = tokens(#"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321", #"544f4b454e", 500)
+  let combined_value = merge(merge(ada_value, asset1), asset2)
+  
+  let min_ada = calculate_min_ada_for_utxo(combined_value, 0, False)
+  
+  // Should account for both assets
+  let expected = base_min_ada + (2 * ada_per_asset)
+  min_ada == expected
+}
+
+test test_min_ada_with_large_datum() {
+  // Test UTxO with large datum
+  let value = create_ada_only_value(10_000_000)
+  let large_datum_size = 1000
+  let min_ada = calculate_min_ada_for_utxo(value, large_datum_size, True)
+  
+  // Should account for large datum
+  let expected = script_min_ada + (large_datum_size * ada_per_datum_byte)
+  min_ada == expected
+}
+
+test test_min_ada_zero_assets() {
+  // Test UTxO with zero native assets
+  let value = create_ada_only_value(1_000_000)
+  let min_ada = calculate_min_ada_for_utxo(value, 0, False)
+  
+  // Should be just base minimum
+  min_ada == base_min_ada
+}

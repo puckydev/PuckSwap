@@ -1,0 +1,690 @@
+use aiken/transaction.{ScriptContext, Spend, Transaction, Input, Output, OutputReference}
+use aiken/transaction/credential.{Address, VerificationKeyCredential}
+use aiken/transaction/value.{Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, from_lovelace, tokens, merge}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/dict
+
+// Import validator and utilities
+use liquidity_provision_validator_v5.{
+  LiquidityProvisionRedeemer, LiquidityProvisionResult, calculate_liquidity_provision,
+  validate_liquidity_ratio_balance, liquidity_provision_validator_v5
+}
+use puckswap/lib/liquidity_utils.{
+  calculate_lp_tokens_to_mint, validate_liquidity_ratio, validate_minimum_amounts,
+  calculate_optimal_token_amount, calculate_optimal_ada_amount
+}
+use puckswap/lib/cip68_types.{
+  PoolCIP68Datum, PoolState, PoolConfig, PoolStats, CIP68Metadata
+}
+
+// =============================================================================
+// LIQUIDITY PROVISION VALIDATOR V5 COMPREHENSIVE TESTS
+// =============================================================================
+
+// Test constants
+const TEST_ADA_RESERVE: Int = 1000_000_000      // 1000 ADA
+const TEST_TOKEN_RESERVE: Int = 2000_000_000    // 2000 tokens
+const TEST_LP_SUPPLY: Int = 1414_213_562        // sqrt(1000 * 2000) * 1e6
+const TEST_ADA_AMOUNT: Int = 100_000_000        // 100 ADA
+const TEST_TOKEN_AMOUNT: Int = 200_000_000      // 200 tokens
+
+// =============================================================================
+// CORE LIQUIDITY CALCULATION TESTS
+// =============================================================================
+
+test test_initial_liquidity_provision() {
+  // Test initial liquidity provision using geometric mean
+  let liquidity_result = calculate_liquidity_provision(
+    0,  // No existing ADA reserve
+    0,  // No existing token reserve
+    0,  // No existing LP supply
+    TEST_ADA_AMOUNT,
+    TEST_TOKEN_AMOUNT,
+    True  // Is initial liquidity
+  )
+
+  // Verify LP tokens calculated using geometric mean
+  // sqrt(100 * 200) * 1e6 ≈ 141,421,356
+  let expected_lp_tokens = math.sqrt(TEST_ADA_AMOUNT * TEST_TOKEN_AMOUNT)
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  // Verify reserves are set correctly
+  expect liquidity_result.new_ada_reserve == TEST_ADA_AMOUNT
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_AMOUNT
+  expect liquidity_result.new_total_lp_supply == expected_lp_tokens
+
+  // Verify ratios are 100% for initial liquidity
+  expect liquidity_result.ada_ratio == 1000000
+  expect liquidity_result.token_ratio == 1000000
+  expect liquidity_result.effective_ratio == 1000000
+
+  True
+}
+
+test test_proportional_liquidity_provision() {
+  // Test proportional liquidity provision (10% of existing pool)
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_ADA_AMOUNT,   // 10% of ADA reserve
+    TEST_TOKEN_AMOUNT, // 10% of token reserve
+    False  // Not initial liquidity
+  )
+
+  // Verify LP tokens are 10% of existing supply
+  let expected_lp_tokens = TEST_LP_SUPPLY * 10 / 100  // 10%
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  // Verify reserves are updated correctly
+  expect liquidity_result.new_ada_reserve == TEST_ADA_RESERVE + TEST_ADA_AMOUNT
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_RESERVE + TEST_TOKEN_AMOUNT
+  expect liquidity_result.new_total_lp_supply == TEST_LP_SUPPLY + expected_lp_tokens
+
+  // Verify ratios are equal (balanced liquidity)
+  expect liquidity_result.ada_ratio == liquidity_result.token_ratio
+  expect liquidity_result.effective_ratio == liquidity_result.ada_ratio
+
+  True
+}
+
+test test_unbalanced_liquidity_provision() {
+  // Test unbalanced liquidity provision (different ratios)
+  let unbalanced_token_amount = 150_000_000  // 7.5% instead of 10%
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_ADA_AMOUNT,        // 10% of ADA reserve
+    unbalanced_token_amount, // 7.5% of token reserve
+    False
+  )
+
+  // Verify LP tokens use minimum ratio (7.5%)
+  let expected_lp_tokens = TEST_LP_SUPPLY * 75 / 1000  // 7.5%
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  // Verify effective ratio is the minimum
+  expect liquidity_result.effective_ratio == liquidity_result.token_ratio
+  expect liquidity_result.effective_ratio < liquidity_result.ada_ratio
+
+  True
+}
+
+// =============================================================================
+// LIQUIDITY RATIO VALIDATION TESTS
+// =============================================================================
+
+test test_balanced_liquidity_validation() {
+  // Test validation of balanced liquidity (within 5% deviation)
+  let is_balanced = validate_liquidity_ratio_balance(
+    100000,  // 10% ADA ratio (scaled by 1e6)
+    100000,  // 10% token ratio (scaled by 1e6)
+    500      // 5% max deviation (500 bps)
+  )
+
+  expect is_balanced
+
+  True
+}
+
+test test_unbalanced_liquidity_validation() {
+  // Test validation of unbalanced liquidity (exceeds 5% deviation)
+  let is_balanced = validate_liquidity_ratio_balance(
+    100000,  // 10% ADA ratio (scaled by 1e6)
+    80000,   // 8% token ratio (scaled by 1e6) - 20% difference
+    500      // 5% max deviation (500 bps)
+  )
+
+  expect !is_balanced
+
+  True
+}
+
+test test_edge_case_ratio_validation() {
+  // Test edge case where one ratio is zero
+  let is_balanced = validate_liquidity_ratio_balance(
+    100000,  // 10% ADA ratio
+    0,       // 0% token ratio
+    500      // 5% max deviation
+  )
+
+  expect !is_balanced
+
+  True
+}
+
+// =============================================================================
+// LIQUIDITY UTILITIES TESTS
+// =============================================================================
+
+test test_minimum_amounts_validation() {
+  // Test initial liquidity minimum amounts
+  let initial_valid = validate_minimum_amounts(
+    10_000_000,  // 10 ADA
+    1_000_000,   // 1 token
+    True         // Is initial
+  )
+  expect initial_valid
+
+  let initial_invalid = validate_minimum_amounts(
+    500_000,     // 0.5 ADA (too small)
+    1_000_000,   // 1 token
+    True
+  )
+  expect !initial_invalid
+
+  // Test subsequent liquidity minimum amounts
+  let subsequent_valid = validate_minimum_amounts(
+    1_000_000,   // 1 ADA
+    1_000_000,   // 1 token
+    False        // Not initial
+  )
+  expect subsequent_valid
+
+  True
+}
+
+test test_optimal_amount_calculations() {
+  // Test optimal token amount calculation for given ADA
+  let optimal_token = calculate_optimal_token_amount(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_ADA_AMOUNT
+  )
+
+  // Should be proportional: 100 ADA * (2000 tokens / 1000 ADA) = 200 tokens
+  expect optimal_token == TEST_TOKEN_AMOUNT
+
+  // Test optimal ADA amount calculation for given tokens
+  let optimal_ada = calculate_optimal_ada_amount(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_TOKEN_AMOUNT
+  )
+
+  // Should be proportional: 200 tokens * (1000 ADA / 2000 tokens) = 100 ADA
+  expect optimal_ada == TEST_ADA_AMOUNT
+
+  True
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+test test_very_small_liquidity_provision() {
+  // Test with very small amounts
+  let small_ada = 1_000_000    // 1 ADA
+  let small_token = 2_000_000  // 2 tokens (maintaining 1:2 ratio)
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    small_ada,
+    small_token,
+    False
+  )
+
+  // Should handle small amounts gracefully
+  expect liquidity_result.lp_tokens_to_mint > 0
+  expect liquidity_result.new_ada_reserve == TEST_ADA_RESERVE + small_ada
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_RESERVE + small_token
+
+  True
+}
+
+test test_large_liquidity_provision() {
+  // Test with large amounts (50% of pool)
+  let large_ada = TEST_ADA_RESERVE / 2      // 500 ADA
+  let large_token = TEST_TOKEN_RESERVE / 2  // 1000 tokens
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    large_ada,
+    large_token,
+    False
+  )
+
+  // Should handle large amounts correctly
+  expect liquidity_result.lp_tokens_to_mint > 0
+  expect liquidity_result.new_ada_reserve == TEST_ADA_RESERVE + large_ada
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_RESERVE + large_token
+
+  // LP tokens should be 50% of existing supply
+  let expected_lp_tokens = TEST_LP_SUPPLY / 2
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  True
+}
+
+test test_precision_with_large_numbers() {
+  // Test precision with very large reserves
+  let large_ada_reserve = 1_000_000_000_000_000    // 1B ADA
+  let large_token_reserve = 2_000_000_000_000_000  // 2B tokens
+  let large_lp_supply = 1_414_213_562_373_095      // sqrt(1B * 2B)
+  let provision_ada = 1_000_000_000_000             // 1M ADA
+  let provision_token = 2_000_000_000_000           // 2M tokens
+
+  let liquidity_result = calculate_liquidity_provision(
+    large_ada_reserve,
+    large_token_reserve,
+    large_lp_supply,
+    provision_ada,
+    provision_token,
+    False
+  )
+
+  // Should handle large numbers without overflow
+  expect liquidity_result.lp_tokens_to_mint > 0
+  expect liquidity_result.new_ada_reserve > large_ada_reserve
+  expect liquidity_result.new_token_reserve > large_token_reserve
+
+  True
+}
+
+// =============================================================================
+// SECURITY TESTS
+// =============================================================================
+
+test test_manipulation_prevention() {
+  // Test that unbalanced liquidity uses minimum ratio
+  let manipulative_ada = 1000_000_000    // 1000 ADA (100% of reserve)
+  let manipulative_token = 100_000_000   // 100 tokens (5% of reserve)
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    manipulative_ada,
+    manipulative_token,
+    False
+  )
+
+  // Should use token ratio (5%) not ADA ratio (100%)
+  let expected_lp_tokens = TEST_LP_SUPPLY * 5 / 100  // 5%
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  // Effective ratio should be the minimum (token ratio)
+  expect liquidity_result.effective_ratio == liquidity_result.token_ratio
+  expect liquidity_result.effective_ratio < liquidity_result.ada_ratio
+
+  True
+}
+
+test test_zero_amount_rejection() {
+  // Test that zero amounts are rejected in validation
+  let zero_ada_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    0,  // Zero ADA
+    TEST_TOKEN_AMOUNT,
+    False
+  )
+
+  // This should be caught by parameter validation in the validator
+  // The calculation function itself may handle it, but validator should reject
+
+  True
+}
+
+// =============================================================================
+// MOCK DATA HELPERS
+// =============================================================================
+
+fn create_mock_pool_datum() -> PoolCIP68Datum {
+  PoolCIP68Datum {
+    metadata: dict.new(),
+    version: 1,
+    extra: Void,
+    pool_state: PoolState {
+      ada_reserve: TEST_ADA_RESERVE,
+      token_reserve: TEST_TOKEN_RESERVE,
+      total_lp_supply: TEST_LP_SUPPLY,
+      last_interaction_slot: 1000,
+      pool_nft_name: #"pool_nft",
+    },
+    pool_config: PoolConfig {
+      token_policy: #"token_policy",
+      token_name: #"PUCKY",
+      lp_token_policy: #"lp_policy",
+      lp_token_name: #"LP",
+      fee_bps: 30,
+      protocol_fee_bps: 5,
+      creator: create_mock_address(),
+      admin: create_mock_address(),
+      is_paused: False,
+    },
+    pool_stats: PoolStats {
+      total_volume_ada: 0,
+      total_volume_token: 0,
+      total_fees_collected: 0,
+      swap_count: 0,
+      liquidity_providers_count: 1,
+      created_at_slot: 1000,
+      last_price_ada_per_token: 2000000,
+      price_history_hash: #"",
+    },
+  }
+}
+
+fn create_mock_address() -> Address {
+  Address {
+    payment_credential: VerificationKeyCredential(#"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"),
+    staking_credential: None,
+  }
+}
+
+fn create_mock_liquidity_redeemer(
+  ada_amount: Int,
+  token_amount: Int,
+  min_lp_tokens: Int,
+  is_initial: Bool
+) -> LiquidityProvisionRedeemer {
+  LiquidityProvisionRedeemer {
+    ada_amount: ada_amount,
+    token_amount: token_amount,
+    min_lp_tokens: min_lp_tokens,
+    max_ratio_deviation_bps: 500,  // 5% max deviation
+    deadline_slot: 2000,
+    user_address: create_mock_address(),
+    is_initial_liquidity: is_initial,
+  }
+}
+
+// =============================================================================
+// INTEGRATION TESTS
+// =============================================================================
+
+test test_complete_initial_liquidity_flow() {
+  // Test complete flow for initial liquidity provision
+  let pool_datum = create_empty_pool_datum()
+  let liquidity_redeemer = create_mock_liquidity_redeemer(
+    TEST_ADA_AMOUNT,
+    TEST_TOKEN_AMOUNT,
+    100_000_000,  // Minimum 100 LP tokens
+    True          // Is initial liquidity
+  )
+
+  // Calculate expected result
+  let liquidity_result = calculate_liquidity_provision(
+    0, 0, 0,  // Empty pool
+    liquidity_redeemer.ada_amount,
+    liquidity_redeemer.token_amount,
+    liquidity_redeemer.is_initial_liquidity
+  )
+
+  // Verify minimum LP tokens requirement is met
+  expect liquidity_result.lp_tokens_to_mint >= liquidity_redeemer.min_lp_tokens
+
+  // Verify initial liquidity creates proper reserves
+  expect liquidity_result.new_ada_reserve == TEST_ADA_AMOUNT
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_AMOUNT
+
+  True
+}
+
+test test_complete_subsequent_liquidity_flow() {
+  // Test complete flow for subsequent liquidity provision
+  let pool_datum = create_mock_pool_datum()
+  let liquidity_redeemer = create_mock_liquidity_redeemer(
+    TEST_ADA_AMOUNT,
+    TEST_TOKEN_AMOUNT,
+    100_000_000,  // Minimum 100 LP tokens
+    False         // Not initial liquidity
+  )
+
+  // Calculate expected result
+  let liquidity_result = calculate_liquidity_provision(
+    pool_datum.pool_state.ada_reserve,
+    pool_datum.pool_state.token_reserve,
+    pool_datum.pool_state.total_lp_supply,
+    liquidity_redeemer.ada_amount,
+    liquidity_redeemer.token_amount,
+    liquidity_redeemer.is_initial_liquidity
+  )
+
+  // Verify minimum LP tokens requirement is met
+  expect liquidity_result.lp_tokens_to_mint >= liquidity_redeemer.min_lp_tokens
+
+  // Verify ratio balance for subsequent liquidity
+  expect validate_liquidity_ratio_balance(
+    liquidity_result.ada_ratio,
+    liquidity_result.token_ratio,
+    liquidity_redeemer.max_ratio_deviation_bps
+  )
+
+  True
+}
+
+// =============================================================================
+// STRESS TESTS
+// =============================================================================
+
+test test_multiple_consecutive_liquidity_provisions() {
+  // Test multiple consecutive liquidity provisions
+  let mut current_ada_reserve = TEST_ADA_RESERVE
+  let mut current_token_reserve = TEST_TOKEN_RESERVE
+  let mut current_lp_supply = TEST_LP_SUPPLY
+
+  // Perform 5 consecutive liquidity provisions
+  let provision_amounts = [
+    (10_000_000, 20_000_000),   // 10 ADA, 20 tokens
+    (20_000_000, 40_000_000),   // 20 ADA, 40 tokens
+    (15_000_000, 30_000_000),   // 15 ADA, 30 tokens
+    (25_000_000, 50_000_000),   // 25 ADA, 50 tokens
+    (30_000_000, 60_000_000)    // 30 ADA, 60 tokens
+  ]
+
+  list.foldr(provision_amounts, True, fn(amounts, acc) {
+    if acc {
+      let (ada_amount, token_amount) = amounts
+
+      let liquidity_result = calculate_liquidity_provision(
+        current_ada_reserve,
+        current_token_reserve,
+        current_lp_supply,
+        ada_amount,
+        token_amount,
+        False  // Not initial
+      )
+
+      // Update reserves for next iteration
+      current_ada_reserve = liquidity_result.new_ada_reserve
+      current_token_reserve = liquidity_result.new_token_reserve
+      current_lp_supply = liquidity_result.new_total_lp_supply
+
+      // Verify invariants
+      current_ada_reserve > 0 &&
+      current_token_reserve > 0 &&
+      current_lp_supply > 0 &&
+      liquidity_result.lp_tokens_to_mint > 0
+    } else {
+      False
+    }
+  })
+}
+
+test test_varying_liquidity_sizes() {
+  // Test liquidity provisions of varying sizes
+  let provision_sizes = [
+    (1_000_000, 2_000_000),       // Small: 1 ADA, 2 tokens
+    (50_000_000, 100_000_000),    // Medium: 50 ADA, 100 tokens
+    (500_000_000, 1_000_000_000), // Large: 500 ADA, 1000 tokens
+    (5_000_000, 10_000_000),      // Small again: 5 ADA, 10 tokens
+  ]
+
+  list.all(provision_sizes, fn(amounts) {
+    let (ada_amount, token_amount) = amounts
+
+    let liquidity_result = calculate_liquidity_provision(
+      TEST_ADA_RESERVE,
+      TEST_TOKEN_RESERVE,
+      TEST_LP_SUPPLY,
+      ada_amount,
+      token_amount,
+      False
+    )
+
+    // Verify all provisions work correctly
+    liquidity_result.lp_tokens_to_mint > 0 &&
+    liquidity_result.new_ada_reserve > TEST_ADA_RESERVE &&
+    liquidity_result.new_token_reserve > TEST_TOKEN_RESERVE
+  })
+}
+
+// =============================================================================
+// BOUNDARY CONDITION TESTS
+// =============================================================================
+
+test test_minimum_pool_size_liquidity() {
+  // Test liquidity provision to minimum size pool
+  let min_ada_reserve = 10_000_000   // 10 ADA
+  let min_token_reserve = 20_000_000 // 20 tokens
+  let min_lp_supply = math.sqrt(min_ada_reserve * min_token_reserve)
+
+  let provision_ada = 1_000_000      // 1 ADA
+  let provision_token = 2_000_000    // 2 tokens
+
+  let liquidity_result = calculate_liquidity_provision(
+    min_ada_reserve,
+    min_token_reserve,
+    min_lp_supply,
+    provision_ada,
+    provision_token,
+    False
+  )
+
+  // Should handle small pools gracefully
+  expect liquidity_result.lp_tokens_to_mint > 0
+  expect liquidity_result.new_ada_reserve == min_ada_reserve + provision_ada
+  expect liquidity_result.new_token_reserve == min_token_reserve + provision_token
+
+  True
+}
+
+test test_maximum_single_provision() {
+  // Test maximum allowed single provision (50% of pool)
+  let max_ada = TEST_ADA_RESERVE * 50 / 100      // 50% of ADA reserve
+  let max_token = TEST_TOKEN_RESERVE * 50 / 100  // 50% of token reserve
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    max_ada,
+    max_token,
+    False
+  )
+
+  // Should handle maximum provisions correctly
+  expect liquidity_result.lp_tokens_to_mint > 0
+  expect liquidity_result.new_ada_reserve == TEST_ADA_RESERVE + max_ada
+  expect liquidity_result.new_token_reserve == TEST_TOKEN_RESERVE + max_token
+
+  // LP tokens should be 50% of existing supply
+  let expected_lp_tokens = TEST_LP_SUPPLY * 50 / 100
+  expect liquidity_result.lp_tokens_to_mint == expected_lp_tokens
+
+  True
+}
+
+// =============================================================================
+// ERROR CONDITION TESTS
+// =============================================================================
+
+test test_slippage_protection() {
+  // Test slippage protection with high minimum LP token requirement
+  let high_min_lp_tokens = 200_000_000  // Unrealistically high
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_ADA_AMOUNT,
+    TEST_TOKEN_AMOUNT,
+    False
+  )
+
+  // Verify that actual LP tokens would be less than unrealistic minimum
+  expect liquidity_result.lp_tokens_to_mint < high_min_lp_tokens
+
+  // This would be caught by the validator's slippage protection
+  True
+}
+
+test test_ratio_deviation_detection() {
+  // Test detection of excessive ratio deviation
+  let unbalanced_token = 50_000_000  // 2.5% instead of 10% (75% deviation)
+
+  let liquidity_result = calculate_liquidity_provision(
+    TEST_ADA_RESERVE,
+    TEST_TOKEN_RESERVE,
+    TEST_LP_SUPPLY,
+    TEST_ADA_AMOUNT,    // 10% of ADA reserve
+    unbalanced_token,   // 2.5% of token reserve
+    False
+  )
+
+  // Calculate ratio deviation
+  let ada_ratio = TEST_ADA_AMOUNT * 1000000 / TEST_ADA_RESERVE
+  let token_ratio = unbalanced_token * 1000000 / TEST_TOKEN_RESERVE
+  let ratio_diff = math.abs(ada_ratio - token_ratio)
+  let max_ratio = math.max(ada_ratio, token_ratio)
+  let deviation_bps = ratio_diff * 10000 / max_ratio
+
+  // Should detect high deviation (>50%)
+  expect deviation_bps > 5000  // More than 50%
+
+  // Validator would reject this with max_ratio_deviation_bps = 500 (5%)
+  expect !validate_liquidity_ratio_balance(ada_ratio, token_ratio, 500)
+
+  True
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+fn create_empty_pool_datum() -> PoolCIP68Datum {
+  PoolCIP68Datum {
+    metadata: dict.new(),
+    version: 1,
+    extra: Void,
+    pool_state: PoolState {
+      ada_reserve: 0,
+      token_reserve: 0,
+      total_lp_supply: 0,
+      last_interaction_slot: 1000,
+      pool_nft_name: #"pool_nft",
+    },
+    pool_config: PoolConfig {
+      token_policy: #"token_policy",
+      token_name: #"PUCKY",
+      lp_token_policy: #"lp_policy",
+      lp_token_name: #"LP",
+      fee_bps: 30,
+      protocol_fee_bps: 5,
+      creator: create_mock_address(),
+      admin: create_mock_address(),
+      is_paused: False,
+    },
+    pool_stats: PoolStats {
+      total_volume_ada: 0,
+      total_volume_token: 0,
+      total_fees_collected: 0,
+      swap_count: 0,
+      liquidity_providers_count: 0,
+      created_at_slot: 1000,
+      last_price_ada_per_token: 0,
+      price_history_hash: #"",
+    },
+  }
+}

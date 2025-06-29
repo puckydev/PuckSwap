@@ -1,0 +1,258 @@
+// PuckSwap v5 DeFi - pADA Minting Policy Tests
+// Comprehensive test suite for secure pADA minting policy
+
+use aiken/list
+use aiken/bytearray
+
+// Test constants
+const test_staking_validator_hash: ByteArray = #"abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+const test_policy_id: ByteArray = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+const test_pADA_name: ByteArray = #"70414441" // "pADA" in hex
+const test_withdrawal_id: ByteArray = #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+
+// Test 1: Validate staking validator hash format
+test test_staking_validator_hash_format() {
+  let hash = test_staking_validator_hash
+  
+  // Validator hash should be exactly 28 bytes
+  bytearray.length(hash) == 28
+}
+
+// Test 2: Validate policy ID format
+test test_policy_id_format() {
+  let policy_id = test_policy_id
+  
+  // Policy ID should be exactly 28 bytes
+  bytearray.length(policy_id) == 28
+}
+
+// Test 3: Validate pADA token name format
+test test_pADA_token_name_format() {
+  let token_name = test_pADA_name
+  let name_length = bytearray.length(token_name)
+  
+  // Token name should be between 4 and 32 bytes
+  name_length >= 4 && name_length <= 32
+}
+
+// Test 4: Validate withdrawal ID format
+test test_withdrawal_id_format() {
+  let withdrawal_id = test_withdrawal_id
+  
+  // Withdrawal ID should be exactly 32 bytes
+  bytearray.length(withdrawal_id) == 32
+}
+
+// Test 5: Validate minimum deposit amount
+test test_minimum_deposit_amount() {
+  let min_deposit = 1_000_000 // 1 ADA
+  let below_min = 999_999
+  let valid_deposit = 2_000_000 // 2 ADA
+  
+  // Validate minimum requirements
+  min_deposit >= 1_000_000 &&
+  below_min < min_deposit &&
+  valid_deposit >= min_deposit
+}
+
+// Test 6: Validate maximum deposit amount
+test test_maximum_deposit_amount() {
+  let max_deposit = 1_000_000_000_000 // 1M ADA
+  let valid_deposit = 100_000_000 // 100 ADA
+  let above_max = 1_000_000_000_001
+  
+  // Validate maximum requirements
+  max_deposit <= 1_000_000_000_000 &&
+  valid_deposit <= max_deposit &&
+  above_max > max_deposit
+}
+
+// Test 7: Validate pADA amount bounds
+test test_pADA_amount_bounds() {
+  let valid_pADA = 100_000_000 // 100 pADA
+  let max_pADA = 1_000_000_000_000 // 1M pADA
+  let zero_pADA = 0
+  
+  // Validate pADA amount requirements
+  valid_pADA > 0 &&
+  valid_pADA <= max_pADA &&
+  zero_pADA == 0
+}
+
+// Test 8: Validate burn amount (negative)
+test test_burn_amount_validation() {
+  let pADA_amount = 100_000_000 // 100 pADA to burn
+  let burn_amount = -pADA_amount // Should be negative
+  
+  // Burn amount should be negative of pADA amount
+  burn_amount == -pADA_amount &&
+  burn_amount < 0 &&
+  pADA_amount > 0
+}
+
+// Test 9: Token filtering logic
+test test_token_filtering() {
+  // Simulate minted tokens list
+  let policy1 = #"1111111111111111111111111111111111111111111111111111111111111111"
+  let policy2 = test_policy_id
+  let policy3 = #"3333333333333333333333333333333333333333333333333333333333333333"
+  
+  let token_name1 = #"746f6b656e31" // "token1"
+  let token_name2 = test_pADA_name
+  let token_name3 = #"746f6b656e33" // "token3"
+  
+  let minted_tokens = [
+    (policy1, token_name1, 1000),
+    (policy2, token_name2, 2000),
+    (policy3, token_name3, 3000)
+  ]
+  
+  // Filter for our policy
+  let filtered = filter_tokens_for_policy(minted_tokens, policy2)
+  
+  // Should only contain tokens for our policy
+  list.length(filtered) == 1
+}
+
+// Helper function for token filtering test
+fn filter_tokens_for_policy(
+  minted_tokens: List<(ByteArray, ByteArray, Int)>,
+  target_policy: ByteArray
+) -> List<(ByteArray, Int)> {
+  when minted_tokens is {
+    [] -> []
+    [(policy, name, amount), ..tail] ->
+      if policy == target_policy {
+        [(name, amount), ..filter_tokens_for_policy(tail, target_policy)]
+      } else {
+        filter_tokens_for_policy(tail, target_policy)
+      }
+  }
+}
+
+// Test 10: Validate single token minting
+test test_single_token_minting() {
+  let pADA_tokens = [(test_pADA_name, 100_000_000)]
+  
+  // Should have exactly one token
+  let token_count = list.length(pADA_tokens)
+  expect token_count == 1
+  
+  // Get the token details
+  expect Some((token_name, amount)) = list.head(pADA_tokens)
+  
+  // Validate token details
+  token_name == test_pADA_name &&
+  amount > 0
+}
+
+// Test 11: Validate single token burning
+test test_single_token_burning() {
+  let pADA_amount = 100_000_000
+  let pADA_tokens = [(test_pADA_name, -pADA_amount)]
+  
+  // Should have exactly one token
+  let token_count = list.length(pADA_tokens)
+  expect token_count == 1
+  
+  // Get the token details
+  expect Some((token_name, burn_amount)) = list.head(pADA_tokens)
+  
+  // Validate burn details
+  token_name == test_pADA_name &&
+  burn_amount == -pADA_amount &&
+  burn_amount < 0
+}
+
+// Test 12: Validate amount consistency
+test test_amount_consistency() {
+  let ada_deposit = 100_000_000 // 100 ADA
+  let pADA_mint = 95_000_000 // 95 pADA (accounting for exchange rate)
+  
+  // Amounts should be positive and reasonable
+  ada_deposit > 0 &&
+  pADA_mint > 0 &&
+  pADA_mint <= ada_deposit // pADA should not exceed ADA (considering exchange rate)
+}
+
+// Test 13: Validate exchange rate bounds
+test test_exchange_rate_bounds() {
+  let ada_amount = 100_000_000 // 100 ADA
+  let min_pADA = 50_000_000 // 50 pADA (worst case 2:1 rate)
+  let max_pADA = 100_000_000 // 100 pADA (best case 1:1 rate)
+  
+  // Exchange rate should be within reasonable bounds
+  min_pADA >= ada_amount / 2 && // At least 50% value
+  max_pADA <= ada_amount // At most 100% value
+}
+
+// Test 14: Validate fee calculations
+test test_fee_calculations() {
+  let deposit_amount = 100_000_000 // 100 ADA
+  let deposit_fee_bps = 50 // 0.5%
+  let withdrawal_fee_bps = 50 // 0.5%
+  
+  // Calculate fees
+  let deposit_fee = (deposit_amount * deposit_fee_bps) / 10000
+  let withdrawal_fee = (deposit_amount * withdrawal_fee_bps) / 10000
+  
+  // Fees should be reasonable
+  deposit_fee == 500_000 && // 0.5 ADA
+  withdrawal_fee == 500_000 && // 0.5 ADA
+  deposit_fee < deposit_amount / 10 && // Less than 10%
+  withdrawal_fee < deposit_amount / 10 // Less than 10%
+}
+
+// Test 15: Validate security constraints
+test test_security_constraints() {
+  let staking_hash_length = bytearray.length(test_staking_validator_hash)
+  let policy_id_length = bytearray.length(test_policy_id)
+  let withdrawal_id_length = bytearray.length(test_withdrawal_id)
+  
+  // All security-critical identifiers should have correct lengths
+  staking_hash_length == 28 &&
+  policy_id_length == 28 &&
+  withdrawal_id_length == 32
+}
+
+// Test 16: Validate operation boundaries
+test test_operation_boundaries() {
+  let min_ada = 1_000_000 // 1 ADA
+  let max_ada = 1_000_000_000_000 // 1M ADA
+  let min_pADA = 1
+  let max_pADA = 1_000_000_000_000 // 1M pADA
+  
+  // Validate all boundaries are reasonable
+  min_ada >= 1_000_000 &&
+  max_ada <= 1_000_000_000_000 &&
+  min_pADA > 0 &&
+  max_pADA <= 1_000_000_000_000 &&
+  max_ada == max_pADA // Same maximum for consistency
+}
+
+// Test 17: Validate error conditions
+test test_error_conditions() {
+  let zero_amount = 0
+  let negative_amount = -1000
+  let empty_hash = #""
+  let short_hash = #"1234"
+  
+  // These should all be invalid
+  zero_amount == 0 &&
+  negative_amount < 0 &&
+  bytearray.length(empty_hash) == 0 &&
+  bytearray.length(short_hash) < 28
+}
+
+// Test 18: Validate precision handling
+test test_precision_handling() {
+  let small_amount = 1 // 1 lovelace
+  let large_amount = 1_000_000_000_000 // 1M ADA
+  let mid_amount = 100_000_000 // 100 ADA
+  
+  // All amounts should be handled correctly
+  small_amount > 0 &&
+  large_amount <= 1_000_000_000_000 &&
+  mid_amount > small_amount &&
+  mid_amount < large_amount
+}

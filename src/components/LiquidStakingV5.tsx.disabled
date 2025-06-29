@@ -1,0 +1,569 @@
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'react-hot-toast';
+import { PuckSwapLiquidStaking } from '../lucid/staking';
+import { formatNumber, formatADA } from '../lib/format-utils';
+
+interface StakingData {
+  totalStaked: bigint;
+  totalPADAMinted: bigint;
+  exchangeRate: number;
+  lastRewardsSyncSlot: number;
+  lastRewardsEpoch: number;
+  totalRewardsEarned: bigint;
+  withdrawalDelaySlots: number;
+  pendingWithdrawals: WithdrawalRequest[];
+  stakePoolId: string;
+  depositFeeBps: number;
+  withdrawalFeeBps: number;
+  managementFeeBps: number;
+}
+
+interface WithdrawalRequest {
+  id: string;
+  user: string;
+  pADAAmount: bigint;
+  expectedADAAmount: bigint;
+  requestedAt: number;
+  status: 'Pending' | 'Completed' | 'Cancelled';
+  completionDeadline: number;
+}
+
+interface StakingQuote {
+  inputAmount: bigint;
+  outputAmount: bigint;
+  fee: bigint;
+  netAmount: bigint;
+  exchangeRate: number;
+}
+
+export default function LiquidStakingV5() {
+  const [stakingData, setStakingData] = useState<StakingData | null>(null);
+  const [mode, setMode] = useState<'deposit' | 'withdraw'>('deposit');
+  const [inputAmount, setInputAmount] = useState<string>('');
+  const [quote, setQuote] = useState<StakingQuote | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [walletConnected, setWalletConnected] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<string>('');
+  const [userADABalance, setUserADABalance] = useState<bigint>(0n);
+  const [userPADABalance, setUserPADABalance] = useState<bigint>(0n);
+  const [txHash, setTxHash] = useState<string>('');
+  const [error, setError] = useState<string>('');
+  const [stakingBuilder, setStakingBuilder] = useState<PuckSwapLiquidStaking | null>(null);
+  const [userWithdrawals, setUserWithdrawals] = useState<WithdrawalRequest[]>([]);
+
+
+  // Mock staking data for demo
+  const mockStakingData: StakingData = {
+    totalStaked: 5000000000000n, // 5M ADA staked
+    totalPADAMinted: 4800000000000n, // 4.8M pADA minted
+    exchangeRate: 1.042, // 1 pADA = 1.042 ADA (includes rewards)
+    lastRewardsSyncSlot: Date.now() - 3600000, // 1 hour ago
+    lastRewardsEpoch: 450,
+    totalRewardsEarned: 200000000000n, // 200K ADA in rewards
+    withdrawalDelaySlots: 432000, // 5 days
+    pendingWithdrawals: [
+      {
+        id: 'withdraw_001',
+        user: 'addr_test1...demo_address',
+        pADAAmount: 1000000000n, // 1000 pADA
+        expectedADAAmount: 1042000000n, // 1042 ADA
+        requestedAt: Date.now() - 86400000, // 1 day ago
+        status: 'Pending',
+        completionDeadline: Date.now() + 345600000 // 4 days from now
+      }
+    ],
+    stakePoolId: 'pool1abc123def456...',
+    depositFeeBps: 10, // 0.1%
+    withdrawalFeeBps: 20, // 0.2%
+    managementFeeBps: 100 // 1% annual
+  };
+
+  useEffect(() => {
+    loadStakingData();
+  }, []);
+
+  useEffect(() => {
+    if (inputAmount && stakingData) {
+      calculateQuote();
+    } else {
+      setQuote(null);
+    }
+  }, [inputAmount, mode, stakingData]);
+
+  const loadStakingData = async () => {
+    try {
+      setIsLoading(true);
+      setError('');
+
+      // Fetch real staking data from Context7 API
+      const response = await fetch('/api/context7/staking');
+      if (!response.ok) {
+        throw new Error(`Failed to fetch staking data: ${response.statusText}`);
+      }
+
+      const apiResponse = await response.json();
+
+      if (!apiResponse.success) {
+        throw new Error(apiResponse.error || 'API request failed');
+      }
+
+      const data = apiResponse.data;
+
+      // Transform API data to StakingData format
+      const stakingData: StakingData = {
+        totalStaked: BigInt(data.totalStaked || 0),
+        totalPADAMinted: BigInt(data.totalPAdaMinted || 0),
+        exchangeRate: parseFloat(data.currentExchangeRate || '1.0'),
+        lastRewardsSyncSlot: data.lastRewardsSyncSlot || 0,
+        lastRewardsEpoch: Math.floor(data.lastRewardsSyncSlot / 432000) || 0,
+        totalRewardsEarned: BigInt(data.totalRewardsEarned || 0),
+        withdrawalDelaySlots: 432000, // 5 days
+        pendingWithdrawals: [],
+        stakePoolId: data.stakePoolId || '',
+        depositFeeBps: 10, // 0.1%
+        withdrawalFeeBps: 20, // 0.2%
+        managementFeeBps: 100 // 1% annual
+      };
+
+      setStakingData(stakingData);
+
+      if (walletConnected && stakingBuilder) {
+        // Load user balances and withdrawals from wallet
+        const adaBalance = await stakingBuilder.getWalletBalance();
+        const pAdaBalance = await stakingBuilder.getUserPADABalance();
+
+        setUserADABalance(adaBalance);
+        setUserPADABalance(pAdaBalance);
+        setUserWithdrawals([]); // Would load from user's UTxOs
+      }
+
+      console.log('✅ Staking data loaded successfully');
+
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to load staking data';
+      setError(errorMsg);
+      console.error('❌ Staking data loading error:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const calculateQuote = () => {
+    if (!stakingData || !inputAmount) return;
+
+    try {
+      const input = BigInt(Math.floor(parseFloat(inputAmount) * 1_000_000));
+      if (input <= 0n) return;
+
+      let outputAmount: bigint;
+      let fee: bigint;
+      let netAmount: bigint;
+
+      if (mode === 'deposit') {
+        // ADA -> pADA
+        fee = (input * BigInt(stakingData.depositFeeBps)) / 10000n;
+        netAmount = input - fee;
+        outputAmount = BigInt(Math.floor(Number(netAmount) / stakingData.exchangeRate));
+      } else {
+        // pADA -> ADA
+        fee = (input * BigInt(stakingData.withdrawalFeeBps)) / 10000n;
+        netAmount = input - fee;
+        outputAmount = BigInt(Math.floor(Number(netAmount) * stakingData.exchangeRate));
+      }
+
+      setQuote({
+        inputAmount: input,
+        outputAmount,
+        fee,
+        netAmount,
+        exchangeRate: stakingData.exchangeRate
+      });
+    } catch (err) {
+      console.error('Quote calculation error:', err);
+      setQuote(null);
+    }
+  };
+
+  const connectWallet = async () => {
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (isDemoMode) {
+        setWalletConnected(true);
+        setWalletAddress('addr_test1...demo_address');
+        toast.success('Demo wallet connected!');
+      } else {
+        const builder = await PuckSwapLiquidStaking.create(
+          process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY || '',
+          "Preprod",
+          {
+            stakingValidator: process.env.NEXT_PUBLIC_STAKING_VALIDATOR_CBOR || 'mock_cbor',
+            pADAMintingPolicy: process.env.NEXT_PUBLIC_PADA_MINTING_POLICY_CBOR || 'mock_cbor'
+          },
+          process.env.NEXT_PUBLIC_STAKING_ADDRESS || 'addr_test1...'
+        );
+
+        setStakingBuilder(builder);
+        setWalletConnected(true);
+        setWalletAddress('addr_test1...real_address');
+        toast.success('Wallet connected successfully!');
+      }
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to connect wallet';
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const executeStakingOperation = async () => {
+    if (!quote || !stakingData || !walletConnected) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+      
+      if (isDemoMode) {
+        // Demo mode simulation
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const mockTxHash = `demo_staking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        setTxHash(mockTxHash);
+        toast.success(`Demo ${mode} completed!`, { icon: mode === 'deposit' ? '🥩' : '💰' });
+      } else if (stakingBuilder) {
+        let result;
+        
+        if (mode === 'deposit') {
+          result = await stakingBuilder.depositStaking({
+            amount: quote.inputAmount,
+            minPADAOut: (quote.outputAmount * 95n) / 100n, // 5% slippage
+            userAddress: walletAddress
+          });
+        } else {
+          result = await stakingBuilder.requestWithdrawal({
+            pADAAmount: quote.inputAmount,
+            minADAOut: (quote.outputAmount * 95n) / 100n, // 5% slippage
+            userAddress: walletAddress
+          });
+        }
+        
+        setTxHash(result.txHash);
+        toast.success(`${mode === 'deposit' ? 'Deposit' : 'Withdrawal request'} completed! TX: ${result.txHash.slice(0, 8)}...`, { 
+          icon: mode === 'deposit' ? '✅' : '⏳' 
+        });
+        
+        // Refresh staking data
+        setTimeout(() => loadStakingData(), 5000);
+      }
+      
+      // Clear inputs
+      setInputAmount('');
+      setQuote(null);
+      
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : `${mode === 'deposit' ? 'Deposit' : 'Withdrawal'} failed`;
+      setError(errorMsg);
+      toast.error(errorMsg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const setMaxAmount = () => {
+    if (mode === 'deposit' && userADABalance > 0n) {
+      setInputAmount((Number(userADABalance) / 1_000_000).toString());
+    } else if (mode === 'withdraw' && userPADABalance > 0n) {
+      setInputAmount((Number(userPADABalance) / 1_000_000).toString());
+    }
+  };
+
+  const clearTransaction = () => {
+    setTxHash('');
+    setError('');
+  };
+
+  const formatTimeRemaining = (deadline: number) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return 'Ready';
+    
+    const days = Math.floor(remaining / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((remaining % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    
+    return `${days}d ${hours}h`;
+  };
+
+  if (!stakingData) {
+    return (
+      <div className="terminal-card p-6 max-w-2xl mx-auto">
+        <div className="text-center text-terminal-green font-mono">
+          {isLoading ? 'Loading staking data...' : 'Staking data unavailable'}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="terminal-card p-6 max-w-2xl mx-auto">
+      {/* Header */}
+      <div className="terminal-header mb-6">
+        <h2 className="text-xl font-bold text-terminal-green font-mono">
+          &gt; PUCKSWAP_LIQUID_STAKING_TERMINAL_v5.0
+        </h2>
+        <div className="text-sm text-terminal-amber font-mono mt-2">
+          Total Staked: {formatADA(stakingData.totalStaked)} |
+          Exchange Rate: 1 pADA = {stakingData.exchangeRate.toFixed(6)} ADA |
+          APY: ~{((stakingData.exchangeRate - 1) * 100).toFixed(2)}%
+        </div>
+        {isDemoMode && (
+          <div className="text-xs text-terminal-red font-mono mt-1">
+            [DEMO MODE - No real transactions]
+          </div>
+        )}
+      </div>
+
+      {/* Staking Stats */}
+      <div className="grid grid-cols-3 gap-4 mb-6 text-sm font-mono">
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Total pADA Supply:</div>
+          <div className="text-terminal-green">{formatADA(stakingData.totalPADAMinted)}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Total Rewards:</div>
+          <div className="text-terminal-green">{formatADA(stakingData.totalRewardsEarned)}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Last Sync:</div>
+          <div className="text-terminal-green">Epoch {stakingData.lastRewardsEpoch}</div>
+        </div>
+      </div>
+
+      {/* User Balances */}
+      <div className="grid grid-cols-2 gap-4 mb-6 text-sm font-mono">
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Your ADA Balance:</div>
+          <div className="text-terminal-green">{formatADA(userADABalance)}</div>
+        </div>
+        <div className="terminal-border p-3">
+          <div className="text-terminal-amber">Your pADA Balance:</div>
+          <div className="text-terminal-green">{formatADA(userPADABalance)}</div>
+        </div>
+      </div>
+
+      {/* Wallet Connection */}
+      {!walletConnected ? (
+        <motion.button
+          onClick={connectWallet}
+          disabled={isLoading}
+          className="w-full terminal-button mb-6"
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >
+          {isLoading ? 'Connecting...' : 'Connect Wallet'}
+        </motion.button>
+      ) : (
+        <div className="mb-6 p-3 terminal-border">
+          <div className="text-terminal-green font-mono text-sm">
+            ✅ Wallet Connected: {walletAddress.slice(0, 12)}...{walletAddress.slice(-8)}
+          </div>
+        </div>
+      )}
+
+      {/* Mode Selection */}
+      <div className="flex mb-6">
+        <button
+          onClick={() => setMode('deposit')}
+          className={`flex-1 py-2 px-4 font-mono text-sm border-r ${
+            mode === 'deposit' 
+              ? 'bg-terminal-green text-black' 
+              : 'text-terminal-green border-terminal-green'
+          }`}
+        >
+          Stake ADA
+        </button>
+        <button
+          onClick={() => setMode('withdraw')}
+          className={`flex-1 py-2 px-4 font-mono text-sm ${
+            mode === 'withdraw' 
+              ? 'bg-terminal-amber text-black' 
+              : 'text-terminal-amber border-terminal-amber'
+          }`}
+        >
+          Unstake pADA
+        </button>
+      </div>
+
+      {/* Staking Interface */}
+      <div className="space-y-4">
+        {/* Input Amount */}
+        <div className="terminal-border p-4">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-terminal-amber font-mono text-sm">
+              {mode === 'deposit' ? 'ADA to Stake:' : 'pADA to Unstake:'}
+            </span>
+            <button
+              onClick={setMaxAmount}
+              className="text-terminal-green font-mono text-xs hover:text-green-400"
+            >
+              MAX
+            </button>
+          </div>
+          <input
+            type="number"
+            value={inputAmount}
+            onChange={(e) => setInputAmount(e.target.value)}
+            placeholder="0.000000"
+            className="w-full bg-transparent text-terminal-green font-mono text-lg border-none outline-none"
+            step="0.000001"
+            min="0"
+            max={mode === 'deposit' ? Number(userADABalance) / 1_000_000 : Number(userPADABalance) / 1_000_000}
+          />
+        </div>
+
+        {/* Output Display */}
+        <div className="terminal-border p-4">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-terminal-amber font-mono text-sm">
+              {mode === 'deposit' ? 'pADA to Receive:' : 'ADA to Receive:'}
+            </span>
+          </div>
+          <div className="text-terminal-green font-mono text-lg">
+            {quote ? formatNumber(Number(quote.outputAmount) / 1_000_000, 6) : '0.000000'}
+          </div>
+        </div>
+
+        {/* Quote Details */}
+        {quote && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="terminal-border p-4 space-y-2 text-sm font-mono"
+          >
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Exchange Rate:</span>
+              <span className="text-terminal-green">1 pADA = {quote.exchangeRate.toFixed(6)} ADA</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Fee ({mode === 'deposit' ? stakingData.depositFeeBps : stakingData.withdrawalFeeBps / 100}%):</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.fee) / 1_000_000, 6)} {mode === 'deposit' ? 'ADA' : 'pADA'}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-terminal-amber">Net Amount:</span>
+              <span className="text-terminal-green">
+                {formatNumber(Number(quote.netAmount) / 1_000_000, 6)} {mode === 'deposit' ? 'ADA' : 'pADA'}
+              </span>
+            </div>
+            {mode === 'withdraw' && (
+              <div className="text-terminal-amber text-xs mt-2">
+                ⚠️ Withdrawal requests have a {Math.floor(stakingData.withdrawalDelaySlots / 86400)} day delay period
+              </div>
+            )}
+          </motion.div>
+        )}
+
+        {/* Execute Button */}
+        <motion.button
+          onClick={executeStakingOperation}
+          disabled={!walletConnected || !quote || isLoading}
+          className="w-full terminal-button py-3"
+          whileHover={{ scale: walletConnected && quote && !isLoading ? 1.02 : 1 }}
+          whileTap={{ scale: walletConnected && quote && !isLoading ? 0.98 : 1 }}
+        >
+          {isLoading ? 'Processing...' : 
+           !walletConnected ? 'Connect Wallet' :
+           !quote ? 'Enter Amount' :
+           mode === 'deposit' ? 'Stake ADA' : 'Request Withdrawal'}
+        </motion.button>
+      </div>
+
+      {/* Pending Withdrawals */}
+      {userWithdrawals.length > 0 && (
+        <div className="mt-6">
+          <h3 className="text-terminal-amber font-mono text-lg mb-4">Your Withdrawal Requests</h3>
+          <div className="space-y-3">
+            {userWithdrawals.map((withdrawal) => (
+              <div key={withdrawal.id} className="terminal-border p-4">
+                <div className="flex justify-between items-center mb-2">
+                  <div className="text-terminal-green font-mono text-sm">
+                    {formatADA(withdrawal.pADAAmount)} pADA → {formatADA(withdrawal.expectedADAAmount)} ADA
+                  </div>
+                  <div className={`font-mono text-sm ${
+                    withdrawal.status === 'Pending' ? 'text-terminal-amber' : 
+                    withdrawal.status === 'Completed' ? 'text-terminal-green' : 'text-terminal-red'
+                  }`}>
+                    {withdrawal.status}
+                  </div>
+                </div>
+                <div className="text-terminal-amber font-mono text-xs">
+                  {withdrawal.status === 'Pending' && (
+                    <>Time remaining: {formatTimeRemaining(withdrawal.completionDeadline)}</>
+                  )}
+                  {withdrawal.status === 'Completed' && (
+                    <>Completed on {new Date(withdrawal.completionDeadline).toLocaleDateString()}</>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Transaction Result */}
+      <AnimatePresence>
+        {txHash && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <div className="text-terminal-green font-mono text-sm">
+                  ✅ {mode === 'deposit' ? 'Staking Deposit' : 'Withdrawal Request'} Submitted
+                </div>
+                <div className="text-terminal-amber font-mono text-xs mt-1">
+                  TX: {txHash.slice(0, 16)}...{txHash.slice(-8)}
+                </div>
+              </div>
+              <button
+                onClick={clearTransaction}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Error Display */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="mt-6 terminal-border border-terminal-red p-4"
+          >
+            <div className="flex justify-between items-center">
+              <div className="text-terminal-red font-mono text-sm">❌ {error}</div>
+              <button
+                onClick={() => setError('')}
+                className="text-terminal-red hover:text-red-400 font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

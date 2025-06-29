@@ -1,0 +1,268 @@
+// PuckSwap v5 DeFi - Liquid Staking Page
+// Next.js page for liquid staking with pADA minting and comprehensive staking features
+// Retro terminal aesthetic with professional DeFi functionality
+
+import React, { useState, useEffect } from 'react';
+import Head from 'next/head';
+import { toast, Toaster } from 'react-hot-toast';
+import LiquidStaking from '../components/LiquidStaking';
+import { PuckSwapLiquidStaking } from '../lucid/staking';
+import { StakingMonitor } from '../context7/staking-monitor';
+
+// Staking page component
+export default function StakingPage() {
+  const [staking, setStaking] = useState<PuckSwapLiquidStaking | null>(null);
+  const [monitor, setMonitor] = useState<StakingMonitor | null>(null);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isDemoMode, setIsDemoMode] = useState(true); // Start in demo mode
+  const [error, setError] = useState<string | null>(null);
+
+  // Initialize staking system
+  useEffect(() => {
+    const initializeStaking = async () => {
+      try {
+        setIsInitializing(true);
+        setError(null);
+
+        if (isDemoMode) {
+          // Demo mode - no actual initialization needed
+          console.log('Running in demo mode');
+          setIsInitializing(false);
+          return;
+        }
+
+        // Check for environment variables
+        const blockfrostApiKey = process.env.NEXT_PUBLIC_BLOCKFROST_API_KEY;
+        const network = (process.env.NEXT_PUBLIC_NETWORK as "Mainnet" | "Preview" | "Preprod") || "Preview";
+
+        if (!blockfrostApiKey) {
+          throw new Error('Blockfrost API key not configured');
+        }
+
+        // Initialize staking system
+        const stakingInstance = await PuckSwapLiquidStaking.create(
+          blockfrostApiKey,
+          network,
+          {
+            stakingValidator: process.env.NEXT_PUBLIC_STAKING_VALIDATOR_CBOR || "",
+            pADAMintingPolicy: process.env.NEXT_PUBLIC_PADA_MINTING_POLICY_CBOR || ""
+          },
+          process.env.NEXT_PUBLIC_STAKING_ADDRESS || ""
+        );
+
+        setStaking(stakingInstance);
+
+        // Initialize monitor
+        const monitorInstance = new StakingMonitor({
+          stakingAddress: process.env.NEXT_PUBLIC_STAKING_ADDRESS || "",
+          pADAPolicyId: process.env.NEXT_PUBLIC_PADA_POLICY_ID || "",
+          blockfrostApiKey,
+          network: network.toLowerCase() as "mainnet" | "preview" | "preprod",
+          enableWebSocket: true,
+          pollingInterval: 10000,
+          maxRetries: 3,
+          retryDelay: 5000,
+          enableAlerts: true,
+          alertThresholds: {
+            lowLiquidityThreshold: BigInt(100_000_000_000), // 100K ADA
+            highWithdrawalVolumeThreshold: BigInt(1_000_000_000_000), // 1M ADA
+            rewardSyncDelayHours: 24,
+            unusualActivityThreshold: 10
+          }
+        });
+
+        await monitorInstance.initialize();
+        await monitorInstance.startMonitoring();
+        setMonitor(monitorInstance);
+
+        console.log('Staking system initialized successfully');
+      } catch (error) {
+        console.error('Failed to initialize staking system:', error);
+        setError(error instanceof Error ? error.message : 'Failed to initialize staking system');
+        toast.error('Failed to initialize staking system. Running in demo mode.');
+        setIsDemoMode(true); // Fallback to demo mode
+      } finally {
+        setIsInitializing(false);
+      }
+    };
+
+    initializeStaking();
+
+    // Cleanup on unmount
+    return () => {
+      if (monitor) {
+        monitor.stopMonitoring();
+      }
+    };
+  }, [isDemoMode]);
+
+  // Toggle demo mode
+  const toggleDemoMode = () => {
+    setIsDemoMode(!isDemoMode);
+    setError(null);
+  };
+
+  return (
+    <>
+      <Head>
+        <title>Liquid Staking - PuckSwap v5 DeFi</title>
+        <meta name="description" content="Stake ADA and mint liquid stADA tokens while earning rewards. Maintain liquidity with PuckSwap's liquid staking solution." />
+        <meta name="keywords" content="liquid staking, stADA, Cardano staking, DeFi, yield farming, staking rewards" />
+        <meta property="og:title" content="Liquid Staking - PuckSwap v5 DeFi" />
+        <meta property="og:description" content="Stake ADA and mint liquid stADA tokens while earning rewards. Maintain liquidity with PuckSwap's liquid staking solution." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://puckswap.com/staking" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Liquid Staking - PuckSwap v5 DeFi" />
+        <meta name="twitter:description" content="Stake ADA and mint liquid stADA tokens while earning rewards." />
+        <link rel="canonical" href="https://puckswap.com/staking" />
+      </Head>
+
+      <div className="min-h-screen bg-terminal-black">
+        {/* Loading Screen */}
+        {isInitializing && (
+          <div className="fixed inset-0 bg-terminal-black flex items-center justify-center z-50">
+            <div className="text-center">
+              <div className="w-16 h-16 border-4 border-terminal-green border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+              <div className="text-terminal-green font-mono text-lg">
+                INITIALIZING_STAKING_SYSTEM.exe
+              </div>
+              <div className="text-terminal-green/70 font-mono text-sm mt-2">
+                Loading liquid staking infrastructure...
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Error Banner */}
+        {error && !isInitializing && (
+          <div className="bg-red-900/20 border-b border-red-500/30 p-4">
+            <div className="max-w-7xl mx-auto flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <span className="text-red-400">⚠️</span>
+                <div>
+                  <div className="text-red-400 font-bold">System Error</div>
+                  <div className="text-red-300 text-sm">{error}</div>
+                </div>
+              </div>
+              <button
+                onClick={toggleDemoMode}
+                className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+              >
+                Switch to Demo Mode
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Demo Mode Banner */}
+        {isDemoMode && !isInitializing && (
+          <div className="bg-terminal-amber/20 border-b border-terminal-amber/30 p-4">
+            <div className="max-w-7xl mx-auto flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <span className="text-terminal-amber">🎮</span>
+                <div>
+                  <div className="text-terminal-amber font-bold">Demo Mode Active</div>
+                  <div className="text-terminal-amber/80 text-sm">
+                    Explore liquid staking features with simulated data. No real transactions will be executed.
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={toggleDemoMode}
+                className="px-4 py-2 bg-terminal-green text-terminal-black rounded hover:bg-terminal-green/80 transition-colors font-bold"
+              >
+                Connect to Mainnet
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Main Content */}
+        {!isInitializing && (
+          <LiquidStaking 
+            staking={staking || undefined}
+            monitor={monitor || undefined}
+            isDemoMode={isDemoMode}
+          />
+        )}
+
+        {/* Toast Notifications */}
+        <Toaster
+          position="bottom-right"
+          toastOptions={{
+            duration: 4000,
+            style: {
+              background: '#1a1a1a',
+              color: '#00ff00',
+              border: '1px solid #00ff0050',
+              fontFamily: 'monospace',
+            },
+            success: {
+              iconTheme: {
+                primary: '#00ff00',
+                secondary: '#1a1a1a',
+              },
+            },
+            error: {
+              iconTheme: {
+                primary: '#ff4444',
+                secondary: '#1a1a1a',
+              },
+            },
+          }}
+        />
+
+        {/* Terminal Footer */}
+        <footer className="border-t border-terminal-green/30 bg-terminal-black/90 backdrop-blur-sm">
+          <div className="max-w-7xl mx-auto px-4 py-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">LIQUID_STAKING.exe</h3>
+                <p className="text-terminal-green/70 text-sm">
+                  Stake ADA and receive liquid pADA tokens that can be traded, used in DeFi,
+                  or held while still earning staking rewards.
+                </p>
+              </div>
+              
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">FEATURES.dat</h3>
+                <ul className="text-terminal-green/70 text-sm space-y-1">
+                  <li>• Liquid pADA token minting</li>
+                  <li>• Automated reward distribution</li>
+                  <li>• Instant liquidity access</li>
+                  <li>• Competitive staking yields</li>
+                  <li>• Withdrawal queue system</li>
+                </ul>
+              </div>
+              
+              <div>
+                <h3 className="text-lg font-bold text-glow mb-3">SECURITY.log</h3>
+                <ul className="text-terminal-green/70 text-sm space-y-1">
+                  <li>• Audited smart contracts</li>
+                  <li>• Oracle-based reward syncing</li>
+                  <li>• Emergency pause mechanisms</li>
+                  <li>• Governance-controlled parameters</li>
+                  <li>• Real-time monitoring</li>
+                </ul>
+              </div>
+            </div>
+            
+            <div className="border-t border-terminal-green/30 mt-6 pt-6 text-center">
+              <p className="text-terminal-green/50 text-sm font-mono">
+                PUCKSWAP_V5_LIQUID_STAKING © 2024 • DEFI_ECOSYSTEM_MODULE • 
+                {isDemoMode ? 'DEMO_MODE_ACTIVE' : 'MAINNET_CONNECTED'}
+              </p>
+            </div>
+          </div>
+        </footer>
+      </div>
+    </>
+  );
+}
+
+// Export page configuration for Next.js
+export const config = {
+  runtime: 'nodejs',
+  unstable_includeFiles: ['public/**/*']
+};

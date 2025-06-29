@@ -1,0 +1,3 @@
+validator minimal(datum: Data, redeemer: Data, context) -> Bool {
+  True
+}

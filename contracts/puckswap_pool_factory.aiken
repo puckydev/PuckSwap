@@ -1,0 +1,246 @@
+use aiken/transaction.{ScriptContext, Spend, Mint, find_input, find_output}
+use aiken/transaction/credential.{Address, VerificationKeyCredential, ScriptCredential}
+use aiken/transaction/value.{
+  Value, PolicyId, AssetName, ada_policy_id, ada_asset_name, 
+  quantity_of, from_lovelace, merge, negate, tokens, flatten, to_minted_value
+}
+use aiken/list
+use aiken/math
+use aiken/bytearray
+use aiken/option
+use aiken/hash.{blake2b_256}
+
+// Pool factory for creating new AMM pools
+// Ensures each pool has a unique NFT identifier
+
+// Factory state datum
+type FactoryDatum {
+  // Factory configuration
+  admin: Address,
+  pool_creation_fee: Int,
+  protocol_fee_bps: Int,
+  
+  // Pool tracking
+  total_pools_created: Int,
+  pool_validator_hash: ByteArray,
+  lp_policy_hash: ByteArray,
+  
+  // Security
+  paused: Bool,
+  min_initial_liquidity: Int,
+}
+
+// Factory redeemer
+type FactoryRedeemer {
+  CreatePool {
+    token_policy: PolicyId,
+    token_name: AssetName,
+    initial_ada: Int,
+    initial_token: Int,
+    fee_bps: Int,
+  }
+  UpdateConfig {
+    new_admin: Option<Address>,
+    new_creation_fee: Option<Int>,
+    new_protocol_fee: Option<Int>,
+  }
+  PauseFactory
+  UnpauseFactory
+}
+
+// Pool NFT minting policy
+validator pool_nft_policy(
+  factory_utxo_ref: transaction.OutputReference,
+  ctx: ScriptContext
+) -> Bool {
+  when ctx.purpose is {
+    Mint(policy_id) -> {
+      // Ensure factory UTxO is consumed
+      let factory_consumed = list.any(ctx.transaction.inputs, fn(input) {
+        input.output_reference == factory_utxo_ref
+      })
+      
+      // Get minted tokens
+      let minted_tokens = to_minted_value(ctx.transaction.mint)
+      let pool_nft_tokens = tokens(minted_tokens, policy_id)
+      
+      // Validate exactly one pool NFT is minted
+      let valid_mint = list.length(pool_nft_tokens) == 1 &&
+        list.all(pool_nft_tokens, fn(token) {
+          let (_, quantity) = token
+          quantity == 1
+        })
+      
+      factory_consumed && valid_mint
+    }
+    _ -> False
+  }
+}
+
+// Factory validator for pool creation
+validator pool_factory(
+  ctx: ScriptContext,
+  datum: FactoryDatum,
+  redeemer: FactoryRedeemer
+) -> Bool {
+  when ctx.purpose is {
+    Spend(output_ref) -> {
+      expect Some(factory_input) = find_input(ctx.transaction.inputs, output_ref)
+      expect Some(factory_output) = find_output(ctx.transaction.outputs, factory_input.output.address)
+      
+      when redeemer is {
+        CreatePool { token_policy, token_name, initial_ada, initial_token, fee_bps } ->
+          validate_pool_creation(
+            factory_input, factory_output, datum, 
+            token_policy, token_name, initial_ada, initial_token, fee_bps, ctx
+          )
+        
+        UpdateConfig { new_admin, new_creation_fee, new_protocol_fee } ->
+          validate_config_update(factory_input, factory_output, datum, new_admin, new_creation_fee, new_protocol_fee, ctx)
+        
+        PauseFactory ->
+          validate_pause(factory_input, factory_output, datum, ctx)
+        
+        UnpauseFactory ->
+          validate_unpause(factory_input, factory_output, datum, ctx)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Validate pool creation
+fn validate_pool_creation(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  token_policy: PolicyId,
+  token_name: AssetName,
+  initial_ada: Int,
+  initial_token: Int,
+  fee_bps: Int,
+  ctx: ScriptContext
+) -> Bool {
+  // Check factory is not paused
+  expect !datum.paused
+  
+  // Validate initial liquidity meets minimum
+  expect initial_ada >= datum.min_initial_liquidity
+  expect initial_token > 0
+  
+  // Validate fee is reasonable (max 1%)
+  expect fee_bps >= 0 && fee_bps <= 100
+  
+  // Check pool creation fee is paid
+  let creation_fee_paid = quantity_of(factory_input.output.value, ada_policy_id, ada_asset_name) -
+                         quantity_of(factory_output.value, ada_policy_id, ada_asset_name) >= datum.pool_creation_fee
+  
+  // Validate new pool UTxO is created
+  let pool_address = credential.from_script(datum.pool_validator_hash)
+  let pool_outputs = list.filter(ctx.transaction.outputs, fn(output) {
+    output.address.payment_credential == ScriptCredential(datum.pool_validator_hash)
+  })
+  
+  expect list.length(pool_outputs) == 1
+  expect Some(pool_output) = list.head(pool_outputs)
+  
+  // Validate pool has correct initial liquidity
+  let pool_ada = quantity_of(pool_output.value, ada_policy_id, ada_asset_name)
+  let pool_token = quantity_of(pool_output.value, token_policy, token_name)
+  
+  // Generate unique pool NFT name
+  let pool_nft_name = generate_pool_nft_name(token_policy, token_name, datum.total_pools_created)
+  
+  // Validate pool NFT is minted and sent to pool
+  let pool_nft_minted = quantity_of(pool_output.value, ctx.transaction.mint, pool_nft_name) == 1
+  
+  // Update factory state
+  expect Some(new_factory_datum) = factory_output.datum
+  expect new_factory_datum.total_pools_created == datum.total_pools_created + 1
+  
+  creation_fee_paid &&
+  pool_ada >= initial_ada &&
+  pool_token >= initial_token &&
+  pool_nft_minted
+}
+
+// Validate configuration updates (admin only)
+fn validate_config_update(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  new_admin: Option<Address>,
+  new_creation_fee: Option<Int>,
+  new_protocol_fee: Option<Int>,
+  ctx: ScriptContext
+) -> Bool {
+  // Check admin signature
+  let admin_signed = when datum.admin.payment_credential is {
+    VerificationKeyCredential(admin_pkh) -> 
+      list.has(ctx.transaction.extra_signatories, admin_pkh)
+    _ -> False
+  }
+  
+  expect admin_signed
+  
+  // Validate new configuration values
+  let valid_config = when new_creation_fee is {
+    Some(fee) -> fee >= 0 && fee <= 10_000_000  // Max 10 ADA
+    None -> True
+  } && when new_protocol_fee is {
+    Some(fee) -> fee >= 0 && fee <= 500  // Max 5%
+    None -> True
+  }
+  
+  valid_config
+}
+
+// Validate factory pause (admin only)
+fn validate_pause(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Check admin signature
+  let admin_signed = when datum.admin.payment_credential is {
+    VerificationKeyCredential(admin_pkh) -> 
+      list.has(ctx.transaction.extra_signatories, admin_pkh)
+    _ -> False
+  }
+  
+  expect admin_signed
+  expect Some(new_datum) = factory_output.datum
+  expect new_datum.paused == True
+  
+  True
+}
+
+// Validate factory unpause (admin only)
+fn validate_unpause(
+  factory_input: transaction.Input,
+  factory_output: transaction.Output,
+  datum: FactoryDatum,
+  ctx: ScriptContext
+) -> Bool {
+  // Check admin signature
+  let admin_signed = when datum.admin.payment_credential is {
+    VerificationKeyCredential(admin_pkh) -> 
+      list.has(ctx.transaction.extra_signatories, admin_pkh)
+    _ -> False
+  }
+  
+  expect admin_signed
+  expect Some(new_datum) = factory_output.datum
+  expect new_datum.paused == False
+  
+  True
+}
+
+// Generate unique pool NFT name
+fn generate_pool_nft_name(token_policy: PolicyId, token_name: AssetName, pool_count: Int) -> AssetName {
+  let pool_identifier = bytearray.concat(token_policy, token_name)
+  let count_bytes = bytearray.from_int(pool_count)
+  let combined = bytearray.concat(pool_identifier, count_bytes)
+  blake2b_256(combined)
+}

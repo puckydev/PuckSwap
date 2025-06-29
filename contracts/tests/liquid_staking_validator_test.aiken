@@ -1,0 +1,137 @@
+// Simple test for liquid staking calculations
+
+// Test calculation functions
+fn calculate_pADA_to_mint(amount: Int, total_staked: Int, total_pADA_minted: Int, accumulated_rewards: Int) -> Int {
+  if total_pADA_minted == 0 {
+    // Initial deposit - 1:1 ratio
+    amount
+  } else {
+    // Calculate based on current ratio including accumulated rewards
+    let total_value = total_staked + accumulated_rewards
+    (amount * total_stADA_minted) / total_value
+  }
+}
+
+fn calculate_ada_to_return(stADA_amount: Int, total_staked: Int, total_stADA_minted: Int, accumulated_rewards: Int) -> Int {
+  if total_stADA_minted == 0 {
+    0
+  } else {
+    // Calculate based on current ratio including accumulated rewards
+    let total_value = total_staked + accumulated_rewards
+    (stADA_amount * total_value) / total_stADA_minted
+  }
+}
+
+// Test 1: Initial deposit (1:1 ratio)
+test test_initial_deposit() {
+  let deposit_amount = 100000000 // 100 ADA
+  let expected_stADA = calculate_stADA_to_mint(deposit_amount, 0, 0, 0)
+
+  // Should be 1:1 ratio for initial deposit
+  expected_stADA == deposit_amount
+}
+
+// Test 2: Deposit with existing state
+test test_deposit_with_rewards() {
+  let deposit_amount = 100000000 // 100 ADA
+  let total_staked = 1000000000 // 1000 ADA
+  let total_stADA_minted = 1000000000 // 1000 stADA
+  let accumulated_rewards = 50000000 // 50 ADA rewards
+
+  let expected_stADA = calculate_stADA_to_mint(deposit_amount, total_staked, total_stADA_minted, accumulated_rewards)
+
+  // With rewards, total value is 1050 ADA, so 100 ADA should get fewer stADA
+  let total_value = total_staked + accumulated_rewards
+  let expected_calculation = (deposit_amount * total_stADA_minted) / total_value
+
+  expected_stADA == expected_calculation
+}
+
+// Test 3: Withdrawal calculation
+test test_withdrawal_calculation() {
+  let stADA_amount = 100000000 // 100 stADA
+  let total_staked = 1000000000 // 1000 ADA
+  let total_stADA_minted = 1000000000 // 1000 stADA
+  let accumulated_rewards = 50000000 // 50 ADA rewards
+
+  let expected_ada = calculate_ada_to_return(stADA_amount, total_staked, total_stADA_minted, accumulated_rewards)
+
+  // With rewards, total value is 1050 ADA, so 100 stADA should get more ADA
+  let total_value = total_staked + accumulated_rewards
+  let expected_calculation = (stADA_amount * total_value) / total_stADA_minted
+
+  expected_ada == expected_calculation
+}
+
+// Test 4: Round trip precision
+test test_round_trip_precision() {
+  let deposit_amount = 100000000 // 100 ADA
+  let total_staked = 1000000000 // 1000 ADA
+  let total_stADA_minted = 1000000000 // 1000 stADA
+  let accumulated_rewards = 50000000 // 50 ADA rewards
+
+  let stADA_minted = calculate_stADA_to_mint(deposit_amount, total_staked, total_stADA_minted, accumulated_rewards)
+  let ada_returned = calculate_ada_to_return(stADA_minted, total_staked + deposit_amount, total_stADA_minted + stADA_minted, accumulated_rewards)
+
+  // Should be approximately equal (within rounding)
+  let difference = if ada_returned > deposit_amount {
+    ada_returned - deposit_amount
+  } else {
+    deposit_amount - ada_returned
+  }
+
+  // Allow for small rounding differences
+  difference <= 1
+}
+
+// Test 5: Fee calculations
+test test_fee_calculations() {
+  let deposit_amount = 100000000 // 100 ADA
+  let deposit_fee_bps = 50 // 0.5%
+
+  // Calculate deposit fee
+  let deposit_fee = (deposit_amount * deposit_fee_bps) / 10000
+  let expected_deposit_fee = 500000 // 0.5 ADA
+
+  deposit_fee == expected_deposit_fee
+}
+
+// Test 6: Reward distribution calculation
+test test_reward_distribution() {
+  let total_rewards = 20000000 // 20 ADA rewards
+  let management_fee_bps = 200 // 2%
+
+  // Calculate management fee
+  let management_fee = (total_rewards * management_fee_bps) / 10000
+  let expected_management_fee = 400000 // 0.4 ADA
+
+  // Net rewards after fee
+  let net_rewards = total_rewards - management_fee
+  let expected_net_rewards = 19600000 // 19.6 ADA
+
+  management_fee == expected_management_fee && net_rewards == expected_net_rewards
+}
+
+// Test 7: Zero amount edge cases
+test test_zero_amounts() {
+  // Test zero deposit
+  let zero_stADA = calculate_stADA_to_mint(0, 1000000000, 1000000000, 50000000)
+
+  // Test zero withdrawal
+  let zero_ada = calculate_ada_to_return(0, 1000000000, 1000000000, 50000000)
+
+  zero_stADA == 0 && zero_ada == 0
+}
+
+// Test 8: Large amounts
+test test_large_amounts() {
+  let large_amount = 1000000000000 // 1M ADA
+  let total_staked = 1000000000000 // 1M ADA
+  let total_stADA_minted = 1000000000000 // 1M stADA
+  let accumulated_rewards = 50000000000 // 50K ADA rewards
+
+  let stADA_minted = calculate_stADA_to_mint(large_amount, total_staked, total_stADA_minted, accumulated_rewards)
+
+  // Should handle large amounts correctly
+  stADA_minted > 0
+}

@@ -1,0 +1,113 @@
+// PuckSwap v5 DeFi - Centralized Validator Export Module
+// Exposes all validators for deployment, serialization, and off-chain interaction
+// Full CIP-68 compliance with canonical datum structures
+
+// =============================================================================
+// VALIDATOR IMPORTS
+// =============================================================================
+
+// Updated AMM validators with correct PoolDatum structure
+use validators/swap_validator.{swap_validator}
+use validators/liquidity_provision_validator.{liquidity_provision_validator}
+
+// =============================================================================
+// VALIDATOR EXPORTS FOR PREPROD TESTNET DEPLOYMENT
+// =============================================================================
+
+// AMM swap validator - handles ADA ↔ PUCKY swaps with constant product formula
+validator puckswap_swap_validator {
+  swap_validator
+}
+
+// Liquidity provision validator - handles balanced ADA + PUCKY deposits
+validator puckswap_liquidity_provision_validator {
+  liquidity_provision_validator
+}
+
+// =============================================================================
+// COMPILED VALIDATOR EXPORTS
+// =============================================================================
+
+// Compile validators for deployment and off-chain interaction
+// These compiled validators can be used for:
+// - Script address generation
+// - Transaction building with Lucid Evolution
+// - Context7 monitoring and indexing
+// - Frontend integration
+
+// AMM validators
+pub const swap_validator_compiled = compile(puckswap_swap_validator)
+pub const liquidity_provision_validator_compiled = compile(puckswap_liquidity_provision_validator)
+
+// =============================================================================
+// VALIDATOR METADATA FOR OFF-CHAIN INTEGRATION
+// =============================================================================
+
+// Validator names for Context7 monitoring and frontend display
+pub const VALIDATOR_NAMES = [
+  ("swap", "PuckSwap AMM Swap Validator"),
+  ("liquidity_provision", "PuckSwap Liquidity Provision Validator"),
+]
+
+// Validator purposes for transaction building
+pub const VALIDATOR_PURPOSES = [
+  ("swap", "Token swaps with 0.3% fee and slippage protection"),
+  ("liquidity_provision", "Balanced liquidity provision with LP token minting"),
+]
+
+// =============================================================================
+// DEPLOYMENT CONFIGURATION
+// =============================================================================
+
+// All validators follow PuckSwap v5 specifications:
+// - Exact PoolDatum structure matching deployed contracts
+// - Aiken standard library usage (aiken/transaction, cardano/assets, aiken/option, aiken/error)
+// - Minimum ADA requirement validation
+// - Security validations against manipulation and attacks
+// - Integration with Lucid Evolution off-chain builders
+// - Context7 real-time monitoring support
+
+// Deployment order recommendation:
+// 1. swap_validator (core AMM functionality)
+// 2. liquidity_provision_validator (liquidity management)
+
+// =============================================================================
+// USAGE EXAMPLES FOR OFF-CHAIN INTEGRATION
+// =============================================================================
+
+// Example: Get validator script address for Lucid Evolution
+// const swapValidatorAddress = lucid.utils.validatorToAddress(swap_validator_compiled);
+
+// Example: Build transaction with validator
+// const tx = await lucid
+//   .newTx()
+//   .collectFrom([poolUtxo], SwapRedeemer)
+//   .attachSpendingValidator(swap_validator_compiled)
+//   .complete();
+
+// Example: Context7 monitoring setup
+// const poolMonitor = new Context7Monitor({
+//   validator: swap_validator_compiled,
+//   datumType: "PoolDatum",
+//   network: "preprod"
+// });
+
+// =============================================================================
+// SECURITY NOTES
+// =============================================================================
+
+// All validators implement comprehensive security validations:
+// - CIP-68 datum structure integrity checks
+// - Minimum ADA requirement enforcement
+// - Slippage protection and manipulation prevention
+// - User authorization and signature validation
+// - Pool draining and dust attack prevention
+// - Proper UTxO state transitions
+// - Integration with minting policies for token control
+
+// For production deployment:
+// - Audit all validator logic thoroughly
+// - Test on Cardano Preprod testnet extensively
+// - Verify integration with Lucid Evolution builders
+// - Validate Context7 monitoring functionality
+// - Ensure proper error handling and user feedback

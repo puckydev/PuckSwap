@@ -1,0 +1,115 @@
+// PuckSwap Core Validators Index - Production Ready
+// Exports core AMM validators for ADA ↔ PUCKY swaps
+// Focused on Preprod testnet deployment
+
+// Import core validators
+use validators/core_amm_swap_validator.{core_amm_swap_validator}
+use validators/core_liquidity_provision_validator.{core_liquidity_provision_validator}
+use validators/core_liquidity_withdrawal_validator.{core_liquidity_withdrawal_validator}
+
+// Import core minting policy
+use policies/core_lp_minting_policy.{core_lp_minting_policy}
+
+// =============================================================================
+// CORE VALIDATOR EXPORTS FOR ON-CHAIN DEPLOYMENT
+// =============================================================================
+
+// Core AMM swap validator - handles ADA ↔ PUCKY swaps with constant product formula
+validator puckswap_core_swap_validator {
+  core_amm_swap_validator
+}
+
+// Core liquidity provision validator - handles balanced ADA + PUCKY deposits
+validator puckswap_core_liquidity_provision_validator {
+  core_liquidity_provision_validator
+}
+
+// Core liquidity withdrawal validator - handles LP token burning for withdrawals
+validator puckswap_core_liquidity_withdrawal_validator {
+  core_liquidity_withdrawal_validator
+}
+
+// =============================================================================
+// CORE MINTING POLICY EXPORTS
+// =============================================================================
+
+// Core LP minting policy - controls LP token minting/burning
+// Authorized validators: [swap_validator_hash, liquidity_provision_validator_hash, withdrawal_validator_hash]
+minting_policy puckswap_core_lp_minting_policy(authorized_validators: List<ByteArray>) {
+  core_lp_minting_policy(authorized_validators)
+}
+
+// =============================================================================
+// COMPILED VALIDATOR EXPORTS
+// =============================================================================
+
+// Compile all core validators for deployment and off-chain interaction
+// These compiled validators can be used for:
+// - Script address generation
+// - Transaction building with Lucid Evolution
+// - Context7 monitoring and indexing
+// - Frontend integration
+
+// Core AMM validators
+pub const core_swap_validator_compiled = compile(puckswap_core_swap_validator)
+pub const core_liquidity_provision_validator_compiled = compile(puckswap_core_liquidity_provision_validator)
+pub const core_liquidity_withdrawal_validator_compiled = compile(puckswap_core_liquidity_withdrawal_validator)
+
+// Core minting policy (requires authorized validators parameter)
+// This will be compiled during deployment with actual validator hashes
+// pub const core_lp_minting_policy_compiled = compile(puckswap_core_lp_minting_policy([]))
+
+// =============================================================================
+// DEPLOYMENT CONFIGURATION
+// =============================================================================
+
+// All core validators follow PuckSwap production specifications:
+// - CIP-68 compliant datum structures
+// - Aiken standard library usage (aiken/transaction, cardano/assets, aiken/option, aiken/error, aiken/cbor)
+// - Minimum ADA requirement validation
+// - Security validations against manipulation and attacks
+// - Integration with Lucid Evolution off-chain builders
+// - Context7 real-time monitoring support
+// - Focused on ADA ↔ PUCKY trading pair
+// - 0.3% fee (997/1000 ratio) for swaps
+// - Proportional liquidity provision/withdrawal
+// - Strict LP token minting/burning coordination
+
+// Network Configuration:
+// - Target: Cardano Preprod Testnet
+// - Blockfrost API: preprodd86p4euUeF6yIUbwl03sJJMD03aICMxL
+// - Network ID: 0 (testnet)
+
+// Contract Addresses (to be computed during deployment):
+// - core_swap_validator: TBD
+// - core_liquidity_provision_validator: TBD  
+// - core_liquidity_withdrawal_validator: TBD
+// - core_lp_minting_policy: TBD
+
+// =============================================================================
+// USAGE NOTES
+// =============================================================================
+
+// 1. Compile contracts: `aiken build`
+// 2. Export to Plutus: `aiken export`
+// 3. Deploy using scripts/deployContracts.ts
+// 4. Update deployment/addresses.json with computed addresses
+// 5. Configure off-chain builders with contract addresses
+// 6. Set up Context7 monitoring with contract addresses
+// 7. Update frontend with contract addresses and ABIs
+
+// Security Considerations:
+// - All validators enforce minimum ADA requirements
+// - Slippage protection through min_amount_out parameters
+// - Deadline validation for MEV protection
+// - Proportional liquidity validation
+// - Strict LP token minting/burning coordination
+// - CIP-68 datum structure validation
+// - Pool pause functionality for emergency situations
+
+// Testing:
+// - Unit tests in contracts/tests/
+// - Integration tests in tests/
+// - Deployment simulation tests
+// - End-to-end transaction flow tests
+// - Edge case and security tests
